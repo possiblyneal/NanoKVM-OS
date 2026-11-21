@@ -2,9 +2,12 @@
 """Durable Pages package snapshots; Actions artifacts are transport, not storage.
 
 The catalog and its hash-checked objects are carried into every deployment.
-Public OS releases activate staged OS snapshots. Add-ons activate independently.
+Public OS releases activate staged OS snapshots. Package-only OS updates and
+add-ons activate independently.
 """
 import argparse
+from datetime import datetime, timezone
+from html import escape
 import hashlib
 import importlib.util
 import io
@@ -52,7 +55,13 @@ def version(item):
 
 
 def retained(snapshots, published):
-    """Three stable, ONE beta, three per add-on; latest pending OS per channel."""
+    """Three stable, ONE beta, three per add-on; latest pending OS per channel,
+    and every pending OS snapshot newer than its channel's published head."""
+    heads = {}
+    for tag in published:
+        if m := a.VERSION.fullmatch(tag):
+            v = version({'kind': 'os', 'tag': tag})
+            heads[bool(m[4])] = max(heads.get(bool(m[4]), v), v)
     groups = {}
     for item in snapshots.values():
         if item['kind'] == 'addon':
@@ -63,8 +72,16 @@ def retained(snapshots, published):
             group = ('beta' if beta else 'stable') + ('' if active else '-pending')
             keep = 1 if beta or not active else 3
         groups.setdefault((group, keep), []).append(item)
-    return {identity(i['kind'], i['tag']): i for (_, keep), items in groups.items()
-            for i in sorted(items, key=version, reverse=True)[:keep]}
+    result = {}
+    for (group, keep), items in groups.items():
+        items = sorted(items, key=version, reverse=True)
+        if group.endswith('-pending'):
+            # Any of these drafts may be published next and become the head,
+            # and its artifact id stays in `seen`: a pruned one never returns.
+            head = heads.get(group.startswith('beta'))
+            keep = max(keep, sum(head is None or version(i) > head for i in items))
+        result.update((identity(i['kind'], i['tag']), i) for i in items[:keep])
+    return result
 
 
 def inventory():
@@ -81,7 +98,10 @@ class Store:
     def __init__(self, cache):
         self.cache = Path(cache)
         self.cache.mkdir(parents=True, exist_ok=True)
-        self.snapshots, self.seen, self.sources = {}, set(), {}
+        self.snapshots, self.seen = {}, set()
+        # Object path -> the feed file that holds the same bytes, deployed
+        # instead of a second copy under package-store/objects.
+        self.served = {}
 
     def put(self, name, data, path=None):
         filename(name)
@@ -97,10 +117,18 @@ class Store:
     def get(self, item):
         path, sha, size = item['path'], item['sha256'], item['size']
         if (not re.fullmatch(r'[a-f0-9]{64}', sha) or type(size) is not int or not 0 < size <= LIMIT
-                or not re.fullmatch(r'package-store/(?:objects/[a-f0-9]{64}|sources/nanokvm-rustdesk-[0-9.]+-r[0-9]+)/[A-Za-z0-9][A-Za-z0-9+_.-]*', path)):
+                or not re.fullmatch(r'package-store/objects/[a-f0-9]{64}/[A-Za-z0-9][A-Za-z0-9+_.-]*', path)):
             raise ValueError('Invalid catalog object')
         target = self.cache / path
-        data = target.read_bytes() if target.exists() else a.fetch(BASE + '/' + path)
+        url = BASE + '/' + path
+        if path in self.served:
+            feed = self.served[path]
+            if (not re.fullmatch(r'(?:(?:beta/)?alpine|' + a.ADDON_DIR + r')/v[0-9.]+/riscv64/[A-Za-z0-9][A-Za-z0-9+_.-]*[.]apk', feed)
+                    or feed.rsplit('/', 1)[1] != path.rsplit('/', 1)[1]):
+                raise ValueError('Invalid catalog feed path')
+            # Feed names are not content addresses: key the cached copy by hash.
+            url = BASE + '/' + feed + '?sha256=' + sha
+        data = target.read_bytes() if target.exists() else a.fetch(url)
         if len(data) != size or hashlib.sha256(data).hexdigest() != sha:
             raise ValueError(f'Corrupt Pages object: {path}')
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -116,20 +144,21 @@ class Store:
                 raise ValueError('Invalid snapshot key')
             for name in item['files']:
                 filename(name)
+            packages_release(item)
         self.snapshots = data['snapshots']
-        self.sources = data.get('sources', {})
+        self.served = data.get('served', {})
         self.seen = set(data['artifacts'])
 
-    def add(self, kind, tag, files, commit):
+    def add(self, kind, tag, files, commit, published_at=None):
         key = identity(kind, tag)
         commit_sha(commit)
         item = {'kind': kind, 'tag': tag, 'files': files, 'commit': commit}
+        if published_at is not None:
+            item.update(packages_only=True, published_at=published_at)
+            packages_release(item)
         if key in self.snapshots and self.snapshots[key] != item:
             raise ValueError(f'Refusing to replace immutable snapshot {key}')
         self.snapshots[key] = item
-        for f in files.values():
-            if f['path'].startswith('package-store/sources/'):
-                self.sources[f['path']] = f
 
     def candidate(self, data, expected_kind, expected_commit=None):
         # Never extract an untrusted ZIP onto the host filesystem.
@@ -158,13 +187,12 @@ class Store:
                 if hashlib.sha256(payload).hexdigest() != sums[name]:
                     raise ValueError(f'Candidate checksum mismatch: {name}')
                 if kind == 'os':
-                    if name not in TECHNICAL and not name.endswith('.apk'):
+                    source = meta.get('packages_only') and name == source_name(tag)
+                    if name not in TECHNICAL and not name.endswith('.apk') and not source:
                         raise ValueError('Unexpected OS file')
-                elif name not in {tag + '.apk', 'APKBUILD',
-                                  f'nanokvm-rustdesk-{addon_packages.TAG.fullmatch(tag)[2]}-source.tar.gz'}:
+                elif name != tag + '.apk':
                     raise ValueError('Unexpected add-on file')
-                source = f'package-store/sources/{tag}/{name}' if kind == 'addon' and not name.endswith('.apk') else None
-                files[name] = self.put(name, payload, source)
+                files[name] = self.put(name, payload)
             if kind == 'os':
                 if not REQUIRED <= files.keys():
                     raise ValueError('Incomplete OS metadata')
@@ -183,9 +211,7 @@ class Store:
                         raise ValueError(f'Incorrect OS package closure: {name}')
             elif tag + '.apk' not in files:
                 raise ValueError('Missing add-on APK')
-            if kind == 'addon' and tag.startswith('nanokvm-rustdesk-') and len(files) != 3:
-                raise ValueError('RustDesk requires corresponding source and APKBUILD')
-            self.add(kind, tag, files, meta['commit'])
+            self.add(kind, tag, files, meta['commit'], meta.get('published_at'))
 
     def ingest(self):
         # Scan ALL pending production artifacts. GitHub concurrency replaces
@@ -213,7 +239,7 @@ class Store:
                 continue
             if run['status'] != 'completed':
                 continue  # Its workflow_run event schedules another pass.
-            self.candidate(a.fetch(artifact['archive_download_url']), WORKFLOWS[workflow], run['head_sha'])
+            self.candidate(a.fetch(artifact['archive_download_url'], 'application/vnd.github+json'), WORKFLOWS[workflow], run['head_sha'])
             self.seen.add(artifact['id'])
 
     def bootstrap(self):
@@ -241,27 +267,20 @@ class Store:
                     raise ValueError('Legacy package size mismatch')
             self.add('os', r['tag_name'], files, tag_commit(r['tag_name']))
         pins = a.independent_addons(a.REPOSITORY, keep=3)
-        by_tag = {r['tag_name']: r for r in inventory()}
+        # Legacy RustDesk source archives stay in their Releases, where the
+        # installed source links point (cleanup keeps them).
         for name, pin in pins.items():
             tag = name[:-4]
             files = {name: self.put(name, addon_packages.checked(name, pin, a.fetch))}
-            if tag.startswith('nanokvm-rustdesk-'):
-                for n in ('APKBUILD', f'nanokvm-rustdesk-{addon_packages.TAG.fullmatch(tag)[2]}-source.tar.gz'):
-                    files[n] = self.put(n, old_file(by_tag[tag], n), f'package-store/sources/{tag}/{n}')
             self.add('addon', tag, files, tag_commit(tag))
-
-        # Corresponding sources outlive binary retention and installed devices.
-        for tag, release in by_tag.items():
-            match = addon_packages.TAG.fullmatch(tag)
-            if not match or match[1] != 'nanokvm-rustdesk' or release['draft']:
-                continue
-            for name in ('APKBUILD', f'nanokvm-rustdesk-{match[2]}-source.tar.gz'):
-                path = f'package-store/sources/{tag}/{name}'
-                if path not in self.sources:
-                    self.sources[path] = self.put(name, old_file(release, name), path)
 
     def render(self, output):
         public = {r['tag_name']: r for r in inventory() if not r['draft'] and r.get('published_at') and a.VERSION.fullmatch(r['tag_name'])}
+        for item in self.snapshots.values():
+            if release := packages_release(item):
+                if item['tag'] in public:
+                    raise ValueError('Package-only update also has a GitHub Release')
+                public[item['tag']] = release
         for beta in (False, True):
             candidates = [r for r in public.values() if bool(a.VERSION.fullmatch(r['tag_name'])[4]) == beta
                           and any(x['name'] == f"NanoKVM-OS-{r['tag_name']}-source.tar.xz" for x in r['assets'])]
@@ -271,6 +290,7 @@ class Store:
                     raise ValueError(f'Published OS release {head} has no staged packages')
         self.snapshots = retained(self.snapshots, public)
         releases, pins, payloads = [], {}, {}
+        branch = a.alpine_branch()
         for item in self.snapshots.values():
             files = item['files']
             for name, f in files.items():
@@ -286,35 +306,74 @@ class Store:
             elif item['kind'] == 'addon':
                 name = item['tag'] + '.apk'
                 f = files[name]
-                pins[name] = {'url': BASE + '/' + f['path'], 'sha256': f['sha256'], 'size': f['size']}
+                # addons.json names where the add-on is served: its feed.
+                url = f'{BASE}/{a.ADDON_DIR}/v{branch}/riscv64/{name}'
+                payloads[url] = payloads[BASE + '/' + f['path']]
+                pins[name] = {'url': url, 'sha256': f['sha256'], 'size': f['size']}
         releases.sort(key=a.order, reverse=True)
-        branch = a.alpine_branch()
         # The beta channel remains the newer of latest stable and latest beta.
         # The stable feed keeps its three releases; beta keeps just its head.
         for channel, directory, keep in [('stable', output, 3), ('beta', output / 'beta', 1)]:
             a.assemble(directory, releases, keep, branch, a.ROOT / 'firmware/alpine/keys',
-                       fetch=lambda url: payloads[url], channel=channel)
+                       fetch=lambda url: payloads[url], channel=channel, base=pins)
         for directory, include_beta in [(output, False), (output / 'beta', True)]:
             shutil.rmtree(directory / 'latest-image')
             a.image_badge(directory, sorted(public.values(), key=a.order, reverse=True), include_beta)
         a.assemble_addons(output, branch, pins, fetch=lambda url: payloads[url])
         for item in self.snapshots.values():
+            if not item.get('packages_only'):
+                continue
+            tag = item['tag']
+            directory = output / 'updates' / tag
+            directory.mkdir(parents=True)
+            source = item['files'][source_name(tag)]
+            source_url = BASE + '/' + source['path']
+            (directory / 'SHA256SUMS').write_text(''.join(
+                f"{f['sha256']}  {name}\n" for name, f in sorted(item['files'].items())))
+            (directory / 'index.html').write_text(
+                '<!doctype html><meta charset="utf-8">'
+                f'<title>NanoKVM OS {escape(tag)}</title><h1>NanoKVM OS {escape(tag)}</h1>'
+                '<p>Package update. Install through Settings → System → Updates.</p>'
+                f'<p><a href="{escape(source_url)}">Corresponding source</a> · '
+                '<a href="SHA256SUMS">SHA-256 checksums</a> · '
+                f'<a href="https://github.com/{a.REPOSITORY}/tree/{item["commit"]}">Source commit</a></p>\n')
+        for directory, include_beta in ((output, False), (output / 'beta', True)):
+            eligible = [r for r in public.values() if include_beta or not a.is_beta(r)]
+            latest = max(eligible, key=a.order)['tag_name']
+            if self.snapshots['os/' + latest].get('packages_only'):
+                index = directory / 'index.html'
+                index.write_text(index.read_text() + '<p><a href="' + BASE +
+                                 '/updates/' + latest + '/">Source and checksums</a></p>\n')
+
+        # An APK a feed serves byte for byte is stored once, as that feed
+        # file; the rest (pending OS releases, indexes, metadata) as objects.
+        # Pages has no links or redirects, so the catalog records the feed
+        # path. The sign job rewrites only Packages.adb, never an APK.
+        feeds = [output / d / ('v' + branch) / 'riscv64' for d in ('alpine', 'beta/alpine', a.ADDON_DIR)]
+        self.served = {}
+        for item in self.snapshots.values():
             for f in item['files'].values():
+                name = f['path'].rsplit('/', 1)[1]
+                feed = next((p for p in (d / name for d in feeds) if name.endswith('.apk') and p.is_file()
+                             and p.stat().st_size == f['size']
+                             and hashlib.sha256(p.read_bytes()).hexdigest() == f['sha256']), None)
+                if feed:
+                    self.served[f['path']] = feed.relative_to(output).as_posix()
+                    continue
                 target = output / f['path']
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if not target.exists():
                     shutil.copyfile(self.cache / f['path'], target)
-        for f in self.sources.values():
-            data = self.get(f)
-            target = output / f['path']
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
         catalog = output / CATALOG
         catalog.parent.mkdir(parents=True, exist_ok=True)
-        catalog.write_text(json.dumps({'schema': 1, 'snapshots': self.snapshots, 'sources': self.sources, 'artifacts': sorted(self.seen)}, sort_keys=True) + '\n')
+        catalog.write_text(json.dumps({'schema': 1, 'snapshots': self.snapshots,
+                                       'served': self.served, 'artifacts': sorted(self.seen)}, sort_keys=True) + '\n')
         total = sum(p.stat().st_size for p in output.rglob('*') if p.is_file())
         if total > LIMIT:
             raise ValueError(f'Pages site {total} bytes exceeds {LIMIT}; deployment refused')
+        if total > LIMIT * 7 // 10:
+            # Sources are never pruned: act before the limit blocks every update.
+            print(f'::warning::Pages site {total:,} bytes is over 70% of the {LIMIT:,} byte limit')
         print(f'Pages: {len(self.snapshots)} snapshots, {total:,} bytes')
 
 
@@ -330,12 +389,35 @@ def commit_sha(value):
     return value
 
 
+def source_name(tag):
+    return f'NanoKVM-OS-{tag}-source.tar.xz'
+
+
+def packages_release(item):
+    """Return release-shaped metadata for a production package-only snapshot."""
+    if not item.get('packages_only'):
+        if 'published_at' in item:
+            raise ValueError('Publication time requires package-only mode')
+        return None
+    if item['packages_only'] is not True or item['kind'] != 'os':
+        raise ValueError('Invalid package-only publication')
+    identity(item['kind'], item['tag'])
+    commit_sha(item['commit'])
+    datetime.strptime(item['published_at'], '%Y-%m-%dT%H:%M:%SZ')
+    if 'files' in item and source_name(item['tag']) not in item['files']:
+        raise ValueError('Package-only update requires corresponding source')
+    return {'tag_name': item['tag'], 'draft': False,
+            'prerelease': bool(a.VERSION.fullmatch(item['tag'])[4]),
+            'published_at': item['published_at'], 'assets': []}
+
+
 def snapshot_meta(archive):
     if archive.getinfo('snapshot.json').file_size > 4096:
         raise ValueError('Oversized snapshot metadata')
     meta = json.loads(archive.read('snapshot.json'))
     identity(meta['kind'], meta['tag'])
     commit_sha(meta['commit'])
+    packages_release(meta)
     return meta
 
 
@@ -364,12 +446,15 @@ def trusted_run(run, kind=None):
                  re.fullmatch(r'(release/\d+\.\d+|v\d+\.\d+\.\d+(?:-beta\.\d+)?)', run['head_branch']))))
 
 
-def already_staged(tag, commit):
+def already_staged(tag, commit, packages_only=False):
     # Only production uses this; dry runs never call --stage.
     try:
         catalog = read_catalog()
         if 'os/' + tag in catalog['snapshots']:
-            same_commit(catalog['snapshots']['os/' + tag]['commit'], commit)
+            item = catalog['snapshots']['os/' + tag]
+            same_commit(item['commit'], commit)
+            if bool(item.get('packages_only')) != packages_only:
+                raise ValueError('Cannot change an existing publication mode')
             return True
     except urllib.error.HTTPError as error:
         if error.code != 404:
@@ -382,23 +467,27 @@ def already_staged(tag, commit):
                 run_id = artifact['workflow_run']['id']
                 run = json.loads(a.fetch(f'https://api.github.com/repos/{a.REPOSITORY}/actions/runs/{run_id}', 'application/vnd.github+json'))
                 if trusted_run(run, 'os'):
-                    with zipfile.ZipFile(io.BytesIO(a.fetch(artifact['archive_download_url']))) as archive:
+                    with zipfile.ZipFile(io.BytesIO(a.fetch(artifact['archive_download_url'], 'application/vnd.github+json'))) as archive:
                         meta = snapshot_meta(archive)
                     if meta['kind'] != 'os' or meta['tag'] != tag:
                         raise ValueError('Candidate metadata differs from its artifact name')
                     same_commit(meta['commit'], run['head_sha'])
                     same_commit(meta['commit'], commit)
+                    if bool(meta.get('packages_only')) != packages_only:
+                        raise ValueError('Cannot change an existing publication mode')
                     return True
         if len(batch) < 100:
             return False
         page += 1
 
 
-def stage(directory, kind, tag, commit):
+def stage(directory, kind, tag, commit, source=None):
     """Add transport metadata only after the production build has passed checks."""
     identity(kind, tag)
     commit_sha(commit)
-    if kind == 'os' and os.environ.get('GITHUB_ACTIONS') == 'true' and already_staged(tag, commit):
+    if source is not None and (kind != 'os' or Path(source).name != source_name(tag)):
+        raise ValueError('Invalid corresponding-source archive')
+    if kind == 'os' and os.environ.get('GITHUB_ACTIONS') == 'true' and already_staged(tag, commit, source is not None):
         print(f'{tag}: reusing the original staged packages')
         with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
             output.write('upload=false\n')
@@ -406,6 +495,13 @@ def stage(directory, kind, tag, commit):
     directory = Path(directory)
     if (directory / 'snapshot.json').exists():
         raise ValueError('Candidate already staged')
+    if source is not None:
+        source = Path(source)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError('Corresponding source must be a regular file')
+        shutil.copyfile(source, directory / source.name)
+        with source.open('rb') as archive, (directory / 'SHA256SUMS').open('a') as sums:
+            sums.write(hashlib.file_digest(archive, 'sha256').hexdigest() + '  ' + source.name + '\n')
     for p in directory.iterdir():
         filename(p.name)
         if not p.is_file() or p.is_symlink():
@@ -416,7 +512,10 @@ def stage(directory, kind, tag, commit):
     for name, sha in sums.items():
         if hashlib.sha256((directory / name).read_bytes()).hexdigest() != sha:
             raise ValueError(f'Candidate checksum mismatch: {name}')
-    (directory / 'snapshot.json').write_text(json.dumps({'kind': kind, 'tag': tag, 'commit': commit}) + '\n')
+    meta = {'kind': kind, 'tag': tag, 'commit': commit}
+    if source is not None:
+        meta.update(packages_only=True, published_at=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    (directory / 'snapshot.json').write_text(json.dumps(meta) + '\n')
     if os.environ.get('GITHUB_OUTPUT'):
         with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
             output.write('upload=true\n')
@@ -430,10 +529,11 @@ def main():
     parser.add_argument('--stage', type=Path)
     parser.add_argument('--kind', choices=['os', 'addon'])
     parser.add_argument('--tag')
+    parser.add_argument('--source', type=Path, help='publish an OS package-only update with corresponding source')
     parser.add_argument('--commit', default=os.environ.get('GITHUB_SHA'))
     args = parser.parse_args()
     if args.stage:
-        stage(args.stage, args.kind, args.tag, args.commit)
+        stage(args.stage, args.kind, args.tag, args.commit, args.source)
         return
     if not args.output:
         parser.error('--output required')

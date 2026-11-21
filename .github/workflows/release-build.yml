@@ -11,14 +11,12 @@ name: Release build
 on:
   push:
     branches: [main]
-    paths: ['**', '!docs/**', '!*.md', '!**/README.md', '!tests/**', 'tests/test-mjpeg-native-contracts.py',
-            'tests/test-zram-pages.py', 'tests/test-lz4-decompressor.py', 'tests/zram-pages/**',
-            'tests/lz4-compressor/**', '!.github/workflows/ci.yml',
+    paths: ['**', '!docs/**', '!*.md', '!**/README.md', '!tests/**',
+            '!.github/workflows/ci.yml',
             '!.github/workflows/codeql.yml']
   pull_request:
-    paths: ['**', '!docs/**', '!*.md', '!**/README.md', '!tests/**', 'tests/test-mjpeg-native-contracts.py',
-            'tests/test-zram-pages.py', 'tests/test-lz4-decompressor.py', 'tests/zram-pages/**',
-            'tests/lz4-compressor/**', '!.github/workflows/ci.yml',
+    paths: ['**', '!docs/**', '!*.md', '!**/README.md', '!tests/**',
+            '!.github/workflows/ci.yml',
             '!.github/workflows/codeql.yml']
   workflow_dispatch:
 
@@ -40,17 +38,21 @@ jobs:
     timeout-minutes: 330
     permissions:
       contents: read
-      # The outputs-sha256 artifact of a main build, and the comment.
+      # The outputs-sha256 artifact of a main build.
       actions: read
-      pull-requests: write
     env:
       # A fixed absolute path: the cached toolchain is not relocatable.
       OUT: /home/runner/nanokvm-out
+    outputs:
+      report: ${{ steps.compare.outputs.report }}
     steps:
       - uses: actions/checkout@v7
         with:
           # The history of main, to find the main build to compare with.
           fetch-depth: 0
+          # Keep the token out of .git/config, where the build tools it runs
+          # could read it.
+          persist-credentials: false
 
       # Builds of main save the caches that every other ref restores.
       - uses: ./.github/actions/prepare-build
@@ -59,32 +61,31 @@ jobs:
           out: ${{ env.OUT }}
           save-caches: 'true'
 
+      - name: Restore component outputs
+        uses: ./.github/actions/component-cache
+        with:
+          out: ${{ env.OUT }}
+          mode: restore
+
       - name: Build
         env:
           # No Git record of the patched trees: it serves local patch work only.
           NANOKVM_PATCH_GIT: '0'
         run: |
-          platform/build.sh -o "$OUT" kernel modules uboot opensbi fip initramfs boot native tpu system tools server
-          # The Go build cache (about 1 GB) is not reused within a run.
-          rm -rf "$OUT/server/gocache"
-          platform/build.sh -o "$OUT" web firmware
+          python3 scripts/build-components.py --out "$OUT"
           du -sh "$OUT" "$OUT"/* 2>/dev/null | sort -h | tail -8
           df -h /
 
-      - name: Check native capture contracts
-        run: |
-          python3 tests/test-mjpeg-native-contracts.py --output "$RUNNER_TEMP/native-contracts"
-          python3 tests/test-mjpeg-native-contracts.py --output "$RUNNER_TEMP/native-contracts-sanitize" --sanitize
+      - name: Verify component reuse
+        env:
+          NANOKVM_PATCH_GIT: '0'
+        run: python3 scripts/build-components.py --out "$OUT" --verify
 
-      - name: Check zram page primitives
-        run: |
-          python3 tests/test-zram-pages.py --source "$OUT/kernel/src"
-          NANOKVM_SANITIZE=1 python3 tests/test-zram-pages.py --source "$OUT/kernel/src"
-
-      - name: Check LZ4 decoder contracts
-        run: |
-          python3 tests/test-lz4-decompressor.py --source "$OUT/kernel/src"
-          NANOKVM_SANITIZE=1 python3 tests/test-lz4-decompressor.py --source "$OUT/kernel/src"
+      - name: Save component outputs
+        uses: ./.github/actions/component-cache
+        with:
+          out: ${{ env.OUT }}
+          mode: save
 
       - name: Hashes
         run: platform/build.sh -o "$OUT" hashes
@@ -100,6 +101,7 @@ jobs:
       # reference is the newest build of a main commit it contains (a commit
       # that changes only documentation is not built).
       - name: Compare with main
+        id: compare
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,19 +126,39 @@ jobs:
             python3 scripts/compare-outputs.py "$RUNNER_TEMP/main/SHA256SUMS" "$OUT/images/SHA256SUMS" \
               --markdown --title 'Build outputs' --base "$label" > "$report"
           fi
+          # Markdown code, not a command substitution.
+          # shellcheck disable=SC2016
           printf 'Hashes: `outputs-sha256` artifact of [this run](%s).\n' "$RUN_URL" >> "$report"
           cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          eof=EOF-$(openssl rand -hex 16)
+          printf 'report<<%s\n%s\n%s\n' "$eof" "$(cat "$report")" "$eof" >> "$GITHUB_OUTPUT"
 
-      # One comment per pull request, updated by each build. A pull request
-      # from a fork has a read-only token and gets the job summary only.
+      - name: Save compiler cache
+        uses: ./.github/actions/save-compiler-cache
+        if: always() && steps.prepare.outputs.ccache-key != ''
+        with:
+          out: ${{ env.OUT }}
+          key: ${{ steps.prepare.outputs.ccache-key }}
+
+  # One comment per pull request, updated by each build. Its own job: the
+  # write token never shares a runner with the build's third-party code. A
+  # pull request from a fork has a read-only token and gets the job summary only.
+  comment:
+    name: Comment on the pull request
+    needs: build
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    permissions:
+      pull-requests: write
+    steps:
       - name: Comment on the pull request
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+          REPORT: ${{ needs.build.outputs.report }}
         run: |
           marker='<!-- release-build-outputs -->'
-          body="$marker"$'\n'"$(cat "$RUNNER_TEMP/outputs.md")"
+          body="$marker"$'\n'"$REPORT"
           # sed reads to the end, unlike head: no SIGPIPE for gh under pipefail.
           id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
                  --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | sed -n 1p)
@@ -145,10 +167,3 @@ jobs:
           else
             gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" > /dev/null
           fi
-
-      - name: Save compiler cache
-        uses: ./.github/actions/save-compiler-cache
-        if: always() && steps.prepare.outputs.ccache-key != ''
-        with:
-          out: ${{ env.OUT }}
-          key: ${{ steps.prepare.outputs.ccache-key }}

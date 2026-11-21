@@ -3,15 +3,14 @@ package webrtc
 import (
 	"NanoKVM-Server/common/pathmtu"
 	"NanoKVM-Server/common/rtpmtu"
-	"NanoKVM-Server/common/udpfast"
 	"NanoKVM-Server/middleware"
 	"NanoKVM-Server/service/stream"
+	"NanoKVM-Server/service/stream/icelocal"
 	"NanoKVM-Server/service/stream/iceservers"
 	"NanoKVM-Server/service/stream/srtpaccel"
 	"NanoKVM-Server/service/stream/webrtcdtls"
 	"encoding/json"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -51,10 +50,6 @@ func Connect(c *gin.Context) {
 	connect(c, encoderConfig)
 }
 
-func ConnectLegacy(c *gin.Context) {
-	connect(c, stream.LegacyEncoderConfig())
-}
-
 func connect(c *gin.Context, encoderConfig stream.EncoderConfig) {
 	// create WebSocket connection
 	wsConn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
@@ -84,7 +79,7 @@ func connect(c *gin.Context, encoderConfig stream.EncoderConfig) {
 	}
 
 	pathBudget := newPeerPathMTU()
-	videoConn, err := createPeerConnection(iceServers, mediaEngine, pathBudget)
+	videoConn, err := createPeerConnection(icelocal.For(c.Request), iceServers, mediaEngine, pathBudget)
 	if err != nil {
 		log.Errorf("failed to create h264 video peer connection: %s", err)
 		return
@@ -188,26 +183,21 @@ func createMediaEngine(config stream.EncoderConfig) (*webrtc.MediaEngine, error)
 	return mediaEngine, nil
 }
 
-func createPeerConnection(iceServers []webrtc.ICEServer, mediaEngine *webrtc.MediaEngine, budgets ...*peerPathMTU) (*webrtc.PeerConnection, error) {
+func createPeerConnection(path icelocal.Path, iceServers []webrtc.ICEServer, mediaEngine *webrtc.MediaEngine, budgets ...*peerPathMTU) (*webrtc.PeerConnection, error) {
 	settingEngine := webrtc.SettingEngine{}
-	configureDiagnosticICEInterface(&settingEngine)
-	// Keep a fixed-budget override for controlled comparisons and recovery.
-	if len(budgets) > 0 && budgets[0] != nil && os.Getenv("NANOKVM_WEBRTC_PMTU") != "0" {
-		network, err := pathmtu.NewNet(budgets[0].receive, os.Getenv("NANOKVM_WEBRTC_UDP_FAST") == "1")
-		if err != nil {
-			return nil, err
-		}
+	if path.Addresses != nil {
+		settingEngine.SetIPFilter(path.Addresses)
+	}
+	base, err := path.Net()
+	if err != nil {
+		return nil, err
+	}
+	settingEngine.SetNet(base)
+	if len(budgets) > 0 && budgets[0] != nil {
+		network := pathmtu.NewNet(base, path.Index(), budgets[0].receive)
 		settingEngine.SetNet(network)
-		if os.Getenv("NANOKVM_WEBRTC_UDP_BATCH") != "0" {
-			network.EnableFrameBatching()
-			budgets[0].setBatcher(network)
-		}
-	} else if os.Getenv("NANOKVM_WEBRTC_UDP_FAST") == "1" {
-		network, err := udpfast.NewNet()
-		if err != nil {
-			return nil, err
-		}
-		settingEngine.SetNet(network)
+		network.EnableFrameBatching()
+		budgets[0].setBatcher(network)
 	}
 	srtpaccel.Configure(&settingEngine)
 	if err := webrtcdtls.Configure(&settingEngine); err != nil {
@@ -223,6 +213,8 @@ func createPeerConnection(iceServers []webrtc.ICEServer, mediaEngine *webrtc.Med
 		if len(budgets) > 0 && budgets[0] != nil {
 			registry.Add(&rtpmtu.Factory{Budget: budgets[0].size})
 		}
+		// Keep NACK's copy: TrackLocalStaticRTP passes a pooled RTP header
+		// that it resets after the write, even when the payload is owned.
 		if err := webrtc.ConfigureNack(mediaEngine, registry); err != nil {
 			return nil, err
 		}
@@ -234,9 +226,14 @@ func createPeerConnection(iceServers []webrtc.ICEServer, mediaEngine *webrtc.Med
 	}
 
 	api := webrtc.NewAPI(apiOptions...)
+	certificates, err := webrtcdtls.Certificates()
+	if err != nil {
+		return nil, err
+	}
 
 	return api.NewPeerConnection(webrtc.Configuration{
 		ICEServers:   iceServers,
 		SDPSemantics: webrtc.SDPSemanticsUnifiedPlan,
+		Certificates: certificates,
 	})
 }

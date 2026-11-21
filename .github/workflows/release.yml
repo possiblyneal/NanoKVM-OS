@@ -38,6 +38,10 @@ on:
         description: 'Also include the stock migration package without publishing an SD image'
         type: boolean
         default: false
+      packages_only:
+        description: 'Publish an OTA patch through Pages only; no GitHub Release or image'
+        type: boolean
+        default: false
       dry_run:
         description: 'Test keys; publish nothing'
         type: boolean
@@ -60,13 +64,9 @@ on:
       - scripts/alpine-signer.sh
       - tests/test-apk-resign.py
       - tests/test-release-build-tar.py
-      - tests/test-release-storage.py
-      - tests/test-release-workflow.py
       - scripts/build-stock-installer.py
       - scripts/install-stock.py
       - firmware/stock-install/**
-      - tests/test-stock-installer.py
-      - tests/test-stock-layout-loop.py
 
 permissions:
   contents: read
@@ -105,7 +105,18 @@ jobs:
       # Reject other refs before sourcing or executing anything from the tree.
       - name: Validate release branch
         if: github.event_name == 'workflow_dispatch'
+        env:
+          PACKAGES_ONLY: ${{ inputs.packages_only }}
+          KIND: ${{ inputs.kind }}
+          IMAGE: ${{ inputs.image }}
+          STOCK_INSTALLER: ${{ inputs.stock_installer }}
         run: |
+          if [ "$PACKAGES_ONLY" = true ]; then
+            [ "$KIND" = patch ] && [ "$IMAGE" != true ] && [ "$STOCK_INSTALLER" != true ] || {
+              echo 'Packages-only publication requires patch without image or stock installer' >&2
+              exit 1
+            }
+          fi
           [[ "$GITHUB_REF" == refs/heads/main || "$GITHUB_REF" =~ ^refs/heads/release/[0-9]+\.[0-9]+$ ]] || {
             echo 'Select main or release/X.Y in Use workflow from' >&2
             exit 1
@@ -136,7 +147,7 @@ jobs:
             workflow_dispatch)
               gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[]' > "$RUNNER_TEMP/release-list"
               jq -s . "$RUNNER_TEMP/release-list" |
-                python3 scripts/next-release.py --channel "${CHANNEL:-stable}" --kind "$KIND" --ref "$REF" > "$RUNNER_TEMP/next"
+                python3 scripts/next-release.py --pages --channel "${CHANNEL:-stable}" --kind "$KIND" --ref "$REF" > "$RUNNER_TEMP/next"
               cat "$RUNNER_TEMP/next" >> "$GITHUB_OUTPUT"
               echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
               [ "$KIND" = minor ] && echo draft=true >> "$GITHUB_OUTPUT" || echo draft=false >> "$GITHUB_OUTPUT"
@@ -160,7 +171,7 @@ jobs:
               # Exercise reuse with a prospective release, as dispatch does.
               gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[]' > "$RUNNER_TEMP/release-list"
               jq -s . "$RUNNER_TEMP/release-list" |
-                python3 scripts/next-release.py --channel "$channel" --kind patch --ref main > "$RUNNER_TEMP/next"
+                python3 scripts/next-release.py --pages --channel "$channel" --kind patch --ref main > "$RUNNER_TEMP/next"
               cat "$RUNNER_TEMP/next" >> "$GITHUB_OUTPUT"
               printf 'image=true\ndraft=true\npublish=false\n' >> "$GITHUB_OUTPUT" ;;
           esac
@@ -171,17 +182,41 @@ jobs:
         with:
           out: ${{ env.OUT }}
 
+      - name: Restore component outputs
+        uses: ./.github/actions/component-cache
+        if: steps.version.outputs.skip != 'true'
+        with:
+          out: ${{ env.OUT }}
+          mode: restore
+
       - name: Build
         if: steps.version.outputs.skip != 'true'
         env:
           NANOKVM_PATCH_GIT: '0'
           NANOKVM_VERSION: ${{ steps.version.outputs.version }}
           NANOKVM_APK_VERSION: ${{ steps.version.outputs.apk_version }}
-        run: |
-          platform/build.sh -o "$OUT" kernel modules uboot opensbi fip initramfs boot native tpu system tools server
-          # The Go build cache (about 1 GB) is not reused within a run.
-          rm -rf "$OUT/server/gocache"
-          platform/build.sh -o "$OUT" web firmware hashes source
+        run: python3 scripts/build-components.py --out "$OUT"
+
+      - name: Verify component reuse
+        if: steps.version.outputs.skip != 'true'
+        env:
+          NANOKVM_PATCH_GIT: '0'
+        run: python3 scripts/build-components.py --out "$OUT" --verify
+
+      - name: Save component outputs
+        uses: ./.github/actions/component-cache
+        if: steps.version.outputs.skip != 'true'
+        with:
+          out: ${{ env.OUT }}
+          mode: save
+
+      - name: Hashes and corresponding source
+        if: steps.version.outputs.skip != 'true'
+        env:
+          NANOKVM_PATCH_GIT: '0'
+          NANOKVM_VERSION: ${{ steps.version.outputs.version }}
+          NANOKVM_APK_VERSION: ${{ steps.version.outputs.apk_version }}
+        run: platform/build.sh -o "$OUT" hashes source
 
       # The packages, root file system and SD image (always built, as a check
       # that the packages install), signed with a throwaway key: this job runs
@@ -289,18 +324,36 @@ jobs:
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/pages_store.py --stage "$OUT/assets/packages" --kind os --tag "$NANOKVM_VERSION"
+          PACKAGES_ONLY: ${{ inputs.packages_only }}
+        run: |
+          args=()
+          [ "$PACKAGES_ONLY" != true ] || args+=(--source "$OUT/assets/public/NanoKVM-OS-$NANOKVM_VERSION-source.tar.xz")
+          python3 scripts/pages_store.py --stage "$OUT/assets/packages" --kind os --tag "$NANOKVM_VERSION" "${args[@]}"
 
       # Prepare the complete public draft before freezing its matching package
       # candidate. A retry before candidate upload can repair a partial draft;
       # afterwards both sets must be reused without re-signing their contents.
       - name: Prepare OS draft
-        if: steps.candidate.outputs.upload == 'true'
+        if: steps.candidate.outputs.upload == 'true' && inputs.packages_only != true
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}
           PREVIOUS: ${{ needs.build.outputs.previous }}
         run: bash scripts/publish-release.sh --prepare
+
+      - name: Reserve package update tag
+        if: inputs.packages_only == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          ref="repos/$GITHUB_REPOSITORY/git/ref/tags/$NANOKVM_VERSION"
+          if gh api "$ref" > "$RUNNER_TEMP/package-tag.json" 2>/dev/null; then
+            test "$(jq -r .object.type "$RUNNER_TEMP/package-tag.json")" = commit
+            test "$(jq -r .object.sha "$RUNNER_TEMP/package-tag.json")" = "$SHA"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$NANOKVM_VERSION" -f sha="$SHA"
+          fi
 
       - uses: actions/upload-artifact@v7
         if: steps.candidate.outputs.upload == 'true'
@@ -310,6 +363,7 @@ jobs:
           retention-days: 90
 
       - name: Release
+        if: inputs.packages_only != true
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}

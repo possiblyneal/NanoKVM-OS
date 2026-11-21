@@ -3,14 +3,13 @@ import { Button, Switch } from 'antd';
 import { useAtom } from 'jotai';
 import {
   DiscIcon,
-  DownloadIcon,
   FileJsonIcon,
   KeyboardIcon,
-  LogOutIcon,
   MaximizeIcon,
   MouseIcon,
   NetworkIcon,
   PowerIcon,
+  SunMoonIcon,
   TerminalSquareIcon,
   VideoIcon,
   XIcon
@@ -19,6 +18,7 @@ import { useTranslation } from 'react-i18next';
 
 import * as ls from '@/lib/localstorage.ts';
 import { menuDisabledItemsAtom } from '@/jotai/settings.ts';
+import { CtrlAltDel } from '@/components/icons/ctrl-alt-del.tsx';
 import { Robot } from '@/components/icons/robot.tsx';
 import { Fold } from '@/components/ui/settings.tsx';
 
@@ -30,22 +30,21 @@ export const MenuIcons = () => {
 
   const items = [
     { key: 'keyboard', icon: <KeyboardIcon size={16} /> },
+    { key: 'ctrl-alt-del', icon: <CtrlAltDel size={16} />, label: 'keyboard.ctrlAltDel.title' },
     { key: 'mouse', icon: <MouseIcon size={16} /> },
     { key: 'image', icon: <DiscIcon size={16} /> },
-    { key: 'download', icon: <DownloadIcon size={16} /> },
     { key: 'terminal', icon: <TerminalSquareIcon size={16} /> },
     { key: 'script', icon: <FileJsonIcon size={16} /> },
     { key: 'wol', icon: <NetworkIcon size={16} /> },
     { key: 'picoclaw', icon: <Robot size={16} /> },
     { key: 'recorder', icon: <VideoIcon size={16} /> },
     { key: 'power', icon: <PowerIcon size={16} /> },
-    { key: 'logout', icon: <LogOutIcon size={16} />, label: 'settings.account.logoutBtn' },
+    { key: 'theme', icon: <SunMoonIcon size={16} />, label: 'settings.appearance.theme' },
     { key: 'fullscreen', icon: <MaximizeIcon size={16} />, label: 'fullscreen.toggle' },
     { key: 'collapse', icon: <XIcon size={16} />, label: 'menu.collapse' }
   ].filter(
     (item) =>
-      account.role === 'admin' ||
-      !['image', 'download', 'terminal', 'script', 'picoclaw'].includes(item.key)
+      account.role === 'admin' || !['image', 'terminal', 'script', 'picoclaw'].includes(item.key)
   );
 
   function updateItems(key: string) {

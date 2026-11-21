@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Divider, Modal, Segmented, Select, Tooltip } from 'antd';
+import { Divider, Modal, Segmented, Select } from 'antd';
 import clsx from 'clsx';
 import { useSetAtom } from 'jotai';
 import { DiscIcon, HardDriveIcon } from 'lucide-react';
@@ -9,6 +9,7 @@ import * as api from '@/api/storage.ts';
 import { releasePointerMenuFocus } from '@/lib/menu-focus.ts';
 import { submenuOpenCountAtom } from '@/jotai/settings.ts';
 import { useVirtualDisk } from '@/hooks/useVirtualDisk.ts';
+import { MenuTooltip } from '@/components/menu-tooltip.tsx';
 import { useDismissMobileMenu } from '@/components/mobile-menu-context.ts';
 
 import { Images } from './images.tsx';
@@ -17,10 +18,14 @@ import { RemoteImage } from './remote.tsx';
 import { Tips } from './tips.tsx';
 
 type ImageProps = {
-  tooltipPlacement?: 'bottom' | 'left' | 'right';
+  tooltipPlacement?: 'top' | 'bottom' | 'left' | 'right';
+  // Outside a toolbar: the title is shown beside the icon, and className
+  // gives the button its size and shape.
+  label?: boolean;
+  className?: string;
 };
 
-export const Image = ({ tooltipPlacement = 'bottom' }: ImageProps) => {
+export const Image = ({ tooltipPlacement = 'bottom', label = false, className }: ImageProps) => {
   const { t } = useTranslation();
   const setSubmenuOpenCount = useSetAtom(submenuOpenCountAtom);
   const dismissMobileMenu = useDismissMobileMenu();
@@ -117,12 +122,11 @@ export const Image = ({ tooltipPlacement = 'bottom' }: ImageProps) => {
 
   return (
     <>
-      <Tooltip
+      <MenuTooltip
         title={t('image.title')}
         placement={tooltipPlacement}
-        trigger={['hover', 'focus']}
-        mouseEnterDelay={0.6}
-        open={!isModalOpen && isTooltipOpen}
+        blocked={isModalOpen || label}
+        open={!label && !isModalOpen && isTooltipOpen}
         onOpenChange={(open) => setIsTooltipOpen(open && !openRef.current)}
       >
         <div
@@ -131,15 +135,23 @@ export const Image = ({ tooltipPlacement = 'bottom' }: ImageProps) => {
           aria-disabled={disabled}
           tabIndex={disabled ? -1 : 0}
           className={clsx(
-            'flex h-[30px] w-[30px] items-center justify-center rounded',
+            label
+              ? 'flex items-center gap-3 text-sm'
+              : 'flex h-[30px] w-[30px] items-center justify-center rounded',
             disabled
               ? 'cursor-not-allowed text-neutral-600 opacity-45'
-              : [
-                  'cursor-pointer hover:bg-neutral-700',
-                  isMounted || remoteConnected || netbootEnabled
-                    ? 'text-blue-500'
-                    : 'text-neutral-300 hover:text-white'
-                ]
+              : label
+                ? [
+                    'cursor-pointer hover:bg-neutral-700/50',
+                    (isMounted || remoteConnected || netbootEnabled) && 'text-blue-500'
+                  ]
+                : [
+                    'cursor-pointer hover:bg-neutral-700',
+                    isMounted || remoteConnected || netbootEnabled
+                      ? 'text-blue-500'
+                      : 'hover:text-fg-strong text-neutral-300'
+                  ],
+            className
           )}
           onClick={(event) => {
             releasePointerMenuFocus(event);
@@ -153,8 +165,9 @@ export const Image = ({ tooltipPlacement = 'bottom' }: ImageProps) => {
           }}
         >
           <DiscIcon size={18} />
+          {label && <span className="truncate">{t('image.title')}</span>}
         </div>
-      </Tooltip>
+      </MenuTooltip>
 
       <Modal open={isModalOpen && !disabled} footer={null} onCancel={() => toggleModal(false)}>
         <div className="flex items-center space-x-1">

@@ -1,5 +1,9 @@
 // NanoKVM OS adaptation, 2026-10-03. SPDX-License-Identifier: AGPL-3.0-only
 use std::io;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use crate::frame_crypto::FrameCipher;
 use crypto_secretbox::{Key, Nonce, Tag, XSalsa20Poly1305};
@@ -11,7 +15,7 @@ pub(crate) const MAX_PACKET_LENGTH: usize = 8 << 20;
 // hundred bytes each. The limit keeps unauthenticated peers from making the
 // server allocate full-size packets.
 pub(crate) const MAX_LOGIN_PACKET_LENGTH: usize = 64 << 10;
-const MAX_RETAINED_BUFFER: usize = 1 << 20;
+pub(crate) const MAX_RETAINED_BUFFER: usize = 1 << 20;
 // Room for the longest length prefix in front of a frame, so the prefix and
 // the payload go out in one write.
 const HEADER_ROOM: usize = 4;
@@ -92,6 +96,8 @@ pub struct FrameReader<R> {
     sequence: u64,
     buffer: Vec<u8>,
     max_length: usize,
+    skip_oversized: bool,
+    skipped: u64,
 }
 
 pub struct FrameWriter<W> {
@@ -99,6 +105,8 @@ pub struct FrameWriter<W> {
     cipher: Option<FrameCipher>,
     sequence: u64,
     buffer: Vec<u8>,
+    // Every byte written to the stream so far, length prefixes and tags included.
+    written: Arc<AtomicU64>,
 }
 
 impl<R> FrameReader<R>
@@ -112,6 +120,8 @@ where
             sequence: 0,
             buffer: Vec::new(),
             max_length: MAX_PACKET_LENGTH,
+            skip_oversized: false,
+            skipped: 0,
         }
     }
 
@@ -120,31 +130,65 @@ where
         self.max_length = max_length.min(MAX_PACKET_LENGTH);
     }
 
+    // From now on a packet longer than the limit but within the protocol's
+    // is read past and dropped instead of ending the stream.
+    pub fn skip_oversized(&mut self) {
+        self.skip_oversized = true;
+    }
+
+    // How many packets were dropped for their length.
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
     pub async fn read<M>(&mut self) -> io::Result<M>
     where
         M: ProstMessage + Default,
     {
-        let result = self.read_plaintext().await.and_then(|offset| {
-            M::decode(&self.buffer[offset..])
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-        });
+        let result = loop {
+            match self.read_plaintext().await {
+                Ok(Some(offset)) => {
+                    break M::decode(&self.buffer[offset..])
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                }
+                Ok(None) => self.skipped += 1,
+                Err(error) => break Err(error),
+            }
+        };
         release_oversized_buffer(&mut self.buffer);
         result
     }
 
     // Reads and decrypts one packet into the buffer and returns where the
-    // plaintext starts.
-    async fn read_plaintext(&mut self) -> io::Result<usize> {
-        read_payload_into(&mut self.inner, &mut self.buffer, self.max_length).await?;
+    // plaintext starts, or None for a packet dropped for its length.
+    async fn read_plaintext(&mut self) -> io::Result<Option<usize>> {
+        let length = read_length(&mut self.inner).await?;
+        if length > self.max_length {
+            if !self.skip_oversized || length > MAX_PACKET_LENGTH {
+                return Err(too_large());
+            }
+            // Drained through a small fixed buffer, so the packet costs no
+            // memory. It used up a nonce all the same: without the count the
+            // next packet would not decrypt. Its content is never decrypted,
+            // so a forged one can only end the session, as a cut stream can.
+            let length = length as u64;
+            let drained =
+                tokio::io::copy(&mut (&mut self.inner).take(length), &mut tokio::io::sink())
+                    .await?;
+            if drained != length {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            if self.cipher.is_some() {
+                next_sequence(&mut self.sequence)?;
+            }
+            return Ok(None);
+        }
+        self.buffer.resize(length, 0);
+        self.inner.read_exact(&mut self.buffer).await?;
         let Some(cipher) = &self.cipher else {
-            return Ok(0);
+            return Ok(Some(0));
         };
-        self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session nonce counter exhausted",
-            )
-        })?;
+        next_sequence(&mut self.sequence)?;
         if self.buffer.len() < XSalsa20Poly1305::TAG_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -156,8 +200,22 @@ where
         cipher
             .decrypt(&nonce(self.sequence), &mut self.buffer[offset..], &tag)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame decryption failed"))?;
-        Ok(offset)
+        Ok(Some(offset))
     }
+}
+
+fn next_sequence(sequence: &mut u64) -> io::Result<()> {
+    *sequence = sequence.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session nonce counter exhausted",
+        )
+    })?;
+    Ok(())
+}
+
+fn too_large() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "packet is too large")
 }
 
 impl<W> FrameWriter<W>
@@ -170,30 +228,62 @@ where
             cipher: key.map(|key| FrameCipher::new(Key::from_slice(&key.send))),
             sequence: 0,
             buffer: Vec::new(),
+            written: Arc::default(),
         }
+    }
+
+    /// The count of bytes written to the stream, which the writer keeps up to date.
+    pub fn written(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.written)
     }
 
     pub async fn write<M>(&mut self, message: &M) -> io::Result<()>
     where
         M: ProstMessage,
     {
-        self.buffer.clear();
-        let tag_length = if self.cipher.is_some() {
-            XSalsa20Poly1305::TAG_SIZE
-        } else {
-            0
-        };
-        let offset = HEADER_ROOM + tag_length;
+        let offset = self.room();
         let length = message
             .encoded_len()
-            .checked_add(tag_length)
+            .checked_add(offset - HEADER_ROOM)
             .filter(|&length| length <= MAX_PACKET_LENGTH)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "packet is too large"))?;
-        self.buffer.reserve(HEADER_ROOM + length);
-        self.buffer.resize(offset, 0);
-        message
-            .encode(&mut self.buffer)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.clear();
+        buffer.reserve(HEADER_ROOM + length);
+        buffer.resize(offset, 0);
+        let result = match message.encode(&mut buffer) {
+            Ok(()) => self.write_encoded(&mut buffer, offset).await,
+            Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        };
+        release_oversized_buffer(&mut buffer);
+        self.buffer = buffer;
+        result
+    }
+
+    // The bytes write_encoded needs before a message.
+    fn room(&self) -> usize {
+        HEADER_ROOM
+            + if self.cipher.is_some() {
+                XSalsa20Poly1305::TAG_SIZE
+            } else {
+                0
+            }
+    }
+
+    /// Sends the encoded message at `frame[start..]` from the caller's own
+    /// buffer: it is encrypted where it is, and the tag and the length
+    /// prefix go into the bytes before it (40 are always enough).
+    pub async fn write_encoded(&mut self, frame: &mut [u8], start: usize) -> io::Result<()> {
+        let room = self.room();
+        if start < room
+            || start > frame.len()
+            || frame.len() - start > MAX_PACKET_LENGTH - (room - HEADER_ROOM)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet is too large",
+            ));
+        }
         if let Some(cipher) = &self.cipher {
             self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
                 io::Error::new(
@@ -202,15 +292,15 @@ where
                 )
             })?;
             let tag = cipher
-                .encrypt(&nonce(self.sequence), &mut self.buffer[offset..])
+                .encrypt(&nonce(self.sequence), &mut frame[start..])
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "frame encryption failed")
                 })?;
-            self.buffer[HEADER_ROOM..offset].copy_from_slice(&tag);
+            frame[start - tag.len()..start].copy_from_slice(&tag);
         }
-        let result = write_frame(&mut self.inner, &mut self.buffer).await;
-        release_oversized_buffer(&mut self.buffer);
-        result
+        let bytes = write_frame(&mut self.inner, &mut frame[start - room..]).await?;
+        self.written.fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -249,7 +339,7 @@ where
     message
         .encode(&mut frame)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    write_frame(writer, &mut frame).await
+    write_frame(writer, &mut frame).await.map(|_| ())
 }
 
 async fn read_payload<R: AsyncRead + Unpin>(
@@ -268,10 +358,7 @@ async fn read_payload_into<R: AsyncRead + Unpin>(
 ) -> io::Result<()> {
     let length = read_length(reader).await?;
     if length > max_length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "packet is too large",
-        ));
+        return Err(too_large());
     }
     payload.resize(length, 0);
     reader.read_exact(payload).await?;
@@ -286,20 +373,21 @@ fn release_oversized_buffer(buffer: &mut Vec<u8>) {
 
 // Writes a frame whose payload starts after HEADER_ROOM unused bytes: the
 // length prefix goes into the end of that room, and the prefix and the
-// payload leave in one write.
-async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &mut [u8]) -> io::Result<()> {
+// payload leave in one write. Returns how many bytes went to the stream.
+async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &mut [u8]) -> io::Result<usize> {
     let (encoded, bytes) = encoded_length(frame.len() - HEADER_ROOM)?;
     let start = HEADER_ROOM - bytes;
     frame[start..HEADER_ROOM].copy_from_slice(&encoded.to_le_bytes()[..bytes]);
     writer.write_all(&frame[start..]).await?;
-    writer.flush().await
+    writer.flush().await?;
+    Ok(frame.len() - start)
 }
 
 #[cfg(test)]
 async fn write_payload<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
     let mut frame = vec![0; HEADER_ROOM];
     frame.extend_from_slice(payload);
-    write_frame(writer, &mut frame).await
+    write_frame(writer, &mut frame).await.map(|_| ())
 }
 
 async fn read_length<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<usize> {
@@ -556,5 +644,28 @@ mod tests {
         let mut reader = super::FrameReader::new(right, None);
         reader.set_max_length(super::MAX_LOGIN_PACKET_LENGTH);
         assert_eq!(reader.read::<Message>().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn skipped_oversized_packet_keeps_the_nonce_sequence() {
+        let packet = |size: usize| Message {
+            union: Some(message::Union::Hash(Hash {
+                salt: "s".repeat(size),
+                challenge: String::new(),
+            })),
+        };
+        let key = super::SessionKey::new([7; 32]);
+        let mut writer = super::FrameWriter::new(Writes::default(), Some(key.clone()));
+        for size in [10, super::MAX_LOGIN_PACKET_LENGTH * 2, 20] {
+            writer.write(&packet(size)).await.unwrap();
+        }
+        let wire = writer.inner.0.concat();
+        let mut reader = super::FrameReader::new(wire.as_slice(), Some(key));
+        reader.set_max_length(super::MAX_LOGIN_PACKET_LENGTH);
+        reader.skip_oversized();
+        assert_eq!(reader.read::<Message>().await.unwrap(), packet(10));
+        assert_eq!(reader.read::<Message>().await.unwrap(), packet(20));
+        assert_eq!(reader.skipped(), 1);
+        assert!(reader.buffer.capacity() < super::MAX_LOGIN_PACKET_LENGTH);
     }
 }

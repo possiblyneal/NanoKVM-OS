@@ -20,7 +20,10 @@ the SoC. Maximum 1440x2560 portrait output uses H.265 and requires client suppor
 Files, clipboard, chat and ATX are not implemented. RustDesk 1.5
 sessions attempt encrypted direct TCP by ID using LAN address exchange and NAT
 punching, then fall back to encrypted relay. IPv6-only direct-by-ID currently
-uses relay. The explicit IP listener remains loopback by default.
+uses relay. The explicit IP listener remains loopback by default; "Connect by
+address" in the settings (`listen_address` 0.0.0.0) opens it on the device's
+addresses. A client that connects by address has no key of the device to
+check, so such a session is not encrypted; the password is still asked for.
 
 The ID server only passes on the relay and peer addresses a controller asks
 for, so the daemon checks them before it connects. A relay must be the
@@ -30,8 +33,10 @@ Internet. Private addresses are accepted when the ID server itself is on a
 private network. Relay session IDs are at most 64 letters, digits, `-` or `_`.
 After login, a controller's packets may be up to 64 KiB.
 
-WebRTC follows the NanoKVM video transport (Settings > Video): the daemon
-accepts WebRTC exactly when that transport is WebRTC. It uses ICE/DTLS/SCTP through
+The daemon accepts WebRTC whenever the installed add-on supports it, whatever
+the NanoKVM video transport (Settings > Video) is. The client chooses: a
+request with a WebRTC offer is answered over WebRTC, one without over TCP or
+relay. WebRTC uses ICE/DTLS/SCTP through
 the existing Go/Pion stack without decode/re-encode. SDP and ICE use authenticated
 encrypted hbbs TCP; the signed RustDesk identity binds the local DTLS fingerprint.
 Relay remains available when the ID server cannot route signaling. ICE uses
@@ -51,22 +56,27 @@ and the app's selected pointer translation. Enabled remote access prepares USB
 keyboard and both mouse interfaces through the existing validated composition;
 unrelated functions are preserved.
 
+The picture contains the target's cursor, and the client is told so: it draws
+no pointer of its own. With `local_pointer` (Client pointer in the settings)
+the client draws one that moves at once, a blue dot as it gets no cursor
+shape, and the target's cursor follows it with the delay of the video.
+
 ## Package and settings
 
-nanokvm-rustdesk is an optional riscv64 package, absent from the base image list.
-It depends on bridge, WebRTC, audio, auto-codec and USB-defaults capability version
-1 supplied by the updated nanokvm-app, plus OpenRC. Upgrade the application before
+nanokvm-rustdesk is a riscv64 package built apart from the OS packages; nanokvm-release depends on it.
+It depends on bridge capability version 2 (the control channel described under
+"Remote access USB defaults") and WebRTC, audio, auto-codec and USB-defaults
+capability version 1 supplied by the updated nanokvm-app, plus OpenRC. Upgrade the application before
 this package. Installation alone leaves it stopped. Upgrade restarts only a service
 that was running; removal stops it and removes its runlevel entry.
 
-Software > Add-ons contains package installation, removal and upgrade when an
-upgrade candidate is available, plus a link to management. Settings > Extensions
-lists installed RustDesk and PicoClaw,
-including stopped services. RustDesk has one management screen with its ID,
-temporary password, service switch and password mode. Server and viewer
-settings are under Advanced settings. PicoClaw opens its existing control panel.
-English and Russian labels are provided. The old two-line UI patch is historical;
-do not apply it again to the integrated branch.
+The package is part of every NanoKVM OS: `nanokvm-release` depends on it, and
+it updates with the other packages. It stays off until switched on in
+Services > RustDesk; until then the daemon does not run and the server keeps
+no bridge socket open. RustDesk has one management screen with its versions,
+ID, temporary password, service switch and password mode. Server and viewer
+settings are under Advanced settings. English and Russian labels are
+provided.
 
 The private /etc/nanokvm-rustdesk directory contains config.json, the stable ID,
 UUID and signing key. User state survives package removal and reinstallation.
@@ -115,7 +125,7 @@ NANOKVM_RUSTDESK_DATA overrides the identity directory for isolated tests.
 Run Actions → RustDesk add-on → Run workflow on main after merging a change to
 the add-on (`.github/workflows/rustdesk.yml`). It builds and checks the APK,
 corresponding source with vendored crates, APKBUILD and checksums, then stages
-them for Pages. A lightweight `nanokvm-rustdesk-VERSION-rN` Git tag reserves the
+the APK for Pages; the archive and APKBUILD stay in the run's artifact. A lightweight `nanokvm-rustdesk-VERSION-rN` Git tag reserves the
 revision; no add-on GitHub Release is created. N is one more than the highest
 tagged revision of VERSION.
 
@@ -127,10 +137,11 @@ the add-on available; no OS release is required. PRs and `dry_run` never stage
 production candidates. Retry a Pages failure by rerunning APK repository on
 main, without rebuilding the add-on.
 
-Pages keeps the current version and two previous versions of each add-on,
-with corresponding sources and APKBUILDs retained permanently. Existing legacy
-RustDesk Releases keep their source assets so installed source links remain valid. Users update through Software → Add-ons;
-APK checks compatibility with their installed OS. OS publication does not pin
+Pages keeps the current version and two previous versions of each add-on.
+Its installed source link opens the Git tree of the version's tag, which
+stays. Existing legacy RustDesk Releases keep their source assets so their
+installed source links remain valid. Devices update it with the other
+packages; APK checks compatibility with their installed OS. OS publication does not pin
 or roll back independent add-ons. See [publication and retention](../../docs/UPDATES.md#package-publication-and-retention).
 
 ## Build and source
@@ -152,28 +163,35 @@ minimum version); rustup is not required for those distribution builds.
 
 For an unsigned local test package from the repository root, with cargo,
 fakeroot, a riscv64 musl GCC and apk-tools 3 mkpkg available:
-fakeroot python3 scripts/build-rustdesk-addon.py --linker /path/to/riscv64-linux-gcc --apk /path/to/host-apk --output work/rustdesk-artifacts --source-url https://dormancygrace.github.io/NanoKVM-OS/package-store/sources/nanokvm-rustdesk-VERSION-rN/nanokvm-rustdesk-VERSION-source.tar.gz
+fakeroot python3 scripts/build-rustdesk-addon.py --linker /path/to/riscv64-linux-gcc --apk /path/to/host-apk --output work/rustdesk-artifacts --source-url https://github.com/dormancygrace/NanoKVM-OS/tree/nanokvm-rustdesk-VERSION-rN/addons/rustdesk
 
-The exported source can also cross-build directly without repository scripts:
-CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=/path/to/riscv64-linux-gcc cargo build --locked --offline --release --target riscv64gc-unknown-linux-musl
+The exported source can also cross-build directly without repository scripts.
+The binary links the linker's musl, which must be 1.2.6 or later (Buildroot's
+is): rustup's own musl for this target starts threads on a misaligned stack, so
+`.cargo/config.toml` turns self-contained linking off. Put rustup's
+`libunwind.a` alone in a directory and repeat the configured flags with that
+directory added:
+mkdir -p /tmp/rust-unwind && cp "$(rustc --print sysroot)/lib/rustlib/riscv64gc-unknown-linux-musl/lib/self-contained/libunwind.a" /tmp/rust-unwind/
+CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=/path/to/riscv64-linux-gcc CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_RUSTFLAGS="<the rustflags of .cargo/config.toml> -C link-arg=-L/tmp/rust-unwind" cargo build --locked --offline --release --target riscv64gc-unknown-linux-musl
 
 Install the Rust riscv64gc-unknown-linux-musl target first. Keep the linker
 symlink name intact for Buildroot wrappers. The builder produces a static RV64GC
-binary without vector instructions and root:root payload ownership. It exports
+binary (its only vector instructions are the frame cipher's two C906 kernels)
+and root:root payload ownership. It exports
 adapted source, Cargo.lock, vendored dependencies and packaging recipes as a
-separate source archive published alongside the add-on on Pages. The APK installs only
-LICENSE, NOTICE, upstream.json and source.json (public URL and SHA-256), alongside
+separate source archive, kept with the build; it is not published. The APK installs only
+LICENSE, NOTICE, upstream.json and source.json (the Git tree URL), alongside
 the binary and lifecycle files. It never installs the source archive or vendored
-crates. The installed web link opens the source for the exact package revision.
+crates. The installed web link opens the source tree of the exact package revision.
 The builder performs no signing, publication or installation.
 
 For Alpine repository builds, place the exported source archive next to
 firmware/alpine/packages/nanokvm-rustdesk/APKBUILD, generate abuild checksums
 and build on riscv64 Alpine. Signing and repository publication belong to the
-normal release workflow after device qualification. GUI installation requires
+normal release workflow, after a test on a device. GUI installation requires
 a configured repository containing the package.
 
-## Qualification
+## Testing
 
 Host tests cover the protocol password challenge, rejected logins, continued
 video during a slow HID reply, input mapping, crypto/framing and persistent
@@ -184,10 +202,10 @@ before relying on the add-on.
 ## Versions and upstream reference
 
 The add-on has its own Cargo/APK version. `upstream.json` records the audited
-RustDesk 1.5.1 protocol reference and exact source commits; it is embedded in
+RustDesk 1.5.3 protocol reference and exact source commits; it is embedded in
 the daemon and installed alongside it so the UI follows the installed package.
 This is a partial protocol endpoint, not a full RustDesk fork.
-The 1.5.1 protocol additions are optional. Trusted-device v2 credentials,
+The protocol additions of 1.5.1 are optional. Trusted-device v2 credentials,
 OS-login messages and remote-USB control are not implemented or advertised;
 password authentication and the existing KX v0/v1 paths remain in use.
 `nanokvm-rustdesk --version` prints both versions without starting the service.
@@ -219,10 +237,10 @@ its input lease; remote keyboard options cannot override server-side permissions
 
 ## Default transport policy (0.3.0-r2)
 
-webrtc_enabled is not set by hand: the NanoKVM server writes it from the device
-video transport (true with WebRTC, false with Direct and MJPEG, false while the
-installed add-on lacks transport support) and restarts a running daemon when it
-changes. A configuration without the field keeps WebRTC off. Classic TCP rendezvous now attempts encrypted
+webrtc_enabled is not set by hand: the NanoKVM server writes it (true when the
+installed add-on supports transport settings, false otherwise) and restarts a
+running daemon when it changes. A configuration without the field keeps WebRTC
+off. Classic TCP rendezvous attempts encrypted
 direct TCP and local-address connection before relay. A direct listener is
 created only for a bounded ID-server request; the permanent direct-IP listener
 keeps its existing loopback default. Authentication, signed identity, KX v1,
@@ -272,7 +290,7 @@ disables RustDesk sound and client permission while leaving shared USB audio
 available to other viewers. Enabling it prepares USB audio automatically. The
 source computer must select the NanoKVM speaker output. Keyboard/mouse errors
 disable that session's input without ending video/audio; reconnect after restoring
-USB input. Individual HID requests time out after three seconds.
+USB input. Individual HID frames time out after three seconds.
 
 When the USB profile exposes only the relative mouse, the application bridge
 converts Android absolute positions into screen pixel deltas, preserves small
@@ -283,31 +301,56 @@ not hold input indefinitely. Login announces the negotiated keyboard permission
 on every connection. The application waits up to two seconds for the first
 usable encoder frame without changing HDMI power intent.
 
-The HID HTTP client keeps its write half open until the server response. The
-Content-Length header delimits each report; sending an early EOF would cancel
-Go net/http request contexts and disable input while video continues.
+Input goes to the app bridge on control.sock, like the other three sockets
+reachable by root only (directory 0700, socket 0600, peer uid 0); the bridge
+asks for nothing more. Each RustDesk session keeps one connection, opened with
+its first frame: `OKHC`, version 1, three reserved bytes and the 16-byte
+session id. A frame is a count of 1 to 8 and that many 8-byte records, a kind
+and 7 payload bytes:
 
-HID preparation, heartbeat and close requests send no body: the Go bridge answers
-these routes immediately, so a separate unused JSON body write could race its
-connection close and disable input with `Broken pipe`. HTTP headers and any report
-body are sent together.
+| Kind | Payload |
+| --- | --- |
+| 1 keyboard | modifiers, six key usages |
+| 2 relative pointer | buttons, x, y, wheel (signed bytes, x and y within ±127) |
+| 3 absolute pointer | buttons, x and y (u16 little-endian, 0 to 32767), wheel |
+| 4 heartbeat | |
+| 5 close | |
+| 6 prepare USB | belongs to no session; alone in its frame |
+
+The bridge answers every frame with one status byte: 0 done, 1 another
+controller holds input (the session waits for it), 2 the session lost input,
+3 invalid record, 4 timed out, 5 the USB write or preparation failed. The
+records of a frame run in order within two seconds altogether and the first
+failure ends the frame. Only a report takes the input lease; the bridge keeps
+a session, with what it holds, until its close record or ten seconds without
+a frame, whether or not its connection is still open. The steps of one
+relative movement share a frame, written at once.
+
+A connection that fails is replaced within the same three seconds and the
+frame is sent once more; a frame that timed out or was refused is not
+repeated. Keyboard and absolute pointer reports carry the whole state, so a
+repeated one changes nothing, and a relative frame can at most move the
+pointer twice. The bridge closes connections only when the app stops, which
+also releases every held key and button. An app that is killed releases
+nothing, with or without this channel; the session's next keyboard or
+pointer report then sets the state right.
 
 ## Display association
 
 This endpoint advertises one HDMI capture. A generic absolute USB mouse maps to
 the Windows primary display, so a secondary HDMI capture needs correct display
-association. In the accepted two-monitor test, control worked after making the
-captured NanoKVM display primary. OS monitor enumeration and capture switching
+association: with two monitors, control works when the captured NanoKVM
+display is the primary one. OS monitor enumeration and capture switching
 require a host helper and additional capture/selection support; they are not
 implemented in this version.
 
 ## C906 build
 
-The release build is the qualified C906 build: `cargo build --locked --offline --release --target riscv64gc-unknown-linux-musl` with the existing cross-linker environment (the native Alpine recipe uses `--target riscv64-alpine-linux-musl`). The release profile selects optimization level 3, full LTO and one codegen unit; `.cargo/config.toml` enables static CRT and the scalar T-Head extensions every C906 implements for both targets, so no extra option is needed. Keep the explicit `--target`: it confines the flags to target code (build scripts and proc-macros are built for the host). These are the settings the `performance` profile of 0.5.3-r2 used, byte for byte; the separate generic profile is gone. The packaging builder records the exact flags and compiler identity in build-profile.json. This Rust backend does not implement RVV 0.7.1; the build is scalar.
+The release build is the C906 build: `cargo build --locked --offline --release --target riscv64gc-unknown-linux-musl` with the existing cross-linker environment (the native Alpine recipe uses `--target riscv64-alpine-linux-musl`). The release profile selects optimization level 3, full LTO and one codegen unit; `.cargo/config.toml` enables static CRT, the scalar T-Head extensions every C906 implements and unaligned loads and stores (the C906 executes them itself; without the flag LLVM reads a word at an unknown alignment byte by byte) for both targets, so no extra option is needed. Keep the explicit `--target`: it confines the flags to target code (build scripts and proc-macros are built for the host). The settings above apply to every release build. The packaging builder records the exact flags and compiler identity in build-profile.json. This Rust backend does not implement RVV 0.7.1, so compiled code is scalar; the only vector instructions are the two generated kernels of the frame cipher (see "C906 framing and Salsa testing").
 
 Local unpublished APK/source pairs can be built with --local-only instead of --source-url; source.json records the local archive digest and publication state. This avoids claiming a public download exists before publication.
 
-## C906 framing and Salsa qualification
+## C906 framing and Salsa testing
 
 The frame reader and writer reuse a bounded payload buffer. Protobuf output is
 encoded behind a reserved 16-byte tag prefix, and XSalsa20-Poly1305 processes
@@ -315,48 +358,58 @@ that buffer in place. The existing tag-prefix wire format, KX directions and
 nonce counter rules are retained. Buffers above 1 MiB are released after the
 frame; the maximum wire frame is 8 MiB.
 
-An explicit RVV 0.7.1 Salsa prototype was correct on C906 but mostly slower
-than the scalar in-place path. Production uses RustCrypto scalar
-XSalsa20-Poly1305; no vector feature or extra assembly compiler is required.
+A video frame is not copied on its way: the bridge reader takes a buffer with
+room around the payload, that of an earlier frame unless it grew above 1 MiB,
+and reads into it without filling it first, the
+session writes the RustDesk message headers into that room, and the same
+buffer is encrypted and sent. A test compares the message with what prost
+encodes.
 
-With a static musl linker and the release profile:
+Production uses the XSalsa20-Poly1305 of `src/frame_crypto.rs`. Its plain
+Rust part (Salsa20 with the 16 state words in registers and whole-word XOR,
+Poly1305 in radix 2^64 with 128-bit products) does short frames, what is left
+over of long ones, and everything in the host tests. On the device, whole
+groups of five blocks go to two generated C906 kernels, the designs of the
+OS's ChaCha20 and Poly1305: four blocks in XTheadVector lanes and a fifth in
+scalar registers, their instructions interleaved.
 
-```sh
-cargo build --locked --release \
-  --target riscv64gc-unknown-linux-musl --features performance-probes \
-  --bin c906-crypto-perf
-```
+- `src/salsa20_c906.S` (`firmware/cpu/go-crypto-c906/gen_salsa20_c906.py`):
+  320 bytes per group, from the first whole group after the frame's first 32
+  bytes.
+- `src/poly1305_c906.S` (`gen_poly1305_vector.py --rust`): 80 bytes per group
+  in radix 2^26, from four groups on.
 
-The tool's `qualify` command checks tag-prefix byte equality, decryption,
-modified-tag handling, input/output guards and size/alignment boundaries.
-`bench` compares the allocation API, detached scalar API and current adapter.
-`frame-bench` compares the original protobuf/allocating encrypted writer with
-the actual current writer, using an observable sink. It records process CPU
-time, wall time and heap allocations. Run measurements on an otherwise idle
-device. These
-measurements do not include the encoder, network or client video decoder.
+Their vector and XTheadBb instructions are `.4byte` words that the generators
+check against GNU as, so rustc's own assembler builds them; CI checks that the
+files are what the generators write.
 
-On the qualified C906 build (then the `performance` profile), the actual writer benchmark measured
-34–37% less process CPU time for 16–256 KiB messages than the previous
-protobuf-plus-allocating-secretbox writer. After buffer warm-up, payload
-allocations fell from two per message to zero for retained sizes. These
-numbers describe the framing writer, excluding encoding and network delivery.
-The hardware gate covered 3,360 crypto cases and 256 active VXRM/VXSAT cases;
-the research prototype passed its counter-wrap and output-alignment checks.
+The kernels execute vector instructions without asking the kernel first, as
+the server's Go code does. Every NanoKVM OS kernel starts a program with
+vector state enabled (`CONFIG_RISCV_ISA_V_DEFAULT_ENABLE=y` in every kernel
+built from this repository, which includes every kernel shipped with the
+bridge this add-on depends on), neither the daemon nor
+its service turns it off, and kernel patch 0078 keeps it from being turned
+off at all. So the add-on needs no kernel newer than the one of the OS it can
+be installed on, and its start need not wait for a reboot.
 
-The installed scalar candidate preserved the configuration and identity
-byte for byte, registered with the official server, and passed signed/encrypted
-view-only login plus 120 real HDMI video messages through a finite local relay.
-Both client and relay ran on C906; the complete test took 4.92 seconds including
-setup and forwarded 2,147,489 video-direction bytes. The exact production
-scalar-profile test executable also passed all 59 non-ignored tests on C906.
-See `tests/relay` for the finite relay fixture and reproduction steps.
+The cipher is tested byte for byte against `crypto_secretbox`, and like it
+wipes the key when the session ends and the per-frame key material after each
+frame. The host tests run the plain Rust; on the device, 1319 lengths from 0
+to 262221 bytes at odd alignments give the reference's bytes, with changed
+tags and frames refused.
 
-The external-relay version of the 120-message test ends in EOF after 10–11
-messages on both the previous binary and the new candidate. Its cause remains
-unresolved; no external throughput improvement is claimed. The interop test
-requests no audio or HID input and sends finite normal protocol keepalives.
-No application encoder or Go scanner change is part of this optimization.
+One frame in place, encrypt (decrypt is the same):
+
+| frame | `crypto_secretbox` | plain Rust | with the C906 kernels |
+| --- | ---: | ---: | ---: |
+| 64 bytes | 5.7 us | 4.3 us | 4.4 us |
+| 1400 bytes | 56.8 us | 34.6 us | 20.7 us |
+| 16 KiB | 625 us (26 MB/s) | 370 us (44 MB/s) | 186 us (88 MB/s) |
+| 256 KiB | 10.7 ms | 6.0 ms | 3.0 ms |
+
+In plain Rust, Poly1305 takes 86 us of the 370 (149 us in RustCrypto's) and
+Salsa20 the rest: 1.1 us per 64-byte block, about one instruction per cycle
+on its 960 round instructions.
 
 For a new package revision, the packaging builder also accepts
 `--package-revision N`. Run its ownership stage under `fakeroot`, keep each

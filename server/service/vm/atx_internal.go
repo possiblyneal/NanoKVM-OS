@@ -8,11 +8,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"NanoKVM-Server/journal"
 	"NanoKVM-Server/pkg/bmc"
 )
 
 // ATX is the host's power buttons and LED for the BMC protocols: the
-// server's Redfish service directly, the IPMI add-on through bmc.ATXPath.
+// server's Redfish service directly, the IPMI daemon through bmc.ATXPath.
 // It drives the same GPIO lines, pulse lock and LED monitor as the web page.
 // Power control from a BMC protocol does not take part in the browser's
 // input control: like a hardware BMC, it works whoever holds the keyboard.
@@ -78,7 +79,7 @@ const (
 	errPressDuration atxError = "the press must last 100-60000 ms"
 )
 
-// GetATXInternal answers the IPMI add-on's state request (bmc.ATXPath).
+// GetATXInternal answers the IPMI daemon's state request (bmc.ATXPath).
 func (s *Service) GetATXInternal(c *gin.Context) {
 	state, err := ATX{}.State(c.Request.Context())
 	if err != nil {
@@ -90,6 +91,8 @@ func (s *Service) GetATXInternal(c *gin.Context) {
 
 // PressATXInternal executes a power action or single press (bmc.ATXPath).
 func (s *Service) PressATXInternal(c *gin.Context) {
+	// The only client of this API is the IPMI daemon.
+	c.Request = c.Request.WithContext(journal.WithActor(c.Request.Context(), "IPMI"))
 	pressATXInternal(c, ATX{})
 }
 

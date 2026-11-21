@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 type downloadStatus string
@@ -162,16 +164,11 @@ func (s *Service) finishDownload(done chan struct{}, status downloadStatus) {
 func (s *Service) ImageEnabled(c *gin.Context) {
 	var rsp proto.Response
 
-	testFile := "/data/.testfile"
-	file, err := os.Create(testFile)
-	if err != nil {
-		rsp.OkRspWithData(c, &proto.ImageEnabledRsp{Enabled: false})
-		return
-	}
-	defer file.Close()
-	defer os.Remove(testFile)
-
-	rsp.OkRspWithData(c, &proto.ImageEnabledRsp{Enabled: true})
+	// access(2) answers EROFS on a read-only mount without writing. A probe
+	// file would mark the exFAT volume dirty until unmount, so every power
+	// cut after a page load left /data needing a check.
+	enabled := unix.Access(imageDirectory, unix.W_OK) == nil
+	rsp.OkRspWithData(c, &proto.ImageEnabledRsp{Enabled: enabled})
 }
 
 func (s *Service) StatusImage(c *gin.Context) {
@@ -192,6 +189,65 @@ func (s *Service) StatusImage(c *gin.Context) {
 	})
 }
 
+// CheckImageUpload is advisory. The transfer rechecks its lock, space and
+// destination since another request can change them before the file arrives.
+func (s *Service) CheckImageUpload(c *gin.Context) {
+	var rsp proto.Response
+	c.Header("Cache-Control", "no-store")
+	name := c.Query("name")
+	if err := validateRemoteImageFilename(name); err != nil {
+		rsp.ErrRsp(c, -1, err.Error())
+		return
+	}
+	size, err := strconv.ParseInt(c.Query("size"), 10, 64)
+	if err != nil || size <= 0 {
+		rsp.ErrRsp(c, -1, "invalid image size")
+		return
+	}
+	if strings.EqualFold(filepath.Ext(name), ".img") {
+		if err := validateRawImageSize(size); err != nil {
+			rsp.ErrRsp(c, -1, err.Error())
+			return
+		}
+	}
+	s.downloadMutex.Lock()
+	busy := s.downloadDone != nil
+	s.downloadMutex.Unlock()
+	_, lockErr := os.Lstat(transferSentinelPath)
+	if busy || lockErr == nil {
+		rsp.ErrRsp(c, -1, errDownloadInProgress.Error())
+		return
+	}
+	if !os.IsNotExist(lockErr) {
+		rsp.ErrRsp(c, -1, lockErr.Error())
+		return
+	}
+	if err := unix.Access(imageDirectory, unix.W_OK); err != nil {
+		rsp.ErrRsp(c, -1, "image storage is not writable")
+		return
+	}
+	dir, err := os.Open(imageDirectory)
+	if err != nil {
+		rsp.ErrRsp(c, -1, err.Error())
+		return
+	}
+	defer dir.Close()
+	budget, err := imageWriteBudget(dir)
+	if err != nil {
+		rsp.ErrRsp(c, -1, err.Error())
+		return
+	}
+	if size > budget {
+		rsp.ErrRsp(c, -1, errImageSpace.Error())
+		return
+	}
+	if err := storage.CheckImageUnused(filepath.Join(imageDirectory, name)); err != nil {
+		rsp.ErrRsp(c, -1, err.Error())
+		return
+	}
+	rsp.OkRsp(c)
+}
+
 func (s *Service) DownloadImageFile(c *gin.Context) {
 	var rsp proto.Response
 
@@ -209,6 +265,9 @@ func (s *Service) DownloadImageFile(c *gin.Context) {
 	}
 	finalStatus := downloadStatusFailed
 	defer func() {
+		if c.Request.Context().Err() != nil {
+			finalStatus = downloadStatusIdle
+		}
 		s.finishDownload(done, finalStatus)
 	}()
 
@@ -286,6 +345,10 @@ func (s *Service) DownloadImageFile(c *gin.Context) {
 		if copyErr == nil {
 			partCloseErr = part.Close()
 		}
+		// The bytes must be on the card before the rename publishes the name.
+		if copyErr == nil {
+			copyErr = out.Sync()
+		}
 		outCloseErr := out.Close()
 		if errors.Is(copyErr, errSHA256Mismatch) {
 			finalStatus = downloadStatusChecksumFailed
@@ -307,8 +370,12 @@ func (s *Service) DownloadImageFile(c *gin.Context) {
 			return
 		}
 
-		if err := installImage(imageDirectory, tempPath, filename); err != nil {
-			rsp.ErrRsp(c, -1, err.Error())
+		// Canceled (also while waiting for the image lock): nothing is
+		// published, the temporary file goes and the page knows already.
+		if err := installImage(c.Request.Context(), imageDirectory, tempPath, filename); err != nil {
+			if c.Request.Context().Err() == nil {
+				rsp.ErrRsp(c, -1, err.Error())
+			}
 			return
 		}
 
@@ -348,7 +415,7 @@ func validateImageFilename(filename string, suffixes ...string) error {
 
 // installImage publishes a completed temporary file as filename in dir.
 // Uploads, new downloads and resumed downloads all add images through it.
-func installImage(dir, tempPath, filename string) error {
+func installImage(ctx context.Context, dir, tempPath, filename string) error {
 	if err := validateRemoteImageFilename(filename); err != nil {
 		return err
 	}
@@ -356,7 +423,7 @@ func installImage(dir, tempPath, filename string) error {
 	if err != nil {
 		return err
 	}
-	return storage.InstallImage(tempPath, destPath)
+	return storage.InstallImage(ctx, tempPath, destPath)
 }
 
 func (s *Service) DownloadImage(c *gin.Context) {
@@ -463,6 +530,9 @@ func (s *Service) downloadRemoteImage(
 	} else {
 		copyErr = downloadGoImage(ctx, rawURL, tempFile, expectedSHA256, onProgress)
 	}
+	if copyErr == nil && ctx.Err() == nil {
+		copyErr = tempFile.Sync()
+	}
 	closeErr := tempFile.Close()
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -478,7 +548,10 @@ func (s *Service) downloadRemoteImage(
 		return ctx.Err()
 	}
 
-	if err := installImage(imageDirectory, tempPath, filename); err != nil {
+	if err := installImage(ctx, imageDirectory, tempPath, filename); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("install downloaded image failed: %w", err)
 	}
 

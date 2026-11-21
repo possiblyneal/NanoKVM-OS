@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "Güç",
-    "showConfirm": "Doğrulama",
-    "showConfirmTip": "Güç ile ilgili işlemler fazladan doğrulama gerektirir",
     "reset": "Sıfırla",
     "powerShort": "Güç tuşu (bas-çek)",
     "powerLong": "Güç tuşu (uzun bas)",
@@ -350,12 +348,13 @@
         "modeAlways": "Her zaman görünür",
         "keyboardLedStatus": "Klavye kilidi göstergeleri",
         "keyboardLedStatusDesc": "Uzak bilgisayarın Caps Lock, Num Lock ve Scroll Lock durumunu menü çubuğunda göster.",
+        "hostLedStatus": "Güç ve disk göstergeleri",
+        "hostLedStatusDesc": "Uzak bilgisayarın güç ve HDD LED’lerini menü çubuğunda göster.",
         "icons": "Menü çubuğu düğmeleri",
         "iconsDesc": "Menü çubuğunda alt menü simgelerini görüntüle",
         "hiddenCount": "{{count}} gizli",
         "showAll": "Tümünü göster"
       },
-      "buttonColor": {},
       "browser": "Bu tarayıcıda",
       "browserDesc": "Yalnızca bu tarayıcıda saklanır; diğer tarayıcılar ve kullanıcıların kendi ayarları vardır.",
       "device": "Bu cihazdaki herkes için",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Yükle"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "Uzak bilgisayarın güç ve disk LED’leri",
+      "powerLed": "Güç LED’i",
+      "powerLedShort": "Pwr",
+      "hddLed": "HDD LED’i",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Uzak klavye kilidi durumu",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "Kaydet"
       },
-      "addons": {
-        "title": "Eklentiler",
-        "packages": "Paketler",
-        "install": "Kur"
-      },
       "title": "Yazılım",
+      "packages": "Paketler",
       "available": "Kullanılabilir paketler",
       "updatesTab": "Güncellemeler",
       "search": "Ara",
@@ -743,10 +745,7 @@
       }
     },
     "rustdesk": {
-      "absent": "Kurulu değil",
       "stopped": "Durduruldu",
-      "install": "Kur",
-      "remove": "Kaldır",
       "save": "Ayarları kaydet",
       "server": "Sunucu",
       "passwordMode": "Parola",
@@ -800,8 +799,7 @@
       "eventHint": {
         "power": "ana bilgisayar açıldı veya kapatıldı; güç LED'i bağlı ATX denetimi gerekir.",
         "hdmi": "görüntü kayboldu veya geri geldi, ana bilgisayar ekranını kapattığında da; video yakalama çalışırken algılanır.",
-        "security": "başarısız girişlerden sonra engellenen bir adres, yeni bir adresten giriş.",
-        "screen": "TPU eklentisinin tanıdığı mavi ekran veya kernel panic; kimse videoyu izlemezken metin okunur ve yanında bir ekran görüntüsü gönderilir."
+        "security": "başarısız girişlerden sonra engellenen bir adres, çok fazla IPMI giriş denemesi, yeni bir adresten giriş."
       },
       "field": {
         "token": "Belirteç",
@@ -882,6 +880,7 @@
         "hdmi_lost": "HDMI sinyali kayboldu",
         "hdmi_restored": "HDMI sinyali geri geldi",
         "security_lockout": "Girişler engellendi",
+        "security_attempt-limit": "Giriş denemeleri sınırlandı",
         "security_new-address": "Yeni adresten giriş",
         "screen_bsod": "Mavi ekran",
         "screen_panic": "Kernel panic",
@@ -927,16 +926,6 @@
         "authError": "Oturum artık çalışmıyor: {{error}}",
         "changed": "Oturum açma sırasında hizmet, istemci kimliği veya kiracı değişti. Yeniden oturum açın."
       }
-    },
-    "addonPage": {
-      "failed": "Eklentinin değerleri okunamadı",
-      "notRunning": "Eklentinin hizmeti çalışmıyor",
-      "refused": "Eklenti bunu reddetti",
-      "saved": "Kaydedildi",
-      "save": "Kaydet",
-      "status": "Durum",
-      "yes": "Evet",
-      "no": "Hayır"
     }
   },
   "picoclaw": {

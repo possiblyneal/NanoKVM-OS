@@ -2,8 +2,19 @@ import { http } from '@/lib/http.ts';
 import { inputLeaseHeaders } from '@/lib/input-lease.ts';
 
 // paste
-export function paste(content: string, langue: string) {
-  return http.post('/api/hid/paste', { content, langue }, { headers: inputLeaseHeaders() });
+// speed: 'normal', or 'slow' for what drops keys typed fast (a firmware
+// setup); a slow paste may take longer than the usual request.
+export function paste(content: string, langue: string, speed: 'normal' | 'slow' = 'normal') {
+  return http.post(
+    '/api/hid/paste',
+    { content, langue, speed },
+    {
+      timeout: 70 * 1000,
+      headers: inputLeaseHeaders(),
+      // Pasted text is often a password typed into the host.
+      sensitive: true
+    }
+  );
 }
 
 // press a fixed key sequence on the host: Ctrl+Alt+Del, one SysRq key, REISUB
@@ -64,5 +75,5 @@ export function setLeaderKey(key: string) {
   return http.post('/api/hid/shortcut/leader-key', { key });
 }
 
-export type ShortcutKey = { label: string; code: string };
-export type Shortcut = { id: string; keys: ShortcutKey[] };
+type ShortcutKey = { label: string; code: string };
+type Shortcut = { id: string; keys: ShortcutKey[] };

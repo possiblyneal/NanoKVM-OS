@@ -6,7 +6,6 @@ The platform builds upstream [OpenSBI v1.9](https://github.com/riscv-software-sr
 
 ```sh
 platform/build.sh -o build/platform -j8 fetch toolchain uboot opensbi fip
-python3 tests/test-nanokvm-fip.py --images build/platform/images
 ```
 
 The generic platform uses `-Os` (patch `0003`), no LTO, no RVV 1.0 code (`CC_SUPPORT_VECTOR=n`), `rv64imac_zicsr_zifencei` and soft-float `lp64`. C906 has a proprietary draft vector ISA: do not advertise standard V/RVV 1.0 in this M-mode DT. Linux retains its own board DT. The DT selects one application hart and 40 KiB aligned heap; the upstream platform default supplies an 8 KiB stack. Unsupported SUSP, CPPC, DBTR, SSE and MPXY facilities are disabled; other extensions retain upstream probing.
@@ -21,15 +20,15 @@ The generic platform uses `-Os` (patch `0003`), no LTO, no RVV 1.0 code (`CC_SUP
 
 The ELF manifest enforces the two PMP extents. Default upstream separates RX and RW firmware domains and denies S/U access to both. U-Boot copies these no-map reservations into the Linux DT. Its exact-address/size deduplication keeps the existing 128 KiB board reservation and adds the 64 KiB RW reservation. Do not replace the static Linux node with one overlapping 192/512 KiB node. The SD partition layout can remain unchanged.
 
-The M-mode DT has no static `reserved-memory` children. The stock FIP carries no BLCP/BLCP_2ND image (both sizes are zero), so the FSBL starts no small core (`No C906L image.`) and nothing uses the 2 MiB at `0x8d000000`; the earlier `c906l@8d000000` node in this DT only made U-Boot copy a useless `no-map` reservation into every Linux DT. Without it, and without the `c906l` node the board DTs used to carry, those 2 MiB are available to Linux. `scripts/nanokvm-fip.py` rejects a FIP that carries a BLCP_2ND image, because that image would run in an unreserved region. No OpenSBI or U-Boot code refers to `0x8d000000`.
+The M-mode DT has no static `reserved-memory` children. The FIP carries no BLCP/BLCP_2ND image (both sizes are zero), so the FSBL leaves the small core stopped (`No C906L image.`). Linux starts it later through `nanokvm_c906l`, with dynamically allocated memory for the [Opus encoder](../../docs/ACCELERATORS.md#small-core). There is no fixed 2 MiB small-core reservation at `0x8d000000`; the Linux board DT reserves only the first 128 KiB there for [crash logs](../../docs/LOGS.md). `scripts/nanokvm-fip.py` rejects a FIP that carries a BLCP_2ND image, because it would run before Linux allocates its memory and could overwrite that region. No OpenSBI or U-Boot code refers to `0x8d000000`.
 
 The FSBL passes `fw_dynamic_info` with U-Boot's entry and S-mode, so use FW_DYNAMIC. Its fixed FDT pointer `0x80011000` points inside a larger modern MONITOR. Patch `0001` adds optional `FW_DYNAMIC_FDT_ADDR`: the embedded DT initializes the generic platform and is relocated to the specified next-argument address. The default behavior of upstream FW_DYNAMIC remains unchanged when the option is absent.
 
 ## Vendor adaptation decisions
 
-| Vendor behavior | Decision and evidence |
+| Vendor behavior | Decision |
 |---|---|
-| C906 cache/CSR setup | Retain the original FSBL. Pinned `fsbl/lib/cpu/riscv/bl1_entrypoint.S` and `bl2_entrypoint.S` initialize mxstatus/mhcr/mcor and PLIC delegation before MONITOR. |
+| C906 cache/CSR setup | Retain the FSBL's. Pinned `fsbl/lib/cpu/riscv/bl1_entrypoint.S` and `bl2_entrypoint.S` initialize mxstatus/mhcr/mcor and PLIC delegation before MONITOR. |
 | C906 draft vector VS | Patch `0002` restores SG2002 mstatus[24:23] after generic hart initialization, including warm-hart startup. Vendor 0.9 used `0x01800000`; ratified upstream uses `0x600`. Without the SG2002 handoff, the installed Linux 7.2.9 faults at CSR_VLENB in `riscv_v_setup_vsize`. Standard VS and other SoCs are unchanged; firmware remains scalar. |
 | Vendor custom PMU SBI extension `0x09000001` | Use upstream SBI PMU with the SG2002 override in `platform/generic/thead/thead-generic.c`. Current mainline Linux uses standard SBI PMU. |
 | SBI 3.0 PMU event discovery | The M-mode DT explicitly maps event 1 to counter 0 (mcycle) and event 2 to counter 2 (minstret). Without this table, EVENT_GET_INFO makes Linux reject cycles/instructions despite registering the PMU. Raw events (`perf stat -e rN`, the C906 mhpmevent codes 0x1-0x2a) may use any programmable counter the hart has (the bitmap allows mhpmcounter3-17; on SG2002 eight raw events count at once, more are multiplexed); the mask is non-zero so the entry does not overlap the two fixed ones. Generic cache events are not mapped. |
@@ -37,14 +36,14 @@ The FSBL passes `fw_dynamic_info` with U-Boot's entry and S-mode, so use FW_DYNA
 | PLIC | Use mainline `thead,c900-plic`, 101 sources, M/S contexts. Upstream handles T-Head delegation. |
 | Vendor `thead,reset-sample` ebreak reset | Do not carry the sample reset handler; it is not matched by the stock DT. System reset is advertised only if an upstream backend supports it. Linux/U-Boot have the SoC reset driver. |
 | T-Head TH1520 TLB erratum | Retain upstream's model-specific selection; do not apply an unrelated workaround to SG2002. |
-| DDR, BLCP and BLCP_2ND | Preserve their bytes and relevant parameter fields from base FIP. No OTP/eFuse changes or new signing flow. |
-| BL2 | The verified stock image receives only the MPLL immediate change from `0x00448101` to `0x04508101` (850 to 1000 MHz), plus its required CRC updates. All other first-stage bytes are preserved. |
+| Chip configuration, DDR, BLCP and BLCP_2ND | Chip configuration and DDR parameters from the pinned FSBL tree, as the SDK's `fip.mk`; no BLCP or BLCP_2ND image. No OTP/eFuse changes or new signing flow. |
+| BL2 | Built from source with `../fsbl/*.patch` (see [../fsbl/README.md](../fsbl/README.md)), including the C906 PLL at 1000 MHz. |
 
 The source audit compares the pinned vendor OpenSBI tree with upstream v0.9 and v1.9; not every vendor/upstream diff is an SG2002 requirement.
 
 ## Validation
 
-`scripts/nanokvm-fip.py` independently checks both parameter CRCs, component CRCs, 512-byte alignment, file overlaps, load/run addresses, first-stage/DDR/small-core preservation and absence of a BLCP_2ND image, exact MONITOR and decompressed U-Boot bytes. The vendor FIP generator includes zero padding in the compressed loader size; the validator accepts only zero trailing padding.
+`scripts/nanokvm-fip.py` independently checks both parameter CRCs, component CRCs, 512-byte alignment, file overlaps, load/run addresses, the built BL2 bytes, first-stage parameter/DDR/small-core preservation and absence of a BLCP_2ND image, and the exact OpenSBI and U-Boot bytes, decoding both LZ4 frames with its own decoder. It accepts only the frame layout the build produces (independent 256 KiB blocks, no checksums, header checksum verified) and blocks that follow the LZ4 format's end rules, within the size the FSBL decodes into, so a frame it certifies is one the FSBL's decoder accepts (`../fsbl/README.md`, patch `0006`: it accepts a superset of this layout). The vendor FIP generator includes zero padding in the compressed loader size; the validator accepts only zero trailing padding. The FSBL decodes the OpenSBI frame (`../fsbl/README.md`, "Compression").
 
 `images/opensbi/build-manifest.json` records the source/tree pin, patches/config/DT hashes, compiler, optimization, binary hash, ELF symbols and PMP extents. `images/fip-manifest.json` records component hashes and checks. Neither manifest establishes successful hardware boot.
 
@@ -82,7 +81,7 @@ takes effect at the next boot. How the ROM behaves with a missing or damaged `fi
 replace it and how to recover without a card reader are in
 [docs/BOOT.md](../../docs/BOOT.md).
 
-When qualifying a new OpenSBI, capture the full boot from FSBL through OpenSBI
+When testing a new OpenSBI, capture the full boot from FSBL through OpenSBI
 and U-Boot to Linux. Check the OpenSBI version, timer/PLIC initialization, both
 domain regions, DT address and S-mode handoff; then kernel boot,
 reserved-memory warnings, SBI PMU, storage/network, application/video and a

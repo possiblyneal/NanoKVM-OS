@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "Accensione",
-    "showConfirm": "Conferma",
-    "showConfirmTip": "Le operazioni di alimentazione richiedono una conferma aggiuntiva",
     "reset": "Reimposta",
     "powerShort": "Accensione (clic breve)",
     "powerLong": "Accensione (clic lungo)",
@@ -350,12 +348,13 @@
         "modeAlways": "Sempre visibile",
         "keyboardLedStatus": "Indicatori di blocco della tastiera",
         "keyboardLedStatusDesc": "Mostra Bloc Maiusc, Bloc Num e Bloc Scorr del computer remoto nella barra dei menu.",
+        "hostLedStatus": "Indicatori di alimentazione e disco",
+        "hostLedStatusDesc": "Mostra i LED di alimentazione e del disco del computer remoto nella barra dei menu.",
         "icons": "Pulsanti della barra dei menu",
         "iconsDesc": "Visualizza le icone dei sottomenu nella barra dei menu",
         "hiddenCount": "{{count}} nascosti",
         "showAll": "Mostra tutto"
       },
-      "buttonColor": {},
       "browser": "In questo browser",
       "browserDesc": "Salvato solo in questo browser; altri browser e utenti hanno le proprie impostazioni.",
       "device": "Per tutti su questo dispositivo",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Carica"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "LED di alimentazione e del disco del computer remoto",
+      "powerLed": "LED di alimentazione",
+      "powerLedShort": "Pwr",
+      "hddLed": "LED del disco",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Stato dei blocchi della tastiera remota",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "Salva"
       },
-      "addons": {
-        "title": "Componenti aggiuntivi",
-        "packages": "Pacchetti",
-        "install": "Installa"
-      },
       "title": "Software",
+      "packages": "Pacchetti",
       "available": "Pacchetti disponibili",
       "updatesTab": "Aggiornamenti",
       "search": "Cerca",
@@ -742,10 +744,7 @@
       }
     },
     "rustdesk": {
-      "absent": "Non installato",
       "stopped": "Arrestato",
-      "install": "Installa",
-      "remove": "Rimuovi",
       "save": "Salva impostazioni",
       "server": "Server",
       "passwordMode": "Password",
@@ -799,8 +798,7 @@
       "eventHint": {
         "power": "l'host è stato acceso o spento; richiede il controllo ATX con il LED di alimentazione collegato.",
         "hdmi": "l'immagine è andata persa o è tornata, anche quando l'host spegne il display; rilevato mentre l'acquisizione video è in corso.",
-        "security": "un indirizzo bloccato dopo accessi falliti, un accesso da un nuovo indirizzo.",
-        "screen": "una schermata blu o un kernel panic, riconosciuti dal componente aggiuntivo TPU; il testo viene letto quando nessuno guarda il video e con esso viene inviato uno screenshot."
+        "security": "un indirizzo bloccato dopo accessi falliti, troppi tentativi di accesso IPMI, un accesso da un nuovo indirizzo."
       },
       "field": {
         "token": "Token",
@@ -881,6 +879,7 @@
         "hdmi_lost": "Segnale HDMI perso",
         "hdmi_restored": "Segnale HDMI ripristinato",
         "security_lockout": "Accessi bloccati",
+        "security_attempt-limit": "Tentativi di accesso limitati",
         "security_new-address": "Accesso da un nuovo indirizzo",
         "screen_bsod": "Schermata blu",
         "screen_panic": "Kernel panic",
@@ -926,16 +925,6 @@
         "authError": "L'accesso non funziona più: {{error}}",
         "changed": "Il servizio, l'ID client o il tenant sono cambiati durante l'accesso. Accedi di nuovo."
       }
-    },
-    "addonPage": {
-      "failed": "Impossibile leggere i valori del componente aggiuntivo",
-      "notRunning": "Il servizio del componente aggiuntivo non è in esecuzione",
-      "refused": "Il componente aggiuntivo l'ha rifiutato",
-      "saved": "Salvato",
-      "save": "Salva",
-      "status": "Stato",
-      "yes": "Sì",
-      "no": "No"
     }
   },
   "picoclaw": {

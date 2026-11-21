@@ -10,14 +10,14 @@ in [docs/BUILD.md](../docs/BUILD.md) and [platform/README.md](../platform/README
 | [boards/](boards/README.md) | SG2002 device trees for alpha, beta and PCIe, and the first-boot board detection |
 | [buildroot/](buildroot/README.md) | Buildroot external tree: cross toolchain, host tools and initramfs utilities only |
 | `cpu/` | C906 assembly for Go's TLS ChaCha20-Poly1305 and `bytes.Index`, and opt-in Go sysmon policies |
-| `crypto/` | cryptodev-linux with the NanoKVM patch, and SG2002 crypto benchmarks |
+| `crypto/` | OpenSSL patches for the C906 and the SG2002 crypto engine, with their generators and tests |
 | `mpi/` | Media library compatibility code and the vendor ISP object list |
-| `probes/` | Capture and encoder probes built by `scripts/build-capture-qualification.py` |
+| `probes/` | EDID profile generators (`edid120/`) used by the platform build |
 | `sensor/` | LT6911 HDMI receiver driver patches |
 | `services/` | Serial console and serial bridge services with their tests |
 | `sources/` | BusyBox 1.36.1 source, kept for the GPL while v2.0-b4 is supported |
-| `toolchain/` | T-Head instruction probe and profile |
-| `sources.json` | Pinned upstream sources |
+| [toolchain/](toolchain/thead/README.md) | C906 compiler and instruction notes |
+| `sources.json` | Kernel, json-c and miniz details that the MPI build and update scripts read; the pins themselves are in `platform/sources.lock` |
 
 ## C906 notes
 
@@ -28,6 +28,3 @@ in [docs/BUILD.md](../docs/BUILD.md) and [platform/README.md](../platform/README
   through `scripts/nanokvm_cpu_profile.py`, and
   `scripts/audit-kbuild-profile.py` checks the kernel build for it. See the
   CPU profile section of [docs/BUILD.md](../docs/BUILD.md).
-
-The notes on the earlier Buildroot and Linux 7.2.3 port that used to be here
-are in the Git history of this file.

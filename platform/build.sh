@@ -6,26 +6,26 @@
 #
 # Steps, in order (default: all of them):
 #   fetch      download and verify every input in sources.lock
-#   toolchain  Buildroot 2026.08.1: cross toolchain, host tools, initramfs userland
-#   kernel     Linux 7.3.1 with kernel/*.patch and kernel/config
+#   toolchain  Buildroot 2026.08.2: cross toolchain, host tools, initramfs userland
+#   kernel     Linux 7.3.5 with kernel/*.patch and kernel/config
 #              (NANOKVM_KERNEL_PROFILE=debug adds kernel/config-debug.fragment)
 #   modules    out-of-tree modules; stage /lib/modules like nanokvm-kmod
 #   uboot      U-Boot 2026.10 with uboot/*.patch and uboot/defconfig
 #   opensbi    OpenSBI 1.9: SG2002 FW_DYNAMIC with embedded M-mode DT
-#   fip        fip.bin: stock FSBL/DDR with new OpenSBI and U-Boot
+#   fip        fip.bin: FSBL built with fsbl/*.patch, OpenSBI and U-Boot
 #   initramfs  initramfs from boot/initramfs.list and the Buildroot userland
 #   boot       board device trees and boot.sd images like nanokvm-kernel
 #   native     SOPHGO media libraries, libkvm_mmf and libkvm
 #   tpu        TPU runtime and the programs that run models on it
 #   system     kvm_system board service
 #   tools      devmem, nanokvm_update_edid, EDID profiles, board probe, USB audio,
-#              exfatprogs, i2c-tools, lolcat, OpenSSL, zlib-ng and liblzma for the server
+#              exfatprogs, i2c-tools, lolcat, OpenSSL and zlib-ng (also for the server)
 #   server     NanoKVM-Server and update/USB internet helpers
 #   web        web UI
 #   firmware   Wi-Fi, regulatory and video codec firmware
 #   hashes     write OUTPUT/images/SHA256SUMS, the hash of every output
-#   payloads   contents of the nineteen NanoKVM packages, from packages.list
-#   packages   signed APK repository of the nineteen packages
+#   payloads   contents of the eighteen NanoKVM packages, from packages.list
+#   packages   signed APK repository of the eighteen packages
 #   rootfs     Alpine 3.24 root file system with nanokvm-release
 #   image      SD card image
 # Not in the default list:
@@ -46,7 +46,7 @@
 # with a throwaway key made in OUTPUT/keys/build; the image trusts only the
 # published keys, and scripts/sign-release.sh then signs the repository with
 # the release key, outside the build. NANOKVM_KERNEL_PROFILE=debug builds
-# the kernel and its modules with kernel/config-debug.fragment (release 7.3.1-nanokvm-os-rN-debug)
+# the kernel and its modules with kernel/config-debug.fragment (release 7.3.5-nanokvm-os-rN-debug)
 # and, with -d only, packages and an image that add platform/debug-packages.
 # With NANOKVM_PREVIOUS (the URL or directory of the
 # published repository's riscv64/ with packages.json) a package whose content
@@ -108,14 +108,18 @@ export GIT_CEILING_DIRECTORIES=$out
 
 # The Release workflow sets the versions of a release; local builds read
 # firmware/alpine/release.env.
-version=${NANOKVM_VERSION:-$(sed -n 's/^NANOKVM_VERSION=//p' "$repo/firmware/alpine/release.env")}
+version=
+case " ${steps[*]} " in
+    *" payloads "* | *" packages "* | *" rootfs "* | *" image "* | *" stock-installer "* | *" source "*)
+        version=${NANOKVM_VERSION:-$(sed -n 's/^NANOKVM_VERSION=//p' "$repo/firmware/alpine/release.env")} ;;
+esac
 # Official Alpine packages.
 profile=stock
-release=7.3.1-nanokvm-os-r10
+release=7.3.5-nanokvm-os-r10
 [ "$kernel_profile" = release ] || release=$release-debug
 # Fixed build times keep identical inputs reproducible. The kernel timestamp
-# is the upstream Linux 7.3.1 release date (00:00 UTC).
-kernel_timestamp='Fri Oct 30 00:00:00 UTC 2026'
+# is the upstream Linux 7.3.5 release date (00:00 UTC).
+kernel_timestamp='Tue Nov 17 00:00:00 UTC 2026'
 uboot_epoch=1788737047
 rtl8733bs_epoch=1788607804
 isa=$(python3 "$repo/scripts/nanokvm_cpu_profile.py" kernel)
@@ -245,7 +249,7 @@ toolchain() {
     else
         rm -rf "$br" "$bo"
         mkdir -p "$br"
-        tar -xf "$dl/buildroot-2026.08.1.tar.xz" -C "$br" --strip-components=1
+        tar -xf "$dl/buildroot-2026.08.2.tar.xz" -C "$br" --strip-components=1
         for patch in "$repo"/firmware/buildroot/source-patches/*.patch; do
             patch -s --batch --forward --fuzz=0 -d "$br" -p1 < "$patch"
         done
@@ -275,11 +279,23 @@ toolchain() {
     echo "$id" > "$bo/.platform-toolchain"
 }
 
-kernel() {
+kernel_make() {
+    KBUILD_BUILD_USER=nanokvm KBUILD_BUILD_HOST=builder KBUILD_BUILD_VERSION=1 \
+        KBUILD_BUILD_TIMESTAMP=$kernel_timestamp make -C "$ksrc" O="$kbuild" ARCH=riscv \
+        CROSS_COMPILE="$cross" CC="${cross}gcc" LOCALVERSION= "KCFLAGS=$isa" \
+        PAHOLE=nkos-no-pahole RUSTC=nkos-no-rustc BINDGEN=nkos-no-bindgen "$@"
+}
+
+kernel_source() {
     rm -rf "$out/kernel"
     mkdir -p "$out/kernel" "$kbuild"
-    tar -xf "$dl/linux-7.3.1.tar.xz" -C "$out/kernel"
-    mv "$out/kernel/linux-7.3.1" "$ksrc"
+    tar -xf "$dl/linux-7.3.5.tar.xz" -C "$out/kernel"
+    mv "$out/kernel/linux-7.3.5" "$ksrc"
+    # The order of the hot kernel functions, included by vmlinux.lds.S (patch
+    # 0088, docs/KERNEL-HOT-TEXT.md).
+    cp "$here/kernel/hot-text.lds" "$ksrc/arch/riscv/kernel/vmlinux-hot.lds.h"
+    # CONFIG_UNUSED_KSYMS_WHITELIST: exports the out-of-tree modules import.
+    cp "$here/kernel/ksyms-keep.txt" "$ksrc/nanokvm-ksyms-keep.txt"
     apply_patches "$ksrc" "$here/kernel"
     python3 "$repo/scripts/nanokvm_cpu_profile.py" kernel --record "$out/kernel/cpu-profile.json" --compiler "${cross}gcc"
     cp "$here/kernel/config" "$kbuild/.config"
@@ -295,10 +311,7 @@ kernel() {
     # Kconfig takes the last assignment of an option.
     [ "$kernel_profile" = release ] || cat "$here/kernel/config-debug.fragment" >> "$kbuild/.config"
     # Host pahole, rustc and bindgen would be recorded in .config; ignore them.
-    local make=(make -C "$ksrc" O="$kbuild" ARCH=riscv CROSS_COMPILE="$cross" CC="${cross}gcc" LOCALVERSION= "KCFLAGS=$isa"
-                PAHOLE=nkos-no-pahole RUSTC=nkos-no-rustc BINDGEN=nkos-no-bindgen)
-    KBUILD_BUILD_USER=nanokvm KBUILD_BUILD_HOST=builder KBUILD_BUILD_VERSION=1 \
-        KBUILD_BUILD_TIMESTAMP=$kernel_timestamp "${make[@]}" olddefconfig
+    kernel_make olddefconfig
     if [ "$kernel_profile" = release ]; then
         diff -u "$out/kernel/expected.config" "$kbuild/.config"
     else
@@ -308,27 +321,65 @@ kernel() {
         done
     fi
     grep -qx "CONFIG_LTO_NONE=y" "$kbuild/.config"
-    KBUILD_BUILD_USER=nanokvm KBUILD_BUILD_HOST=builder KBUILD_BUILD_VERSION=1 \
-        KBUILD_BUILD_TIMESTAMP=$kernel_timestamp "${make[@]}" -j"$jobs" Image modules
+}
+
+kernel() {
+    kernel_source
+    kernel_make -j"$jobs" Image modules
     [ "$(cat "$kbuild/include/config/kernel.release")" = "$release" ]
     mkdir -p "$img"
     cp "$kbuild/arch/riscv/boot/Image" "$img/Image"
+    kernel_exports
+}
+
+kernel_exports() {
+    local state=$out/component-support/kernel strip=()
+    rm -rf "$state"
+    mkdir -p "$state"
+    cp "$kbuild/.config" "$kbuild/Module.symvers" "$kbuild/System.map" "$state/"
+    cp "$kbuild/usr/gen_init_cpio" "$kbuild/include/generated/utsversion.h" "$state/"
+    [ "$kernel_profile" = release ] || strip=(INSTALL_MOD_STRIP=1)
+    kernel_make INSTALL_MOD_PATH="$state/modules" DEPMOD=true "${strip[@]}" modules_install
+    rm -f "$state/modules/lib/modules/$release/build" "$state/modules/lib/modules/$release/source"
+}
+
+# Recreate working headers/tools from pinned sources, without rebuilding Linux.
+# Only immutable ABI exports are restored from the component cache.
+kernel_state() {
+    local state=$out/component-support/kernel name
+    for name in .config Module.symvers System.map gen_init_cpio utsversion.h; do
+        [ -s "$state/$name" ] || { echo "Missing cached kernel export: $name" >&2; return 1; }
+    done
+    kernel_source
+    kernel_make -j"$jobs" modules_prepare
+    cmp "$state/.config" "$kbuild/.config"
+    cp "$state/Module.symvers" "$state/System.map" "$kbuild/"
+    mkdir -p "$kbuild/usr"
+    cp "$state/gen_init_cpio" "$kbuild/usr/"
+    cp "$state/utsversion.h" "$kbuild/include/generated/"
+}
+
+osdrv_source() {
+    local dest=$out/modules/sources/osdrv
+    rm -rf "$dest"
+    unpack_git osdrv . "$dest"
+    apply_patches "$dest" "$here/modules/osdrv"
 }
 
 modules() {
     local m=$out/modules src name module symbols=() maps target
     rm -rf "$m" "${img:?}/lib"
     src=$m/sources
-    unpack_git osdrv . "$src/osdrv"
+    osdrv_source
     unpack_git aic8800 src/SDIO/driver_fw/driver/aic8800 "$src/wifi"
-    unpack_git cryptodev . "$src/cryptodev"
     cp -r "$here/modules/hwcrypto" "$src/aes"
+    cp -r "$here/modules/c906l" "$src/c906l"
+    # The small core's program (the Opus encoder), embedded in nanokvm_c906l.
+    python3 "$repo/scripts/build-c906l-firmware.py" --cross "$cross" --opus-archive "$dl/opus-1.6.1.tar.gz" \
+        --jobs "$jobs" --output "$src/c906l/c906l.bin"
     cp -r "$here/modules/cv181x-aximon" "$src/aximon"
-    cp -r "$here/modules/cv181x-trng" "$src/trng"
     unpack_git sipeed-sdk osdrv/extdrv/wireless/rtl8733bs "$m/rtl8733bs"
-    apply_patches "$src/osdrv" "$here/modules/osdrv"
     apply_patches "$src/wifi" "$here/modules/aic8800"
-    apply_patches "$src/cryptodev" "$here/modules/cryptodev"
     apply_patches "$m/rtl8733bs" "$here/modules/rtl8733bs"
 
     # __FILE__ is kept in stripped modules; map paths as the v2.0 build did.
@@ -345,10 +396,9 @@ modules() {
         symbols+=("$module/Module.symvers")
     done
     build "$src/wifi" CONFIG_PLATFORM_UBUNTU=n CONFIG_SDIO_BT=y CONFIG_AIC8800_BTLPM_SUPPORT=n CONFIG_USE_FW_REQUEST=y
+    build "$src/c906l" "C906L_FW=$src/c906l/c906l.bin"
     build "$src/aes"
     build "$src/aximon"
-    build "$src/trng"
-    build "$src/cryptodev"
     # Vendor diagnostics use __DATE__ and __TIME__.
     KBUILD_BUILD_USER=nanokvm KBUILD_BUILD_HOST=builder SOURCE_DATE_EPOCH=$rtl8733bs_epoch \
         make -C "$ksrc" O="$kbuild" ARCH=riscv CROSS_COMPILE="$cross" M="$m/rtl8733bs" \
@@ -357,19 +407,17 @@ modules() {
         'USER_EXTRA_CFLAGS=-DCONFIG_LITTLE_ENDIAN -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT' \
         -j"$jobs" modules
 
-    # Staged like the package: in-tree modules as built, extra modules stripped.
-    # The debug kernel builds DWARF for vmlinux; its installed modules drop it.
-    local strip=()
-    [ "$kernel_profile" = release ] || strip=(INSTALL_MOD_STRIP=1)
-    make -C "$ksrc" O="$kbuild" ARCH=riscv CROSS_COMPILE="$cross" INSTALL_MOD_PATH="$img" DEPMOD=true "${strip[@]}" modules_install
-    rm -f "$img/lib/modules/$release/build" "$img/lib/modules/$release/source"
+    # Immutable in-tree modules accompany the cached kernel ABI exports.
+    # Out-of-tree modules can be rebuilt from modules_prepare + Module.symvers.
+    mkdir -p "$img/lib"
+    cp -a "$out/component-support/kernel/modules/lib/." "$img/lib/"
     mkdir -p "$img/lib/modules/$release/extra"
     while IFS= read -r -d '' module; do
         target=$img/lib/modules/$release/extra/${module##*/}
         [ ! -e "$target" ] || { echo "Duplicate module name: $target" >&2; exit 1; }
         cp "$module" "$target"
         "${cross}strip" --strip-debug "$target"
-    done < <(find "$src/osdrv/interdrv" "$src/wifi" "$src/aes" "$src/aximon" "$src/trng" "$src/cryptodev" "$m/rtl8733bs" -name '*.ko' -print0)
+    done < <(find "$src/osdrv/interdrv" "$src/wifi" "$src/c906l" "$src/aes" "$src/aximon" "$m/rtl8733bs" -name '*.ko' -print0)
     # Name every module in sorted order; a directory scan would make the
     # order of the modules.* indexes depend on the file system.
     local mods=$img/lib/modules/$release list
@@ -437,15 +485,35 @@ opensbi() {
 fip() {
     local f=$out/fip
     rm -rf "$f"
-    mkdir -p "$f"
-    tar -xf "$dl/sipeed-sdk.tar" -C "$f" fsbl/plat/cv181x/fiptool.py
+    mkdir -p "$f/build"
+    unpack_git sipeed-sdk fsbl "$f/fsbl"
+    mkdir -p "$f/fsbl/build"
+    cp "$here/fsbl/cvi_board_memmap.h" "$f/fsbl/build/"
+    apply_patches "$f/fsbl" "$here/fsbl"
+    # The SDK's settings for sg2002_licheervnano_sd (build/scripts/fip_v2.mk).
+    # The banner names this build instead of a Git hash and the build time:
+    # "FSBL Jb2829:nanokvm-os:sipeed-sdk <commit>" (Jb2829 is cv181x, scrambled).
+    CHIP_ARCH=CV181X ARCH=riscv BOOT_CPU=riscv DDR_CFG=ddr3_1866_x16 \
+        FSBL_SECURE_BOOT_SUPPORT=n TPU_PERF_MODE=y \
+        make -C "$f/fsbl" -j"$jobs" V=0 O="$f/build" CROSS_COMPILE="$cross" \
+        BUILD_STRING=nanokvm-os \
+        BUILD_MESSAGE_TIMESTAMP="\"sipeed-sdk $(lock sipeed-sdk | awk '{ print substr($3, 1, 8) }')\"" \
+        "$f/build/bl2.bin"
+    # The register writes the ROM performs before BL2 (fip.mk gen-chip-conf).
+    "$host/python3" "$f/fsbl/plat/cv181x/chip_conf.py" "$f/build/chip_conf.bin"
+    # The DDR parameter block is the SDK's (fip.mk DDR_PARAM_TEST_PATH); this
+    # BL2 loads and CRC-checks it but only logs its first word.
     "$host/python3" "$repo/scripts/nanokvm-fip.py" build \
-        --tool "$f/fsbl/plat/cv181x/fiptool.py" --base "$here/fip/base-fip.bin" \
+        --tool "$f/fsbl/plat/cv181x/fiptool.py" --lz4 "$host/lz4" --chip-conf "$f/build/chip_conf.bin" \
+        --bl2 "$f/build/bl2.bin" --ddr-param "$f/fsbl/test/cv181x/ddr_param.bin" \
         --monitor "$img/opensbi/fw_dynamic.bin" --uboot "$img/u-boot.bin" \
         --opensbi-manifest "$img/opensbi/build-manifest.json" \
         --output "$f/fip.bin" --report "$f/manifest.json"
     cp "$f/fip.bin" "$img/fip.bin"
     cp "$f/manifest.json" "$img/fip-manifest.json"
+    rm -rf "$img/fsbl"
+    mkdir -p "$img/fsbl"
+    cp "$f/build/bl2.bin" "$f/build/chip_conf.bin" "$f/fsbl/test/cv181x/ddr_param.bin" "$img/fsbl/"
     # The boot logos U-Boot draws on the OLED (nkoled), one per board.
     rm -rf "$img/oled-logo"
     "$host/python3" "$repo/scripts/gen-oled-boot-logo.py" "$img/oled-logo"
@@ -456,9 +524,11 @@ fip() {
     cp "$out/opensbi/src/COPYING.BSD" "$l/opensbi-COPYING.BSD"
     cp "$out/uboot/src/Licenses/README" "$l/u-boot-Licenses-README"
     cp "$out/uboot/src/Licenses/gpl-2.0.txt" "$l/u-boot-gpl-2.0.txt"
-    printf '%s\n' 'The FSBL (BL2) and DDR parameters in fip.bin are the Sophgo binaries of' \
-        'platform/fip/base-fip.bin; their source is fsbl/ in the Sipeed SDK pinned in' \
-        'platform/sources.lock (sipeed-sdk).' > "$l/fsbl-NOTICE"
+    printf '%s\n' 'The FSBL (BL2) in fip.bin is built from fsbl/ in the Sipeed SDK pinned in' \
+        'platform/sources.lock (sipeed-sdk) with platform/fsbl/*.patch. Its upstream,' \
+        'https://github.com/sophgo/fsbl, is licensed under GPL-2.0 (u-boot-gpl-2.0.txt' \
+        'has the text). The chip configuration and DDR parameters come from the same tree.' \
+        > "$l/fsbl-NOTICE"
 }
 
 initramfs() {
@@ -490,9 +560,8 @@ initramfs() {
         done
     done
     "$kbuild/usr/gen_init_cpio" -t 0 "$i/initramfs.list" > "$i/initramfs.cpio"
-    # lz4 legacy format, the one Linux unpacks: 0.24 s against 0.49 s for zstd
-    # -19 on the stand, though /init starts only 0.08 s sooner because the
-    # unpacking overlaps driver probing; the larger file costs U-Boot 16 ms.
+    # lz4 legacy format, the one Linux unpacks: it unpacks in half the time of
+    # zstd -19, which outweighs the larger file U-Boot has to load.
     "$host/lz4" -q -f -l -12 "$i/initramfs.cpio" "$img/initramfs.cpio.lz4"
     # Their licenses, from the toolchain step; nanokvm-kernel installs them.
     rm -rf "${img:?}/licenses/initramfs"
@@ -544,11 +613,11 @@ boot() {
 # SOPHGO media libraries (cvi_mpi with native/cvi_mpi/*.patch), the MMF
 # wrapper and capture library: the six-file HDMI-light runtime bundle.
 native() {
-    local n=$out/native lib
+    local n=$out/native lib dependency
     rm -rf "$n" "${img:?}/native" "$img/native-licenses"
     mkdir -p "$n/src" "$img/native"
     unpack_git cvi-mpi . "$n/src/cvi_mpi"
-    for lib in sensors json-c miniz inih; do unpack_git "$lib" . "$n/src/$lib"; done
+    for dependency in sensors json-c miniz inih; do unpack_git "$dependency" . "$n/src/$dependency"; done
     apply_patches "$n/src/json-c" "$here/native/json-c"
     apply_patches "$n/src/cvi_mpi" "$here/native/cvi_mpi"
     apply_patches "$n/src/sensors" "$repo/firmware/sensor/patches"
@@ -556,7 +625,7 @@ native() {
                NANOKVM_KERNEL_SOURCE="$ksrc" NANOKVM_BUILDROOT_OUTPUT="$bo" NANOKVM_CMAKE="$host/cmake"
                JOBS="$jobs")
     env "${env[@]}" bash "$repo/scripts/build-mpi.sh"
-    env "${env[@]}" "$host/python3" "$repo/scripts/build-isp-vendor.py"
+    env "${env[@]}" "$host/python3" "$repo/scripts/build-isp.py"
     env "${env[@]}" NANOKVM_JSON_C_SOURCE="$n/src/json-c" NANOKVM_MINIZ_SOURCE="$n/src/miniz" \
         NANOKVM_MPI_THIRDPARTY_OUTPUT="$n/bin" "$host/python3" "$repo/scripts/build-mpi-bin.py"
     # Always ship one coherent HDMI-light bundle, regardless of inherited profile.
@@ -568,7 +637,7 @@ native() {
     for lib in "$n/hdmi-light"/cvi-mpi-*; do
         [ ! -f "$lib" ] || cp "$lib" "$img/native-licenses/"
     done
-    [ "$(find "$img/native" -name '*.so' | wc -l)" = 6 ]
+    [ "$(find "$img/native" -name '*.so' | wc -l)" = 2 ]
 }
 
 # The TPU runtime (Sophgo cviruntime and cvikernel, ported to dma-buf heaps)
@@ -595,8 +664,8 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_C_FLAGS "\${CMAKE_C_FLAGS} ${cpu_flags[*]} -ffile-prefix-map=$t=tpu" CACHE STRING "")
 set(CMAKE_CXX_FLAGS "\${CMAKE_CXX_FLAGS} ${cpu_flags[*]} -ffile-prefix-map=$t=tpu" CACHE STRING "")
 EOF
-    # The runtime's CMake files predate CMake 3.5.
-    local cmake=("$host/cmake" -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
+    # The runtime's CMake files ask for CMake 2.8-3.1; CMake 4 warns below 3.10.
+    local cmake=("$host/cmake" -DCMAKE_POLICY_VERSION_MINIMUM=3.10)
     local target=("${cmake[@]}" -DCMAKE_BUILD_TYPE=RELEASE -DCMAKE_C_FLAGS_RELEASE=-O2 -DCMAKE_CXX_FLAGS_RELEASE=-O2
                   -DCMAKE_TOOLCHAIN_FILE="$build/toolchain.cmake" -DCMAKE_INSTALL_PREFIX="$inst")
     # The model schema: a host flatc, then the generated headers.
@@ -649,13 +718,18 @@ server() {
     local s=$out/server
     rm -rf "$s" "${img:?}/server"
     mkdir -p "$s" "$img/server" "$dl/go-mod"
-    tar -xzf "$dl/go1.27.3.linux-amd64.tar.gz" -C "$s"
+    tar -xzf "$dl/go1.27.4.linux-amd64.tar.gz" -C "$s"
     "$host/python3" "$repo/firmware/cpu/sysmon-runtime/prepare.py" --base "$s/go" --output "$s/goroot" > /dev/null
+    # The server's hot functions are linked first, together
+    # (firmware/cpu/go-hot-order): the linker gets the option for that.
+    GOCACHE=$s/gocache "$host/python3" "$repo/firmware/cpu/go-hot-order/prepare-linker.py" --goroot "$s/goroot" > /dev/null
     GOMODCACHE=$dl/go-mod GOPATH=$s/gopath GOCACHE=$s/gocache GOFLAGS=-mod=readonly GOTOOLCHAIN=local \
         "$host/python3" "$repo/scripts/build-server-existing-libs.py" --libraries "$img/native" \
-        --compression "$out/tools/compress" --buildroot-output "$bo" --go "$s/goroot/bin/go" --output "$s/out"
+        --compression "$out/tools/compress" --buildroot-output "$bo" --go "$s/goroot/bin/go" --output "$s/out" \
+        --hot-order "$repo/firmware/cpu/go-hot-order/server-webrtc.txt"
     cp "$s/out/NanoKVM-Server.stripped" "$img/server/NanoKVM-Server"
-    cp "$s/out/nkos-update" "$s/out/nkos-apply-updates" "$s/out/nkos-usb-internet" "$s/out/nkos-standby" "$img/server/"
+    cp "$s/out/nkos-update" "$s/out/nkos-apply-updates" "$s/out/nkos-usb-internet" "$s/out/nkos-standby" \
+        "$s/out/nkos-ipmi" "$img/server/"
 }
 
 # Web UI. npm packages are checked against pnpm-lock.yaml.
@@ -745,8 +819,10 @@ tools() {
     # Link the SONAME directly: libtool's libblkid.la injects an absolute
     # sysroot RPATH. Removing its tag later leaves the path in .dynstr and
     # makes mkfs.exfat differ between hosts even after stripping.
-    (cd "$exf" &&
-        ./configure --host=riscv64-buildroot-linux-musl --prefix=/usr CC="${cross}gcc" AR="${cross}ar" \
+    # The toolchain directory in PATH: libtool then finds the prefixed nm and
+    # objdump instead of the build host's; file and mt have no cross version.
+    (cd "$exf" && export PATH="$host:$PATH" &&
+        ./configure --host=riscv64-buildroot-linux-musl FILECMD=file MANIFEST_TOOL=: --prefix=/usr CC="${cross}gcc" AR="${cross}ar" \
             RANLIB="${cross}ranlib" STRIP="${cross}strip" PKG_CONFIG="$host/pkg-config" \
             BLKID_LIBS="-l:libblkid.so.1" CFLAGS="${cpu_flags[*]} -g0" > "$t/exfatprogs-configure.log" &&
         make -j"$jobs" > "$t/exfatprogs-make.log")
@@ -781,8 +857,7 @@ tools() {
 
     unpack_git tinyalsa . "$t/tinyalsa"
     "$py" "$repo/scripts/build-usb-audio.py" --output "$t/usb-audio" --buildroot-output "$bo" \
-        --kernel-source "$ksrc" --kernel-output "$kbuild" --tinyalsa "$t/tinyalsa" \
-        --opus-archive "$dl/opus-1.6.1.tar.gz" --jobs "$jobs"
+        --kernel-source "$ksrc" --kernel-output "$kbuild" --tinyalsa "$t/tinyalsa" --jobs "$jobs"
     cp "$t/usb-audio/usb-audio-capture" "$img/tools/"
     cp "$t/usb-audio/share/usb-audio/"* "$img/tools/usb-audio/"
 
@@ -818,26 +893,12 @@ tools() {
     [ -z "$missing" ] || { echo "zlib-ng does not export these zlib 1.3.2 symbols:" $missing >&2; exit 1; }
     cp "$t/zlib-ng/LICENSE.md" "$img/tools/zlib-ng/"
 
-    # liblzma for the server's xz decoder, from the release commit: the 2024
-    # backdoor was in generated files of release tarballs, not in Git. C906
-    # flags do not speed up its decoder; the profile is kept for uniformity.
-    unpack_git xz . "$t/xz"
-    "$host/cmake" -S "$t/xz" -B "$t/xz/build" -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
-        -DCMAKE_C_COMPILER="${cross}gcc" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-DNDEBUG \
-        -DCMAKE_C_FLAGS="${cpu_flags[*]/_xtheadvector/} -ffile-prefix-map=$t/xz=xz" \
-        -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DXZ_NLS=OFF -DXZ_DOC=OFF -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF \
-        -DXZ_TOOL_LZMADEC=OFF -DXZ_TOOL_LZMAINFO=OFF
-    "$host/cmake" --build "$t/xz/build" -j "$jobs"
-    mkdir -p "$img/tools/xz"
-    cp "$t/xz/COPYING.0BSD" "$img/tools/xz/"
-
-    # Headers and static libraries that the server step links its gzip and xz
-    # readers against (server/internal/decompress).
+    # Headers and static library that the server step links its gzip reader
+    # against (server/internal/decompress).
     local dev=$t/compress
     mkdir -p "$dev/include" "$dev/lib"
     cp "$t/zlib-ng/build/zlib.h" "$t/zlib-ng/build/zconf.h" "$t/zlib-ng/build/zlib_name_mangling.h" "$dev/include/"
-    cp -r "$t/xz/src/liblzma/api/lzma.h" "$t/xz/src/liblzma/api/lzma" "$dev/include/"
-    cp "$t/zlib-ng/build/libz.a" "$t/xz/build/liblzma.a" "$dev/lib/"
+    cp "$t/zlib-ng/build/libz.a" "$dev/lib/"
 }
 
 # Firmware files: AIC8800 Wi-Fi firmware from the Radxa package that the
@@ -1025,7 +1086,7 @@ register_qemu() {
 alpine_tree() {
     rm -rf "$1"
     mkdir -p "$1"
-    tar --numeric-owner -xzf "$dl/alpine-minirootfs-3.24.3-riscv64.tar.gz" -C "$1"
+    tar --numeric-owner -xzf "$dl/alpine-minirootfs-3.24.4-riscv64.tar.gz" -C "$1"
 }
 
 # Run a command in the Alpine tree $1 with /dev, /proc, /sys, the host DNS
@@ -1145,7 +1206,7 @@ package_versions() {
     done < "$v/reused"
 }
 
-# Build the nineteen packages with abuild in an Alpine riscv64 tree.
+# Build the eighteen packages with abuild in an Alpine riscv64 tree.
 packages() (
     local b=$out/apk-builder
     register_qemu
@@ -1175,8 +1236,9 @@ packages() (
         SOURCE_DATE_EPOCH="$(git -C "$repo" log -1 --format=%ct)" PAYLOAD_ROOT=/build/payloads \
         REPODEST=/build/repo SRCDEST=/build/distfiles ABUILD_FLAGS='-F -d' PKGVERSIONS=/build/versions/versions.txt \
         /bin/sh /build/src/scripts/build-alpine-packages.sh stock
-    # OS repositories contain only core/reused packages. Optional add-ons are
-    # published independently to their own Pages repository.
+    # The release holds only the packages built here or reused from earlier
+    # releases. Packages published on their own, including those nanokvm-release
+    # depends on, are in the add-on repository on Pages.
     in_chroot "$b" /bin/sh -c 'cd /build/repo/stock/recipes/riscv64 && /sbin/apk verify ./*.apk'
     # Every package signature was verified before signing the new ECDSA index.
     in_chroot "$b" /bin/sh -c 'cd /build/repo/stock/recipes/riscv64 &&
@@ -1210,15 +1272,30 @@ rootfs() {
     # build key is trusted only for the installation below.
     [ -z "$devkey$laterkey" ] || install -m 0644 "$ecpub" "$r/etc/apk/keys/"
     for pub in "$repo"/firmware/alpine/keys/*.pub; do install -m 0644 "$pub" "$r/etc/apk/keys/"; done
-    # The v3 index, as on the device.
-    printf '%s\n' /mnt/nanokvm-apk/recipes/riscv64/Packages.adb https://dl-cdn.alpinelinux.org/alpine/v3.24/main \
-        > "$r/etc/apk/repositories"
+    # The v3 index, as on the device, with Alpine main and community.
+    # nanokvm-release also depends on packages that are built and published on
+    # their own (RustDesk, the computer sensors, the screen model): they come
+    # from the signed index of the add-on repository, the line nanokvm-base
+    # installs for the device, whose packages its signature authenticates by
+    # hash.
+    printf '%s\n' /mnt/nanokvm-apk/recipes/riscv64/Packages.adb \
+        "$(cat "$repo/firmware/alpine/etc/apk/repositories.d/nanokvm-addons.list")" \
+        https://dl-cdn.alpinelinux.org/alpine/v3.24/main \
+        https://dl-cdn.alpinelinux.org/alpine/v3.24/community > "$r/etc/apk/repositories"
     # --preserve-env keeps QEMU_CPU for the package scripts and triggers, which
-    # load the new libz.so.1 (kmod's depmod, for one).
-    BIND=$rel/apk:/mnt/nanokvm-apk in_chroot "$r" /sbin/apk --no-cache --preserve-env add nanokvm-release
+    # load the new libz.so.1 (kmod's depmod, for one). The network services of
+    # Settings > Services and the OpenVPN client are selected next to
+    # nanokvm-release, which does not depend on them: a device updated from a
+    # release without them gets them from the server (basePackages in
+    # server/service/extensions/apkpkg/base.go, the same list).
+    BIND=$rel/apk:/mnt/nanokvm-apk in_chroot "$r" /sbin/apk --no-cache --preserve-env add nanokvm-release \
+        lldpd lldpd-openrc net-snmp net-snmp-openrc nut nut-openrc openvpn
+    # They are installed: the server does not install them again, so one the
+    # user removes before its first check stays removed.
+    mkdir -p "$r/etc/kvm"
+    : > "$r/etc/kvm/base-packages"
     if [ "$kernel_profile" = debug ]; then
         # The debug tools of platform/debug-packages, from main and community.
-        echo https://dl-cdn.alpinelinux.org/alpine/v3.24/community >> "$r/etc/apk/repositories"
         # shellcheck disable=SC2046 # one package name per word
         BIND=$rel/apk:/mnt/nanokvm-apk in_chroot "$r" /sbin/apk --no-cache --preserve-env add \
             $(sed 's/#.*//' "$here/debug-packages")
@@ -1226,26 +1303,31 @@ rootfs() {
     rmdir "$r/mnt/nanokvm-apk"
     [ -z "$laterkey" ] || rm "$r/etc/apk/keys/${ecpub##*/}"
     # The repositories of the device: the v3 index of NanoKVM OS releases on
-    # GitHub Pages (nanokvm-keys moves older devices there) and Alpine main. Community is
-    # off until the Software page or a Tailscale or NetBird install turns it on
-    # (server/osupdate/community.go).
+    # GitHub Pages (nanokvm-keys moves older devices there), Alpine main and
+    # Alpine community, where LLDP and UPS (lldpd, nut) come from.
     case ${NANOKVM_CHANNEL:-stable} in
         stable) channel_path= ;;
         beta) channel_path=beta/ ;;
         *) echo 'Unknown NanoKVM release channel' >&2; exit 1 ;;
     esac
     printf '%s\n' "https://dormancygrace.github.io/NanoKVM-OS/${channel_path}alpine/v3.24/riscv64/Packages.adb" https://dl-cdn.alpinelinux.org/alpine/v3.24/main \
-        > "$r/etc/apk/repositories"
-    # A debug image keeps community: some of its tools come from there.
-    [ "$kernel_profile" = release ] || echo https://dl-cdn.alpinelinux.org/alpine/v3.24/community >> "$r/etc/apk/repositories"
+        https://dl-cdn.alpinelinux.org/alpine/v3.24/community > "$r/etc/apk/repositories"
     rm -f "$r/etc/resolv.conf"
     # The settings APIs call these; refuse an incomplete root.
     for path in usr/sbin/nkos-usb-internet etc/init.d/nanokvm-usb-internet usr/sbin/iw usr/sbin/nanokvm_update_edid etc/init.d/nanokvm-policy \
                 usr/libexec/nanokvm/legacy/S50sshd usr/libexec/nanokvm/legacy/S38memory \
                 usr/libexec/nanokvm/legacy/S34mssclamp kvmapp/system/bin/usb-audio-capture \
-                usr/sbin/nkos-board-probe usr/sbin/nkos-board-select; do
+                usr/sbin/nkos-board-probe usr/sbin/nkos-board-select usr/sbin/nkos-ipmi etc/init.d/nanokvm-ipmi \
+                usr/bin/nanokvm-rustdesk etc/init.d/nanokvm-rustdesk; do
         [ -x "$r/$path" ] || { echo "rootfs: missing $path" >&2; exit 1; }
     done
+    for path in usr/share/nanokvm/host-sensors/nanokvm-sensors.exe usr/share/nanokvm/host-sensors/nanokvm-sensors.sh \
+                usr/lib/nanokvm-tpu/models/screen.cvimodel; do
+        [ -f "$r/$path" ] || { echo "rootfs: missing $path" >&2; exit 1; }
+    done
+    # RustDesk is off until it is switched on (server/service/rustdesk).
+    [ ! -e "$r/etc/runlevels/default/nanokvm-rustdesk" ] || {
+        echo "rootfs: nanokvm-rustdesk starts at boot" >&2; exit 1; }
     [ -d "$r/lib/modules/$(cat "$r/usr/lib/nanokvm/boot/kernel.release")" ] || {
         echo "rootfs: boot.sd and modules differ" >&2; exit 1; }
     # One provider owns the OpenSSL command, configuration and both ABI3 libraries.
@@ -1324,7 +1406,7 @@ source_archive() {
     mkdir -p "$stage/$name/upstream/buildroot-packages" "$stage/$name/NanoKVM-OS"
     # The GPL-licensed inputs of the image. The rest of sources.lock is
     # fetched from its upstream by build.sh and is not redistributed here.
-    for pkg in buildroot linux u-boot osdrv aic8800 cryptodev sipeed-sdk opensbi busybox exfatprogs i2c-tools; do
+    for pkg in buildroot linux u-boot osdrv aic8800 sipeed-sdk opensbi busybox exfatprogs i2c-tools; do
         url=$(lock "$pkg" | awk '{ print $2 }')
         if [[ $url == *.git ]]; then cp "$dl/$pkg.tar" "$stage/$name/upstream/"
         else cp "$dl/${url##*/}" "$stage/$name/upstream/"; fi
@@ -1373,19 +1455,33 @@ check_output_kernel_profile() {
     printf '%s\n' "$kernel_profile" > "$stamp.tmp"
     mv "$stamp.tmp" "$stamp"
 }
+# The component planner reads Bash's own parsed function bodies when checking
+# that its declared inputs cover every repository path used by a build step.
+if [ "${#steps[@]}" = 1 ] && [ "${steps[0]}" = component-functions ]; then
+    declare -f
+    exit 0
+fi
+
 case " ${steps[*]} " in
-    *" kernel "* | *" modules "* | *" initramfs "* | *" boot "* | *" payloads "* | *" packages "* | *" rootfs "* | *" image "* | *" stock-installer "*)
+    *" kernel "* | *" kernel-state "* | *" modules "* | *" initramfs "* | *" boot "* | *" payloads "* | *" packages "* | *" rootfs "* | *" image "* | *" stock-installer "*)
         check_output_kernel_profile ;;
 esac
 
 # Buildroot requires invalidation when the SDK configuration changes. A
 # namespace isolates entries even when local builds share a cache directory.
-export CCACHE_NAMESPACE="nkos-$(toolchain_id)"
+for step in "${steps[@]}"; do
+    case $step in
+        toolchain|kernel|kernel-state|modules|uboot|opensbi|fip|boot|native|tpu|system|server|tools)
+            export CCACHE_NAMESPACE="nkos-$(toolchain_id)"; break ;;
+    esac
+done
 
 for step in "${steps[@]}"; do
     case $step in
         fetch|toolchain|kernel|modules|uboot|opensbi|fip|initramfs|boot|native|tpu|system|server|web|tools|firmware|hashes|payloads)
             log "$step"; "$step" ;;
+        kernel-state) log kernel-state; kernel_state ;;
+        osdrv-source) log osdrv-source; osdrv_source ;;
         packages|rootfs|image|clean)
             if [ "${NANOKVM_USERNS:-0}" = 1 ]; then log "$step"; "$step"; else in_userns "$step"; fi ;;
         stock-installer) log stock-installer; stock_installer ;;

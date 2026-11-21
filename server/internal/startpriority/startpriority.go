@@ -1,15 +1,19 @@
 // Package startpriority runs the server ahead of the other services while it
-// starts and the first viewer connects, then returns it to the normal
-// priority.
+// starts and the first viewer connects, then keeps it a little ahead of
+// ordinary tasks.
 //
 // The boot is CPU-bound on the single C906 core: from the first service to the
 // first frame the CPU is busy all the time, and the services that start after
 // the application (chronyd, syslog, crond, sshd, the watchdog) compete with
-// the server for it. At nice -10 the server reached its first frame about
-// 2.3 s sooner on the stand (17.5 s after kernel start, from 19.6-20.2 s).
-// Kept for good, the boost would also take CPU from SSH sessions and
-// kvm_system while video streams, so it ends a few seconds after the first
-// viewer, and a minute after the start at the latest.
+// the server for it. At nice -10 the server reaches its first frame about
+// 2 s sooner. The boost ends a few seconds after the first viewer, and a
+// minute after the start at the latest.
+//
+// After it the server stays at nice -5. At nice 0 any other CPU-bound task of
+// the device (a package update, a download, a build in an SSH session) gets
+// the core in equal turns and the video threads run late, so the browser
+// drops frames; -2 is not enough and -10 adds nothing. At -5 the other task
+// keeps its share of the core and runs at the same speed.
 //
 // Linux sets the nice value per thread. Threads inherit it from the thread
 // that creates them, so raising every thread at the start covers the Go
@@ -32,8 +36,8 @@ import (
 const (
 	// Boost is the nice value while the server starts.
 	Boost = -10
-	// Normal is the default nice value.
-	Normal = 0
+	// Steady is the nice value after the start.
+	Steady = -5
 )
 
 var (
@@ -88,8 +92,8 @@ func ViewerConnected() {
 	}
 }
 
-// Release returns the boosted threads to the normal priority, leaving any
-// other value alone. Later calls do nothing.
+// Release moves the boosted threads to the steady priority, leaving any other
+// value alone. Later calls do nothing.
 func Release() {
 	mu.Lock()
 	defer mu.Unlock()
@@ -97,21 +101,21 @@ func Release() {
 		return
 	}
 	timer.Stop()
-	if err := setAll(Normal, func(tid int) bool { return niceOf(tid) == Boost }); err != nil {
+	if err := setAll(Steady, func(tid int) bool { return niceOf(tid) == Boost }); err != nil {
 		log.Warnf("start priority release: %v; retrying", err)
 		timer = time.AfterFunc(time.Second, Release)
 		return
 	}
 	released = true
-	log.Info("start priority released")
+	log.Infof("start priority released; steady target nice %d", Steady)
 }
 
-// niceOf reads a thread's nice value (field 19 of its stat line); it is
-// Normal when the thread is gone or the line unreadable.
+// niceOf reads a thread's nice value (field 19 of its stat line); it is 0
+// when the thread is gone or the line unreadable.
 func niceOf(tid int) int {
 	data, err := os.ReadFile(taskDir + "/" + strconv.Itoa(tid) + "/stat")
 	if err != nil {
-		return Normal
+		return 0
 	}
 	// The command name in parentheses may contain spaces.
 	line := string(data)
@@ -121,11 +125,11 @@ func niceOf(tid int) int {
 	fields := strings.Fields(line)
 	// After the name: state(3) ... nice(19), the 17th field here.
 	if len(fields) < 17 {
-		return Normal
+		return 0
 	}
 	nice, err := strconv.Atoi(fields[16])
 	if err != nil {
-		return Normal
+		return 0
 	}
 	return nice
 }

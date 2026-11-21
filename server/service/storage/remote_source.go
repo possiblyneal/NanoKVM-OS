@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,10 +38,10 @@ func (s *Service) reserveRemote(r *remoteSession) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.remote != nil {
-		return errors.New("Remote media is already connected")
+		return driveInUse("Remote media is already connected")
 	}
 	if s.netboot != nil {
-		return errors.New("Turn off network boot before connecting an ISO")
+		return driveInUse("Turn off network boot before connecting an ISO")
 	}
 	h := hid.GetHid()
 	h.Lock()
@@ -53,19 +54,24 @@ func (s *Service) reserveRemote(r *remoteSession) error {
 		return errors.New("Cannot read USB storage state")
 	}
 	if strings.TrimSpace(string(current)) != "" {
-		return errors.New("Unmount the current image first")
+		return driveInUse("Unmount the current image first")
 	}
 	s.remote, s.remoteError, s.remoteKind = r, "", r.kind
 	return nil
 }
 
+// errRemoteEjected ends a session normally: installers eject their medium
+// when they finish, so the status does not keep it as an error.
+var errRemoteEjected = errors.New("Remote ISO was ejected or USB storage was disabled")
+
 func (s *Service) releaseRemote(r *remoteSession, err error) {
 	r.close()
+	defer close(r.released)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.remote == r {
 		s.remote = nil
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errRemoteEjected) {
 			s.remoteError = err.Error()
 		}
 	}
@@ -97,6 +103,9 @@ func (s *Service) serveRemote(r *remoteSession, source remotemedia.Source, mount
 			if err := os.WriteFile(mountDevice, []byte("\n"), 0600); err != nil {
 				_ = os.WriteFile(forcedEjectDevice, []byte("1"), 0600)
 			}
+		}
+		if r.mounted {
+			recordMedium(r.actor, "")
 		}
 		r.mounted = false
 	}()
@@ -145,15 +154,23 @@ func (s *Service) serveRemote(r *remoteSession, source remotemedia.Source, mount
 			err = errors.New("USB medium changed while connecting")
 		}
 	}
+	changed, restore := false, func() {}
 	if err == nil {
-		for _, item := range []struct{ path, value string }{{roFlag, "1"}, {cdromFlag, "1"}, {inquiryString, storageidentity.Read(hid.USBFlagsDir).Inquiry("remote")}, {mountDevice, remotemedia.DevicePath}} {
-			if err = os.WriteFile(item.path, []byte(item.value), 0600); err != nil {
-				break
-			}
-		}
+		changed, restore, err = setDrive(true, storageidentity.Read(hid.USBFlagsDir).Inquiry("remote"))
 	}
 	if err == nil {
-		err = reconnectRemoteUSB()
+		if err = os.WriteFile(mountDevice, []byte(remotemedia.DevicePath), 0600); err != nil {
+			restore()
+		}
+	}
+	if err == nil && changed {
+		// A failed reconnection leaves the medium in: the deferred cleanup
+		// ejects it, and the drive is put back once it is empty.
+		if err = reconnectUSB(); err != nil {
+			if os.WriteFile(mountDevice, []byte("\n"), 0600) == nil || os.WriteFile(forcedEjectDevice, []byte("1"), 0600) == nil {
+				restore()
+			}
+		}
 	}
 	if err == nil {
 		r.mounted = true
@@ -191,7 +208,7 @@ func (s *Service) serveRemote(r *remoteSession, source remotemedia.Source, mount
 			activeErr := requireActiveUSBStorage()
 			h.Unlock()
 			if readErr != nil || activeErr != nil || strings.TrimSpace(string(data)) != remotemedia.DevicePath {
-				return errors.New("Remote ISO was ejected or USB storage was disabled")
+				return errRemoteEjected
 			}
 		}
 	}
@@ -242,12 +259,23 @@ func (s *Service) ConnectSMB(c *gin.Context) {
 }
 
 func (s *Service) connectRemoteURL(c *gin.Context, kind string, open func(context.Context) (remotemedia.Source, string, uint64, error)) {
-	ctx, cancel := context.WithCancel(context.Background())
-	r := &remoteSession{kind: kind, name: "remote.iso", closed: make(chan struct{}), cancel: cancel}
-	if err := s.reserveRemote(r); err != nil {
-		r.close()
+	if _, err := s.startRemote(kind, "", webActor(c), open); err != nil {
 		c.JSON(409, gin.H{"code": -2, "msg": err.Error()})
 		return
+	}
+	var rsp proto.Response
+	rsp.OkRsp(c)
+}
+
+// startRemote reserves the drive and connects a URL source in the
+// background. The session's ready channel gets the outcome.
+func (s *Service) startRemote(kind, location, actor string, open func(context.Context) (remotemedia.Source, string, uint64, error)) (*remoteSession, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &remoteSession{kind: kind, name: "remote.iso", location: location, actor: actor, closed: make(chan struct{}), cancel: cancel,
+		ready: make(chan error, 1), released: make(chan struct{})}
+	if err := s.reserveRemote(r); err != nil {
+		r.close()
+		return nil, err
 	}
 	go func() {
 		source, name, size, err := open(ctx)
@@ -255,12 +283,33 @@ func (s *Service) connectRemoteURL(c *gin.Context, kind string, open func(contex
 			s.mu.Lock()
 			r.name, r.size = name, size
 			s.mu.Unlock()
-			err = s.serveRemote(r, source, nil)
+			err = s.serveRemote(r, source, func() error {
+				recordMedium(r.actor, r.name)
+				r.ready <- nil
+				return nil
+			})
+		}
+		// Unless the medium got to the computer, this is why not.
+		select {
+		case r.ready <- err:
+		default:
 		}
 		s.releaseRemote(r, err)
 	}()
-	var rsp proto.Response
-	rsp.OkRsp(c)
+	return r, nil
+}
+
+// nbdOwnerRunning reports whether the PID the kernel keeps for /dev/nbd0 is
+// another running server. The kernel keeps the PID of the server that served
+// the disk for as long as anything holds nbd0 open, and the USB gadget does
+// while its LUN names nbd0: after a crash or a restart, the PID is the dead
+// server's.
+func nbdOwnerRunning(pid string) bool {
+	if pid == "" || pid == strconv.Itoa(os.Getpid()) {
+		return false
+	}
+	comm, err := os.ReadFile(filepath.Join("/proc", pid, "comm"))
+	return err == nil && strings.TrimSpace(string(comm)) == "NanoKVM-Server"
 }
 
 // A crashed server closes its NBD socket, but configfs can still name the dead
@@ -284,7 +333,7 @@ func (s *Service) cleanupRemote(devicePath, pidPath string) {
 	h.Lock()
 	defer h.Unlock()
 	pid, err := os.ReadFile(pidPath)
-	if (err != nil && !errors.Is(err, os.ErrNotExist)) || strings.TrimSpace(string(pid)) != "" {
+	if (err != nil && !errors.Is(err, os.ErrNotExist)) || nbdOwnerRunning(strings.TrimSpace(string(pid))) {
 		return
 	}
 	if data, _ := os.ReadFile(mountDevice); strings.TrimSpace(string(data)) == remotemedia.DevicePath {

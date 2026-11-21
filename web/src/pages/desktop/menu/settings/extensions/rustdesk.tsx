@@ -14,25 +14,25 @@ import {
   Switch,
   Typography
 } from 'antd';
-import { useAtom } from 'jotai';
+import { useAtom, useAtomValue } from 'jotai';
 import { useTranslation } from 'react-i18next';
 
 import {
   configureRustDesk,
   getRustDeskStatus,
-  rustDeskPackageAction,
+  regenerateRustDeskPassword,
   type RustDeskConfig
 } from '@/api/rustdesk';
 import { showRequestError } from '@/lib/show-request-error.ts';
 import { pollWhileVisible } from '@/lib/visible-poll';
 import { rustDeskStatusAtom } from '@/jotai/rustdesk';
+import { themeAtom } from '@/jotai/settings.ts';
 import { SettingsSection, StatusBadge } from '@/components/ui/settings.tsx';
-
-import { RustDeskVersions } from '../software/rustdesk-versions';
 
 export const RustDeskControls = () => {
   const { t } = useTranslation('translation', { keyPrefix: 'settings.rustdesk' });
   const [status, setStatus] = useAtom(rustDeskStatusAtom);
+  const dark = useAtomValue(themeAtom) === 'dark';
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [form] = Form.useForm<RustDeskConfig>();
@@ -63,7 +63,12 @@ export const RustDeskControls = () => {
       const next = response.data;
       setStatus(next);
       if (!dirty.current)
-        form.setFieldsValue({ audio_enabled: true, ...next.config, password: '' });
+        form.setFieldsValue({
+          audio_enabled: true,
+          local_pointer: false,
+          ...next.config,
+          password: ''
+        });
       setError('');
     } catch {
       if (started === generation.current && !controller.signal.aborted) setError(t('failed'));
@@ -107,7 +112,7 @@ export const RustDeskControls = () => {
     setBusy(true);
     try {
       const response =
-        action === 'save' ? await configureRustDesk(values!) : await rustDeskPackageAction(action);
+        action === 'save' ? await configureRustDesk(values!) : await regenerateRustDeskPassword();
       if (!mounted.current || started !== generation.current) return;
       if (response.code !== 0) {
         showRequestError(response, 'settings.rustdesk.failed');
@@ -133,9 +138,18 @@ export const RustDeskControls = () => {
       {error && <Alert type="error" title={error} showIcon />}
       {!status && !error && <Spin />}
       <SettingsSection>
-        {status?.installed && <RustDeskVersions status={status} />}
+        {status && (
+          <div className="text-fg-muted flex flex-col gap-1 text-sm">
+            <span>
+              {t('packageVersion')}: {status.version || t('unknownVersion')}
+            </span>
+            <span>
+              {t('rustdeskVersion')}: {status.rustdesk_version || t('unknownVersion')}
+            </span>
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-4">
-          {status?.installed && (
+          {status && (
             <StatusBadge tone={status.running ? 'success' : 'neutral'}>
               {status.running ? t('running') : t('stopped')}
             </StatusBadge>
@@ -153,7 +167,7 @@ export const RustDeskControls = () => {
             <Typography.Text copyable>{status.id}</Typography.Text>
           </div>
         )}
-        {status?.installed && status.config.password_mode === 'temporary' && (
+        {status?.config.password_mode === 'temporary' && (
           <div>
             {status.temporary_password ? (
               <div className="flex flex-wrap items-center gap-2">
@@ -178,10 +192,11 @@ export const RustDeskControls = () => {
         )}
         <p className="m-0">{t('explain')}</p>
       </SettingsSection>
-      {status?.installed && (
+      {status && (
         <ConfigProvider
           theme={{
-            token: { colorBgContainer: '#262626', colorBorder: '#525252' },
+            // a step lighter than the dialog; the light theme keeps its own white
+            token: dark ? { colorBgContainer: '#262626', colorBorder: '#525252' } : {},
             components: {
               Collapse: { headerPadding: '12px 16px', contentPadding: 16 }
             }
@@ -189,7 +204,12 @@ export const RustDeskControls = () => {
         >
           <Form
             form={form}
-            initialValues={{ audio_enabled: true, ...status.config, password: '' }}
+            initialValues={{
+              audio_enabled: true,
+              local_pointer: false,
+              ...status.config,
+              password: ''
+            }}
             layout="vertical"
             disabled={busy}
             onValuesChange={() => {
@@ -214,6 +234,26 @@ export const RustDeskControls = () => {
                 <Switch />
               </Form.Item>
             )}
+            {status.supports_pointer_settings && (
+              <Form.Item
+                name="local_pointer"
+                label={t('localPointer')}
+                valuePropName="checked"
+                extra={t('localPointerHint')}
+              >
+                <Switch />
+              </Form.Item>
+            )}
+            <Form.Item
+              name="listen_address"
+              label={t('lanAccess')}
+              extra={t('lanAccessHint')}
+              valuePropName="checked"
+              getValueProps={(value) => ({ checked: !!value && value !== '127.0.0.1' })}
+              normalize={(checked) => (checked ? '0.0.0.0' : '127.0.0.1')}
+            >
+              <Switch />
+            </Form.Item>
             {status.supports_audio && (
               <Alert
                 type="info"
@@ -303,13 +343,7 @@ export const RustDeskControls = () => {
                       )}
                       {status.supports_transport_settings && (
                         <Form.Item label={t('webrtc')} extra={t('transportHint')}>
-                          <Typography.Text>
-                            {status.video_transport === 'webrtc'
-                              ? t('webrtcOn')
-                              : t('webrtcOff', {
-                                  transport: status.video_transport === 'mjpeg' ? 'MJPEG' : 'Direct'
-                                })}
-                          </Typography.Text>
+                          <Typography.Text>{t('webrtcOn')}</Typography.Text>
                         </Form.Item>
                       )}
                       <Alert type="info" title={t('video')} className="mb-4" />
@@ -332,7 +366,7 @@ export const RustDeskControls = () => {
           </Form>
         </ConfigProvider>
       )}
-      {status?.installed && status.source_url && (
+      {status?.source_url && (
         <a href={status.source_url} target="_blank" rel="noopener noreferrer">
           {t('source')} · AGPL-3.0
         </a>

@@ -1,9 +1,11 @@
 import Queue from 'yocto-queue';
 
+import { ConnectRecovery, RECOVERY_RECONNECT_DELAY } from '@/lib/connect-recovery.ts';
 import { DIRECT_H264_CODEC, DIRECT_H265_CODEC } from '@/lib/encoder.ts';
 
 import { DirectMetrics } from './direct-metrics.ts';
 import { DirectPlayout } from './direct-playout.ts';
+import { probeTimeout } from './stall-check.ts';
 import { halvedVisibleRect } from './visible-rect.ts';
 
 let canvas: OffscreenCanvas | null = null;
@@ -14,8 +16,16 @@ let decoder: VideoDecoder | null = null;
 let streamUrl: string | null = null;
 let socket: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectDelayMs = 250;
+const initialReconnectDelayMs = 250;
+let reconnectDelayMs = initialReconnectDelayMs;
+// After a lost connection, attempts time out and retry soon (see ConnectRecovery).
+const recovery = new ConnectRecovery();
+let connectTimer: ReturnType<typeof setTimeout> | null = null;
 let stopped = false;
+let openMs = 0;
+// The server's instanceMessage on the open socket; null until it arrives.
+let serverInstance: number | null = null;
+let probe: WebSocket | null = null;
 let resyncRequested = false;
 let pendingAckTimestamp: number | null = null;
 // A keyframe (a stream start or resync) is acknowledged without batching.
@@ -44,6 +54,8 @@ const frameAckMessage = 2;
 const streamResyncMessage = 3;
 // Asks for a keyframe without a resync; older servers ignore it.
 const keyframeRequestMessage = 4;
+// The server's first message on a socket: [5][instance ID, uint32 LE].
+const instanceMessage = 5;
 // ACKs go out as soon as a frame is handed to the decoder, so the window only
 // has to cover the round trip. They are withheld from decoderHighWatermark
 // queued chunks until the queue falls to decoderLowWatermark. Keep
@@ -58,7 +70,7 @@ const frameQueue = new Queue<VideoFrame>();
 const frameChannel = new MessageChannel();
 
 type WorkerMessage = {
-  type: 'video' | 'stop' | 'screenshot' | 'record' | 'keyframe';
+  type: 'video' | 'stop' | 'screenshot' | 'record' | 'keyframe' | 'check';
   record?: boolean;
   requestId?: number;
   codec?: 'h264' | 'h265';
@@ -144,6 +156,7 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
       stopped = true;
       clearReconnectTimer();
       disconnect();
+      probe?.close();
       resetDecoder();
       if (animationRequest !== null) cancelAnimationFrame(animationRequest);
       animationRequest = null;
@@ -159,6 +172,9 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
       break;
     case 'keyframe':
       if (recording) requestKeyframe();
+      break;
+    case 'check':
+      checkSocket();
       break;
   }
 };
@@ -185,16 +201,30 @@ function connect() {
   try {
     const url = new URL(streamUrl);
     if (flowControl) url.searchParams.set('flow', String(flowControlWindow));
+    const createdAt = performance.now();
     const nextSocket = new WebSocket(url);
     nextSocket.binaryType = 'arraybuffer';
     socket = nextSocket;
+    let opened = false;
+    const timeout = recovery.connectTimeout(createdAt);
+    if (timeout !== null) {
+      connectTimer = setTimeout(() => {
+        connectTimer = null;
+        if (nextSocket.readyState === WebSocket.CONNECTING) nextSocket.close();
+      }, timeout);
+    }
 
     nextSocket.onopen = () => {
       if (socket !== nextSocket || stopped) {
         return;
       }
 
-      reconnectDelayMs = 250;
+      clearConnectTimer();
+      opened = true;
+      openMs = performance.now() - createdAt;
+      serverInstance = null;
+      recovery.opened(openMs);
+      reconnectDelayMs = initialReconnectDelayMs;
       resyncRequested = false;
       pendingAckTimestamp = null;
       clearAcks();
@@ -206,7 +236,9 @@ function connect() {
         return;
       }
 
-      handleWsMessage(event.data);
+      const instance = readInstance(event.data);
+      if (instance !== null) serverInstance = instance;
+      else handleWsMessage(event.data);
     };
 
     nextSocket.onerror = () => {
@@ -221,11 +253,9 @@ function connect() {
       }
 
       socket = null;
-      resyncRequested = false;
-      pendingAckTimestamp = null;
-      clearAcks();
-      decodeBackpressured = false;
-      resetDecoder();
+      clearConnectTimer();
+      if (opened) recovery.lost(performance.now());
+      resetStream();
 
       if (event.code === 1008) {
         stopped = true;
@@ -240,9 +270,58 @@ function connect() {
   }
 }
 
+function resetStream() {
+  resyncRequested = false;
+  pendingAckTimestamp = null;
+  clearAcks();
+  decodeBackpressured = false;
+  resetDecoder();
+}
+
+// The page's /api/ws came back after a loss. A power cut sends no close, so the
+// old socket can look alive for about 28 s, and a socket waiting out a network
+// blip looks the same from here. A probe socket asks the server for its
+// instance: a different one means the server restarted and the old socket is
+// dead. A probe that fails or times out leaves the socket alone.
+function checkSocket() {
+  if (stopped || !streamUrl || probe || serverInstance === null) return;
+  if (socket?.readyState !== WebSocket.OPEN) return;
+  const checked = socket;
+  const checkedInstance = serverInstance;
+  const url = new URL(streamUrl);
+  url.searchParams.set('probe', '1');
+  const current = new WebSocket(url);
+  current.binaryType = 'arraybuffer';
+  probe = current;
+  const timeout = setTimeout(() => current.close(), probeTimeout(openMs));
+  current.onmessage = (event) => {
+    current.close();
+    const instance = readInstance(event.data);
+    if (instance === null || instance === checkedInstance) return;
+    if (socket !== checked || stopped) return;
+    recovery.lost(performance.now());
+    disconnect();
+    resetStream();
+    clearReconnectTimer();
+    reconnectDelayMs = initialReconnectDelayMs;
+    connect();
+  };
+  current.onclose = () => {
+    clearTimeout(timeout);
+    if (probe === current) probe = null;
+  };
+}
+
+function readInstance(message: unknown): number | null {
+  if (!(message instanceof ArrayBuffer) || message.byteLength !== 5) return null;
+  const view = new DataView(message);
+  return view.getUint8(0) === instanceMessage ? view.getUint32(1, true) : null;
+}
+
 function disconnect() {
   const currentSocket = socket;
   socket = null;
+  clearConnectTimer();
 
   if (currentSocket && currentSocket.readyState !== WebSocket.CLOSED) {
     currentSocket.close();
@@ -254,12 +333,24 @@ function scheduleReconnect() {
     return;
   }
 
-  const delay = reconnectDelayMs;
+  // Soon after a lost connection each attempt already takes up to the connect timeout,
+  // so the delay is capped there instead of growing.
+  const recovering = recovery.recovering(performance.now());
+  const delay = recovering
+    ? Math.min(reconnectDelayMs, RECOVERY_RECONNECT_DELAY)
+    : reconnectDelayMs;
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, maxReconnectDelayMs);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect();
   }, delay);
+}
+
+function clearConnectTimer() {
+  if (connectTimer !== null) {
+    clearTimeout(connectTimer);
+    connectTimer = null;
+  }
 }
 
 function clearReconnectTimer() {

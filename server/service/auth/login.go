@@ -2,14 +2,12 @@ package auth
 
 import (
 	"net/http"
-	"strings"
 	"time"
 
 	"NanoKVM-Server/authn"
 	"NanoKVM-Server/config"
 	"NanoKVM-Server/middleware"
 	"NanoKVM-Server/proto"
-	"NanoKVM-Server/service/notify"
 	"NanoKVM-Server/utils"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +21,10 @@ const ReturnTokenHeader = "X-NanoKVM-Return-Token"
 
 // loginBodyTimeout bounds how long a login request may take to send its body.
 var loginBodyTimeout = 15 * time.Second
+
+// loginPenalty is the unit of the delays before a failed login or password
+// check replies.
+var loginPenalty = time.Second
 
 func (s *Service) Login(c *gin.Context) {
 	// Cover early replies too: HTTP/1 may drain an unread request body
@@ -46,12 +48,12 @@ func (s *Service) Login(c *gin.Context) {
 
 	clientIP := GetClientIP(c)
 	if locked, code, msg := CheckLoginAttempt(clientIP); locked {
-		time.Sleep(3 * time.Second)
+		time.Sleep(3 * loginPenalty)
 		rsp.ErrRsp(c, code, msg)
 		return
 	}
 	if err := proto.ParseFormRequest(c, &req); err != nil {
-		time.Sleep(3 * time.Second)
+		time.Sleep(3 * loginPenalty)
 		rsp.ErrRsp(c, -1, "invalid parameters")
 		return
 	}
@@ -59,7 +61,7 @@ func (s *Service) Login(c *gin.Context) {
 	// Recheck lockout on admission: failures can arrive while parsing.
 	release, admitted, code, msg := BeginLoginAttempt(clientIP)
 	if !admitted {
-		time.Sleep(3 * time.Second)
+		time.Sleep(3 * loginPenalty)
 		rsp.ErrRsp(c, code, msg)
 		return
 	}
@@ -72,7 +74,7 @@ func (s *Service) Login(c *gin.Context) {
 	user, ok, err := authn.DefaultStore.Authenticate(req.Username, password)
 	if err != nil {
 		log.Errorf("load account during login: %s", err)
-		time.Sleep(2 * time.Second)
+		time.Sleep(2 * loginPenalty)
 		rsp.ErrRsp(c, -3, "authentication unavailable")
 		return
 	}
@@ -80,22 +82,12 @@ func (s *Service) Login(c *gin.Context) {
 		s.loginFailedFor(c, clientIP, req.Username, &rsp)
 		return
 	}
-
-	ClearLoginAttempt(clientIP, req.Username)
-	token, err := middleware.GenerateJWT(user.Username, user.TokenVersion)
-	if err != nil {
-		time.Sleep(time.Second)
-		rsp.ErrRsp(c, -3, "generate token failed")
-		return
+	if user.TOTP != nil {
+		if user = s.requireSecondFactor(c, clientIP, user, req.OTP, &rsp); user == nil {
+			return
+		}
 	}
-	setSessionCookie(c, token)
-	if strings.EqualFold(strings.TrimSpace(c.GetHeader(ReturnTokenHeader)), "true") {
-		rsp.OkRspWithData(c, &proto.LoginRsp{Token: token})
-	} else {
-		rsp.OkRsp(c)
-	}
-	log.Infof("user logged in: %s", user.Username)
-	go notify.LoginSucceeded(user.Username, clientIP)
+	s.finishLogin(c, clientIP, user, &rsp)
 }
 
 // loginFailed records the failure before the delay, so the lockout counts it
@@ -107,7 +99,7 @@ func (s *Service) loginFailed(c *gin.Context, clientIP string, rsp *proto.Respon
 // loginFailedFor is loginFailed for a known user name.
 func (s *Service) loginFailedFor(c *gin.Context, clientIP, username string, rsp *proto.Response) {
 	locked, code, msg := RecordLoginFailureFor(clientIP, username)
-	time.Sleep(2 * time.Second)
+	time.Sleep(2 * loginPenalty)
 	if locked {
 		rsp.ErrRsp(c, code, msg)
 		return
@@ -138,11 +130,16 @@ func (s *Service) GetAccount(c *gin.Context) {
 		rsp.ErrRsp(c, -1, "get account failed")
 		return
 	}
-	rsp.OkRspWithData(c, &proto.GetAccountRsp{
+	data := &proto.GetAccountRsp{
 		Username:           principal.Username,
 		Role:               string(principal.Role),
 		MustChangePassword: principal.MustChangePassword,
-	})
+	}
+	if user, err := authn.DefaultStore.Get(principal.Username); err == nil && user.TOTP != nil {
+		data.TOTPEnabled = true
+		data.RecoveryCodesLeft = len(user.TOTP.RecoveryHashes)
+	}
+	rsp.OkRspWithData(c, data)
 }
 
 func setSessionCookie(c *gin.Context, token string) {
@@ -171,12 +168,5 @@ func setSessionCookie(c *gin.Context, token string) {
 }
 
 func clearSessionCookie(c *gin.Context) {
-	secure := middleware.SessionCookieName(c.Request) == middleware.CookieName
-	c.SetSameSite(http.SameSiteStrictMode)
-	// Clear the legacy cookie too, so HTTP fallback cannot restore a session
-	// after logout when token revocation is disabled. HTTPS can clear both;
-	// HTTP cannot remove a Secure cookie left by a previous HTTPS session.
-	for _, name := range []string{middleware.CookieName, middleware.HTTPCookieName} {
-		c.SetCookie(name, "", -1, "/", "", secure, true)
-	}
+	middleware.ClearSessionCookie(c)
 }

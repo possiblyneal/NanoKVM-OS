@@ -5,7 +5,8 @@
 // The adapter deliberately does not change ordinary PacketConn semantics by
 // queueing arbitrary writes. Only RTP media writes observed between BeginFrame
 // and EndFrame are copied into bounded slots. EndFrame performs the actual
-// send and returns its error to the caller.
+// send and returns its error to the caller. A socket of a data channel
+// (BatchRecords) also buffers DTLS application records, which have no frame.
 package udpbatch
 
 import (
@@ -22,7 +23,6 @@ import (
 	"time"
 	"unsafe"
 
-	"NanoKVM-Server/common/udpfast"
 	"github.com/pion/transport/v5"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -71,6 +71,7 @@ type Conn struct {
 
 	mu            sync.Mutex
 	frame         bool
+	records       bool // DTLS application records are buffered at all times
 	count         int
 	addr          netip.AddrPort
 	slots         [maxBatchPackets]packetSlot
@@ -79,13 +80,24 @@ type Conn struct {
 	flushInterval time.Duration
 	sticky        error
 	sendmmsg      sendmmsgFunc
-	gsoBuffer     *[maxBatchPackets * maxPacketBytes]byte
+	gso           bool // UDP_SEGMENT works on this socket
 	gsoStats      *gsoDiagnostics
+	// The arguments of each sendmmsg, built under mu: as locals their
+	// addresses, handed to the kernel, moved them to the heap on every send.
+	scratch sendScratch
+}
+
+type sendScratch struct {
+	messages [maxBatchPackets]mmsghdr
+	iovs     [maxBatchPackets]unix.Iovec
+	addr4    [maxBatchPackets]unix.RawSockaddrInet4
+	addr6    [maxBatchPackets]unix.RawSockaddrInet6
+	control  [24]byte // CMSG_SPACE(sizeof(uint16)) on supported 64-bit Linux.
 }
 
 // Wrap returns a frame-aware wrapper when c is an IPv4/IPv6 UDP socket with
 // an accessible RawConn. The bool reports whether the wrapper was installed.
-func Wrap(c *net.UDPConn, fast bool, onClose func()) (*Conn, bool) {
+func Wrap(c *net.UDPConn, onClose func()) (*Conn, bool) {
 	if c == nil || c.RemoteAddr() != nil {
 		return nil, false
 	}
@@ -101,12 +113,8 @@ func Wrap(c *net.UDPConn, fast bool, onClose func()) (*Conn, bool) {
 		return nil, false
 	}
 
-	var direct transport.UDPConn = c
-	if fast {
-		direct = udpfast.Wrap(c)
-	}
 	wrapped := &Conn{
-		UDPConn:       direct,
+		UDPConn:       c,
 		udp:           c,
 		raw:           raw,
 		family:        family,
@@ -114,11 +122,10 @@ func Wrap(c *net.UDPConn, fast bool, onClose func()) (*Conn, bool) {
 		flushInterval: configuredFlushInterval(),
 		sendmmsg:      syscallSendmmsg,
 	}
-	if os.Getenv("NANOKVM_WEBRTC_UDP_GSO") == "1" {
-		wrapped.gsoBuffer = new([maxBatchPackets * maxPacketBytes]byte)
-		if os.Getenv("NANOKVM_WEBRTC_DIAGNOSTICS") == "1" {
-			wrapped.gsoStats = &gsoDiagnostics{}
-		}
+	// UDP GSO halves the sender's CPU per packet on the SG2002.
+	wrapped.gso = true
+	if os.Getenv("NANOKVM_WEBRTC_DIAGNOSTICS") == "1" {
+		wrapped.gsoStats = &gsoDiagnostics{}
 	}
 	return wrapped, true
 }
@@ -139,6 +146,17 @@ func (c *Conn) BeginFrame() {
 	}
 	c.frame = true
 	c.sticky = nil
+}
+
+// BatchRecords buffers DTLS application records at all times, for a data
+// channel: its sender writes a burst of packets, each of which would be a
+// system call, and has no frame to mark. A burst goes out when it is full,
+// when anything else is written to the socket, or after the flush interval.
+// An error of a burst is returned by the next write.
+func (c *Conn) BatchRecords() {
+	c.mu.Lock()
+	c.records = true
+	c.mu.Unlock()
 }
 
 // EndFrame flushes all buffered media and returns the first send error.
@@ -169,7 +187,7 @@ func (c *Conn) timerFlush(state *timerState) {
 	}
 	c.timerState = nil
 	c.timerArmed = false
-	if !c.closed.Load() && c.frame && c.count != 0 {
+	if !c.closed.Load() && (c.frame || c.records) && c.count != 0 {
 		_ = c.flushLocked()
 	}
 	c.mu.Unlock()
@@ -246,14 +264,20 @@ func (c *Conn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
 }
 
 func (c *Conn) batchWriteLocked(b []byte, ap netip.AddrPort, valid bool) (int, error, bool) {
-	if !c.frame || !isBatchableRTP(b) {
+	record := c.records && isDTLSRecord(b)
+	if !record && (!c.frame || !isBatchableRTP(b)) {
 		if err := c.flushLocked(); err != nil {
 			return 0, err, true
 		}
 		return 0, nil, false
 	}
 	if c.sticky != nil {
-		return 0, c.sticky, true
+		err := c.sticky
+		if record {
+			// No frame ends to report and clear it.
+			c.sticky = nil
+		}
+		return 0, err, true
 	}
 	if !valid || (c.count != 0 && c.addr != ap) {
 		if err := c.flushLocked(); err != nil {
@@ -261,7 +285,10 @@ func (c *Conn) batchWriteLocked(b []byte, ap netip.AddrPort, valid bool) (int, e
 		}
 		return 0, nil, false
 	}
-	if c.count == maxBatchPackets {
+	// UDP_SEGMENT takes datagrams of one size and a shorter last one: a record
+	// longer than the burst's first starts the next burst, a shorter one ends
+	// its own (below).
+	if c.count == maxBatchPackets || (record && c.count != 0 && len(b) > c.slots[0].n) {
 		if err := c.flushLocked(); err != nil {
 			return 0, err, true
 		}
@@ -278,10 +305,10 @@ func (c *Conn) batchWriteLocked(b []byte, ap netip.AddrPort, valid bool) (int, e
 	slot := &c.slots[c.count]
 	slot.n = copy(slot.data[:], b)
 	slot.addr = ap
-	slot.marker = b[1]&0x80 != 0
+	slot.marker = !record && b[1]&0x80 != 0
 	c.count++
 	c.startTimerLocked()
-	if slot.marker {
+	if slot.marker || (record && slot.n < c.slots[0].n) {
 		if err := c.flushLocked(); err != nil {
 			return 0, err, true
 		}
@@ -321,9 +348,6 @@ func (c *Conn) Close() error {
 		c.sticky = net.ErrClosed
 		if s := c.gsoStats; s != nil && s.attempts != 0 {
 			log.Infof("WebRTC UDP GSO close: attempts=%d bundles=%d datagrams=%d fallbacks=%d", s.attempts, s.bundles, s.datagrams, s.fallbacks)
-		}
-		if c.gsoBuffer != nil {
-			clear(c.gsoBuffer[:])
 		}
 		for i := range c.slots {
 			c.slots[i] = packetSlot{}
@@ -403,6 +427,12 @@ func isBatchableRTP(b []byte) bool {
 	return pt < 64 || pt > 95
 }
 
+// A DTLS application data record (content type 23, DTLS 1.2), which is what
+// carries a data channel once the handshake is over.
+func isDTLSRecord(b []byte) bool {
+	return len(b) >= 13 && len(b) <= maxPacketBytes && b[0] == 23 && b[1] == 0xfe && b[2] == 0xfd
+}
+
 func (c *Conn) flushLocked() error {
 	if c.count == 0 {
 		return c.sticky
@@ -412,11 +442,10 @@ func (c *Conn) flushLocked() error {
 	count := c.count
 	sent, err, handled := c.sendGSOLocked(count)
 	if !handled {
-		var messages [maxBatchPackets]mmsghdr
-		var iovs [maxBatchPackets]unix.Iovec
-		var addr4 [maxBatchPackets]unix.RawSockaddrInet4
-		var addr6 [maxBatchPackets]unix.RawSockaddrInet6
+		s := &c.scratch
+		messages, iovs, addr4, addr6 := &s.messages, &s.iovs, &s.addr4, &s.addr6
 		for i := 0; i < c.count; i++ {
+			messages[i] = mmsghdr{}
 			slot := &c.slots[i]
 			iovs[i] = unix.Iovec{
 				Base: &slot.data[0],
@@ -441,7 +470,7 @@ func (c *Conn) flushLocked() error {
 			}
 		}
 
-		sent, err = c.sendMessagesLocked(&messages, count)
+		sent, err = c.sendMessagesLocked(messages, count)
 	}
 	if errors.Is(err, syscall.ENOSYS) && sent == 0 {
 		_, fallbackErr := c.fallbackLocked(0, count)

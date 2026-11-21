@@ -3,6 +3,10 @@ package hid
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -21,6 +25,8 @@ type Char struct {
 type PasteReq struct {
 	Content string `form:"content" validate:"required"`
 	Langue  string `form:"langue"`
+	// Speed is "normal" (the default) or "slow".
+	Speed string `form:"speed"`
 }
 
 const (
@@ -28,6 +34,21 @@ const (
 	maxPasteDuration     = 25 * time.Second
 	maxPasteContentRunes = int(maxPasteDuration / defaultPasteDelay)
 )
+
+// pasteSpeed is how a paste presses its keys: how long a key stays down, the
+// pause after it, and the longest the whole paste may take.
+type pasteSpeed struct {
+	hold, gap, limit time.Duration
+}
+
+// Normal is as fast as a running system takes it. Slow is for what reads
+// the keyboard itself and drops keys that come too close or are let go too
+// soon: a firmware setup, a boot loader, a console over a slow link.
+var pasteSpeeds = map[string]pasteSpeed{
+	"":       {gap: defaultPasteDelay, limit: maxPasteDuration},
+	"normal": {gap: defaultPasteDelay, limit: maxPasteDuration},
+	"slow":   {hold: 30 * time.Millisecond, gap: 100 * time.Millisecond, limit: 50 * time.Second},
+}
 
 func LangueSwitch(base map[rune]Char, lang string) map[rune]Char {
 	// if no language is specified → return base map
@@ -92,6 +113,7 @@ func LangueSwitch(base map[rune]Char, lang string) map[rune]Char {
 		m['\u20AC'] = Char{0x40, 8}  // €
 		m['\u00B2'] = Char{0x40, 31} // ²
 		m['\u00B3'] = Char{0x40, 32} // ³
+		m['='] = Char{2, 39}         // Shift + 0
 
 	case "fr":
 		// French AZERTY layout
@@ -168,6 +190,10 @@ func LangueSwitch(base map[rune]Char, lang string) map[rune]Char {
 		m['@'] = Char{0x40, 39}     // AltGr+0
 		m['\u20AC'] = Char{0x40, 8} // € AltGr+E
 
+		// ISO key between left Shift and W (HID 100)
+		m['<'] = Char{0, 100}
+		m['>'] = Char{2, 100}
+
 	case "es":
 		applySpanishLayout(m)
 	}
@@ -183,12 +209,21 @@ func (s *Service) Paste(c *gin.Context) {
 		return
 	}
 
+	speed, ok := pasteSpeeds[req.Speed]
+	if !ok {
+		rsp.ErrRsp(c, -1, "invalid arguments")
+		return
+	}
+
 	// Reject oversized input before the rune slice multiplies its size.
 	if len(req.Content) > maxPasteContentRunes*utf8.UTFMax {
 		rsp.ErrRsp(c, -2, "content too long")
 		return
 	}
-	contentRunes := []rune(req.Content)
+	// Clipboard text may carry CR LF or CR line ends; each is one Enter.
+	content := strings.ReplaceAll(req.Content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	contentRunes := []rune(content)
 	if len(contentRunes) > maxPasteContentRunes {
 		rsp.ErrRsp(c, -2, "content too long")
 		return
@@ -200,17 +235,23 @@ func (s *Service) Paste(c *gin.Context) {
 		followMap = spanishDeadKeyContinuationMap
 	}
 
+	// A paste with a character the layout cannot type is refused whole:
+	// typing the rest would put wrong text, such as a password, on the host.
+	if missing := untypeableRunes(contentRunes, charMapLocal); len(missing) > 0 {
+		rsp.ErrRsp(c, -2, "the keyboard layout cannot type "+formatRunes(missing))
+		return
+	}
+
 	typeableKeys := 0
 	for _, char := range contentRunes {
-		if _, ok := charMapLocal[char]; ok {
+		typeableKeys++
+		if _, ok := followMap[char]; ok {
 			typeableKeys++
-			if _, ok := followMap[char]; ok {
-				typeableKeys++
-			}
 		}
 	}
-	if time.Duration(typeableKeys)*defaultPasteDelay > maxPasteDuration {
-		rsp.ErrRsp(c, -2, "paste duration exceeds 25s")
+	if time.Duration(typeableKeys)*(speed.hold+speed.gap) > speed.limit {
+		rsp.ErrRsp(c, -2, fmt.Sprintf("the text is too long for this speed: at most %d characters",
+			int(speed.limit/(speed.hold+speed.gap))))
 		return
 	}
 
@@ -249,35 +290,31 @@ func (s *Service) Paste(c *gin.Context) {
 		})
 	}
 
+	// One key: down, held for the speed's time, up, then the pause.
+	pressKey := func(key Char) error {
+		keyDown := []byte{byte(key.Modifiers), 0x00, byte(key.Code), 0x00, 0x00, 0x00, 0x00, 0x00}
+		if err := writeKeyboardReport(keyDown); err != nil {
+			return err
+		}
+		if speed.hold > 0 {
+			if err := sleepPasteContext(c.Request.Context(), speed.hold); err != nil {
+				return err
+			}
+		}
+		if err := writeKeyboardReport(keyUp); err != nil {
+			return err
+		}
+		return sleepPasteContext(c.Request.Context(), speed.gap)
+	}
 	for _, char := range contentRunes {
 		if err := context.Cause(c.Request.Context()); err != nil {
 			break
 		}
-		key, ok := charMapLocal[char]
-		if !ok {
-			log.Debugf("unknown key '%c' (rune: %d)", char, char)
-			continue
-		}
-
-		keyDown := []byte{byte(key.Modifiers), 0x00, byte(key.Code), 0x00, 0x00, 0x00, 0x00, 0x00}
-		if err = writeKeyboardReport(keyDown); err != nil {
-			break
-		}
-		if err = writeKeyboardReport(keyUp); err != nil {
-			break
-		}
-		if err = sleepPasteContext(c.Request.Context(), defaultPasteDelay); err != nil {
+		if err = pressKey(charMapLocal[char]); err != nil {
 			break
 		}
 		if followKey, ok := followMap[char]; ok {
-			followKeyDown := []byte{byte(followKey.Modifiers), 0x00, byte(followKey.Code), 0x00, 0x00, 0x00, 0x00, 0x00}
-			if err = writeKeyboardReport(followKeyDown); err != nil {
-				break
-			}
-			if err = writeKeyboardReport(keyUp); err != nil {
-				break
-			}
-			if err = sleepPasteContext(c.Request.Context(), defaultPasteDelay); err != nil {
+			if err = pressKey(followKey); err != nil {
 				break
 			}
 		}
@@ -299,7 +336,37 @@ func (s *Service) Paste(c *gin.Context) {
 	}
 
 	rsp.OkRsp(c)
-	log.Debugf("hid paste success, total %d characters processed", len(contentRunes))
+	log.Debugf("hid paste success, total %d characters typed", len(contentRunes))
+}
+
+const maxReportedRunes = 5
+
+// untypeableRunes returns the distinct runes of text that m has no key for,
+// in order of first appearance, at most maxReportedRunes+1 of them.
+func untypeableRunes(text []rune, m map[rune]Char) []rune {
+	var missing []rune
+	for _, r := range text {
+		if _, ok := m[r]; ok || slices.Contains(missing, r) {
+			continue
+		}
+		missing = append(missing, r)
+		if len(missing) > maxReportedRunes {
+			break
+		}
+	}
+	return missing
+}
+
+func formatRunes(runes []rune) string {
+	quoted := make([]string, 0, maxReportedRunes)
+	for i, r := range runes {
+		if i == maxReportedRunes {
+			quoted = append(quoted, "...")
+			break
+		}
+		quoted = append(quoted, strconv.QuoteRune(r))
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func sleepPasteContext(ctx context.Context, delay time.Duration) error {

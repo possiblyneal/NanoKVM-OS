@@ -13,9 +13,11 @@ import sys
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--libraries', type=Path, required=True)
 p.add_argument('--compression', type=Path, required=True,
-               help='zlib-ng and liblzma headers (include/) and static libraries (lib/) from the tools step')
+               help='zlib-ng headers (include/) and static library (lib/) from the tools step')
 p.add_argument('--buildroot-output', type=Path, required=True)
 p.add_argument('--go', type=Path, required=True)
+p.add_argument('--hot-order', type=Path,
+               help='function order for the linker (firmware/cpu/go-hot-order); needs its prepared linker')
 p.add_argument('--output', type=Path, required=True)
 a = p.parse_args()
 repo = Path(__file__).resolve().parents[1]
@@ -25,17 +27,18 @@ if out.exists():
 names = ['kvm', 'kvm_mmf', 'sys', 'vi', 'vpss', 'vo', 'rgn', 'gdc', 'cvi_ive', 'venc', 'vdec',
          'misc', 'isp', 'isp_algo', 'ae', 'awb', 'af', 'cvi_bin', 'cvi_bin_isp']
 full_names = {f'lib{name}.so' for name in names}
-light_names = {f'lib{name}.so' for name in ('kvm', 'kvm_mmf', 'ae', 'awb', 'af', 'isp_algo')}
+light_names = {f'lib{name}.so' for name in ('kvm', 'kvm_mmf')}
 actual_names = {path.name for path in a.libraries.resolve().glob('*.so')}
 if actual_names not in (full_names, light_names):
-    p.error('Native bundle must contain exactly the six HDMI-light or nineteen full libraries; mixed bundles are unsupported')
+    p.error('Native bundle must contain exactly the two HDMI-light or nineteen full libraries; mixed bundles are unsupported')
 sources = {name: a.libraries.resolve()/name for name in sorted(actual_names)}
 for source in sources.values():
     if not source.is_file():
         p.error('Missing native library: '+str(source))
 cross = str(a.buildroot_output.resolve()/'host/bin/riscv64-buildroot-linux-musl-')
 required_native_symbols = {
-    'libkvm.so': {'kvmv_read_video_sink_v2', 'kvmv_read_mjpeg_sink', 'set_mjpeg_chroma', 'get_mjpeg_chroma_status'},
+    'libkvm.so': {'kvmv_read_video_sink_v2', 'kvmv_read_mjpeg_sink', 'kvmv_read_mjpeg_tiles_sink',
+                  'set_mjpeg_chroma', 'get_mjpeg_chroma_status'},
     'libkvm_mmf.so': {'mmf_add_venc_channel_v2', 'mmf_add_vi_channel_configured', 'mmf_vi_drop_pending'},
 }
 required_native_dependencies = {
@@ -62,10 +65,10 @@ for library, required in required_native_dependencies.items():
     missing = sorted(required - dependencies)
     if missing:
         p.error(f'Native bundle mismatch: {library} does not require {", ".join(missing)}')
-# server/internal/decompress links zlib-ng and liblzma statically: only the
-# .a files are in this lib directory, so -lz and -llzma cannot pick a .so.
+# server/internal/decompress links zlib-ng statically: only the .a file is in
+# this lib directory, so -lz cannot pick a .so.
 compression = a.compression.resolve()
-for name in ('include/zlib.h', 'include/lzma.h', 'lib/libz.a', 'lib/liblzma.a'):
+for name in ('include/zlib.h', 'lib/libz.a'):
     if not (compression/name).is_file():
         p.error(f'Missing {name} in {compression}; run the tools step first')
 if any(compression.glob('lib/*.so*')):
@@ -99,7 +102,10 @@ subprocess.run([sys.executable, str(repo / 'firmware/cpu/go-websocket-c906/prepa
 websocket_modfile = str(websocket / 'server/go.mod')
 # Go action IDs include the output-specific CGO library search path.
 # Omit the Go build ID; manifest SHA-256 values identify the exact binaries.
-subprocess.run([go, 'build', '-modfile=' + websocket_modfile, '-tags=nomsgpack', '-trimpath', '-buildvcs=false', '-ldflags=-linkmode=external -buildid=', '-o',
+# The hot functions first, together: firmware/cpu/go-hot-order. The linker
+# must be the one prepare-linker.py built.
+hot_order = f' -hotorder={a.hot_order.resolve()}' if a.hot_order else ''
+subprocess.run([go, 'build', '-modfile=' + websocket_modfile, '-tags=nomsgpack', '-trimpath', '-buildvcs=false', '-ldflags=-linkmode=external -buildid=' + hot_order, '-o',
                 str(out/'NanoKVM-Server'), '.'], cwd=websocket/'server', env=env, check=True)
 info = subprocess.check_output([go, 'version', '-m', str(out/'NanoKVM-Server')], env=env, text=True)
 symbols = subprocess.check_output([go, 'tool', 'nm', str(out/'NanoKVM-Server')], env=env, text=True)
@@ -137,8 +143,13 @@ subprocess.run([go, 'build', '-trimpath', '-buildvcs=false', '-ldflags=-s -w -bu
                 '-o', str(out/'nkos-standby'), './cmd/nkos-standby'],
                cwd=repo/'server', env=helper_env, check=True)
 files.append(out/'nkos-standby')
-manifest = {'qualification': 'cross-build only',
-            'custom_runtime_expected': custom_runtime_expected,
+# The IPMI daemon: a process of its own, so that a fault in parsing untrusted
+# UDP packets cannot stop the server.
+subprocess.run([go, 'build', '-trimpath', '-buildvcs=false', '-ldflags=-s -w -buildid=',
+                '-o', str(out/'nkos-ipmi'), './cmd/nkos-ipmi'],
+               cwd=repo/'server', env=helper_env, check=True)
+files.append(out/'nkos-ipmi')
+manifest = {'custom_runtime_expected': custom_runtime_expected,
             'custom_runtime_present': custom_runtime_present,
             'websocket_c906_present': websocket_mask_present,
             'websocket_c906': json.loads((websocket/'manifest.json').read_text()),

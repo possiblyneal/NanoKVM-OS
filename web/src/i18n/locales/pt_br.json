@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "Energia",
-    "showConfirm": "Confirmação",
-    "showConfirmTip": "Operações de energia requerem uma confirmação extra",
     "reset": "Redefinir",
     "powerShort": "Energia (clique curto)",
     "powerLong": "Energia (clique longo)",
@@ -350,12 +348,13 @@
         "modeAlways": "Sempre visível",
         "keyboardLedStatus": "Indicadores de bloqueio do teclado",
         "keyboardLedStatusDesc": "Mostrar Caps Lock, Num Lock e Scroll Lock do computador remoto na barra de menu.",
+        "hostLedStatus": "Indicadores de energia e disco",
+        "hostLedStatusDesc": "Mostrar os LEDs de energia e de disco do computador remoto na barra de menu.",
         "icons": "Botões da barra de menu",
         "iconsDesc": "Exibir ícones de submenus na barra de menu",
         "hiddenCount": "{{count}} ocultos",
         "showAll": "Mostrar todos"
       },
-      "buttonColor": {},
       "browser": "Neste navegador",
       "browserDesc": "Guardado só neste navegador; outros navegadores e usuários têm os seus.",
       "device": "Para todos neste dispositivo",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Enviar"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "LEDs de energia e de disco do computador remoto",
+      "powerLed": "LED de energia",
+      "powerLedShort": "Pwr",
+      "hddLed": "LED de disco",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Estado dos bloqueios do teclado remoto",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "Salvar"
       },
-      "addons": {
-        "title": "Complementos",
-        "packages": "Pacotes",
-        "install": "Instalar"
-      },
       "title": "Software",
+      "packages": "Pacotes",
       "available": "Pacotes disponíveis",
       "updatesTab": "Atualizações",
       "search": "Pesquisar",
@@ -744,10 +746,7 @@
       }
     },
     "rustdesk": {
-      "absent": "Não instalado",
       "stopped": "Parado",
-      "install": "Instalar",
-      "remove": "Remover",
       "save": "Salvar configurações",
       "server": "Servidor",
       "passwordMode": "Senha",
@@ -801,8 +800,7 @@
       "eventHint": {
         "power": "o host foi ligado ou desligado; requer controle ATX com o LED de energia conectado.",
         "hdmi": "a imagem foi perdida ou voltou, também quando o host desliga a tela; detectado enquanto a captura de vídeo está ativa.",
-        "security": "um endereço bloqueado após logins malsucedidos, um login a partir de um novo endereço.",
-        "screen": "uma tela azul ou um kernel panic, reconhecidos pelo complemento TPU; o texto é lido quando ninguém está assistindo ao vídeo, e uma captura de tela é enviada junto."
+        "security": "um endereço bloqueado após logins malsucedidos, tentativas de login IPMI em excesso, um login a partir de um novo endereço."
       },
       "field": {
         "token": "Token",
@@ -883,6 +881,7 @@
         "hdmi_lost": "Sinal HDMI perdido",
         "hdmi_restored": "Sinal HDMI restaurado",
         "security_lockout": "Logins bloqueados",
+        "security_attempt-limit": "Tentativas de login limitadas",
         "security_new-address": "Login a partir de um novo endereço",
         "screen_bsod": "Tela azul",
         "screen_panic": "Kernel panic",
@@ -928,16 +927,6 @@
         "authError": "O login não funciona mais: {{error}}",
         "changed": "O serviço, o ID do cliente ou o tenant mudou durante o login. Entre novamente."
       }
-    },
-    "addonPage": {
-      "failed": "Não foi possível ler os valores do complemento",
-      "notRunning": "O serviço do complemento não está em execução",
-      "refused": "O complemento recusou",
-      "saved": "Salvo",
-      "save": "Salvar",
-      "status": "Status",
-      "yes": "Sim",
-      "no": "Não"
     }
   },
   "picoclaw": {

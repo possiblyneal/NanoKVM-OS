@@ -28,7 +28,8 @@ var wifiMu sync.Mutex
 var wifiBusy bool
 var wifiError string
 var wifiControl = radioControl{etc: "/etc/kvm", net: "/sys/class/net/wlan0", sdio: "/sys/bus/sdio/devices",
-	runDir: wifiRunDir, run: runRadioCommand, request: wpaControl(wpaControlSocket), bands: &bandCache{ttl: 30 * time.Second}}
+	runDir: wifiRunDir, run: runRadioCommand, request: wpaControl(wpaControlSocket), bands: &bandCache{ttl: 30 * time.Second},
+	apBands: &apChannelCache{ttl: 30 * time.Second}}
 
 type radioControl struct {
 	etc, net string
@@ -42,6 +43,8 @@ type radioControl struct {
 	request func(string) (string, error)
 	// bands, when set, lets status polls reuse a recent channel list.
 	bands *bandCache
+	// apBands, when set, lets the access point page reuse its channel list.
+	apBands *apChannelCache
 }
 
 // bandCache keeps the last successful channel list of a phy. iw reports
@@ -780,6 +783,20 @@ func (s *Service) DisconnectWifi(c *gin.Context) {
 		}
 		finishWifi(err)
 	}()
+}
+
+// requestMayRideWifi reports whether a Wi-Fi change can cut this page off: the
+// request ends at wlan0, or at an address whose traffic can run over Wi-Fi,
+// such as a VPN (Tailscale, NetBird, WireGuard, OpenVPN) or a local proxy.
+// Only a request that ends at an Ethernet or USB network address survives.
+func requestMayRideWifi(c *gin.Context) bool {
+	interfaces, _ := net.Interfaces()
+	for _, iface := range interfaces {
+		if requestOnInterface(c, iface.Name) {
+			return !(strings.HasPrefix(iface.Name, "eth") || strings.HasPrefix(iface.Name, "usb"))
+		}
+	}
+	return true
 }
 
 // requestOnInterface reports whether the connection of this request ends at

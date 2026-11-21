@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"NanoKVM-Server/internal/oomscore"
+	"NanoKVM-Server/pkg/resolvconf"
 	"NanoKVM-Server/proto"
-	"NanoKVM-Server/service/extensions/apkpkg"
 	"github.com/gin-gonic/gin"
 )
 
@@ -71,7 +71,12 @@ func NewService() *Service {
 			ps, _ := s.profiles()
 			for _, p := range ps {
 				if p.ID == id && s.pid(id) == 0 {
-					_ = s.start(p)
+					// Right after a power cut resolvconf can fail before
+					// OpenVPN runs: retry as for a tunnel that exited.
+					generation := s.nextGeneration(id)
+					if s.startAttempt(p, 0, generation) != nil {
+						go s.supervise(id, generation, 0, 0)
+					}
 				}
 			}
 		}
@@ -262,7 +267,7 @@ func (s *Service) startAttempt(p Profile, attempt int, generation uint64) error 
 		return e
 	}
 	// Validate and canonicalize persisted profiles again before handing them to
-	// a root daemon. The service owns the runtime TUN device name.
+	// a root daemon. The service owns the runtime device name.
 	profilePath := s.path(p.ID, ".ovpn")
 	b, e := os.ReadFile(profilePath)
 	if e != nil {
@@ -277,7 +282,7 @@ func (s *Service) startAttempt(p Profile, attempt int, generation uint64) error 
 			return e
 		}
 	}
-	if _, e = os.Stat("/run/resolvconf/interfaces/nkos.base"); os.IsNotExist(e) {
+	if !resolvconf.Has("nkos.base") {
 		base, err := os.ReadFile("/etc/resolv.conf")
 		if err != nil {
 			return err
@@ -290,10 +295,30 @@ func (s *Service) startAttempt(p Profile, attempt int, generation uint64) error 
 			return e
 		}
 	}
+	// The callers hold s.mu and found no OpenVPN of this profile running.
+	if e = removeStaleDCO(deviceName(p.ID)); e != nil {
+		return e
+	}
+	devType := "tun"
+	if normalized.TAP {
+		devType = "tap"
+		// A new device for every start. One left by an OpenVPN that did
+		// not exit cleanly (killed, out of memory) keeps that OpenVPN's
+		// addresses and routes, and a pushed default route there would
+		// catch the way to the server. The callers hold s.mu and found no
+		// OpenVPN of this profile running, so the device is no one's.
+		name := deviceName(p.ID)
+		if e = removeTAP(name); e == nil {
+			e = prepareTAP(name)
+		}
+		if e != nil {
+			return e
+		}
+	}
 	args := []string{
 		"--config", profilePath,
 		"--dev", deviceName(p.ID),
-		"--dev-type", "tun",
+		"--dev-type", devType,
 		"--log", s.runtime(p.ID, ".log"),
 		"--script-security", "2",
 		"--up", "/etc/openvpn/up.sh",
@@ -339,7 +364,12 @@ func (s *Service) startAttempt(p Profile, attempt int, generation uint64) error 
 func (s *Service) stop(id string) (result error) {
 	// No retry chain may restart what is being stopped.
 	s.nextGeneration(id)
-	defer func() { result = errors.Join(result, s.clearDNS(id)) }()
+	defer func() {
+		result = errors.Join(result, s.clearDNS(id))
+		if s.pid(id) == 0 {
+			result = errors.Join(result, removeStaleDCO(deviceName(id)), removeTAP(deviceName(id)))
+		}
+	}()
 	pid := s.pid(id)
 	if pid == 0 {
 		return nil
@@ -365,9 +395,52 @@ func (s *Service) stop(id string) (result error) {
 	}
 	return fmt.Errorf("OpenVPN has not stopped")
 }
+
+// prepareTAP creates the TAP device of a profile before OpenVPN opens it,
+// with IPv6 router advertisements and address autoconfiguration off from the
+// first frame: a TAP device is on the server's Ethernet segment, whose
+// routers would otherwise give the NanoKVM addresses and a default route.
+// Addresses and routes come only from what the server pushes, as with TUN.
+// OpenVPN attaches to the device. The device outlives OpenVPN with whatever
+// it had: the caller removes an old one first, and stop removes it.
+var prepareTAP = func(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if out, e := exec.CommandContext(ctx, "ip", "tuntap", "add", "dev", name, "mode", "tap").CombinedOutput(); e != nil {
+		return fmt.Errorf("cannot create the TAP device: %s", strings.TrimSpace(string(out)))
+	}
+	for _, key := range []string{"accept_ra", "autoconf"} {
+		// No such file: a kernel without IPv6, nothing to switch off.
+		if e := os.WriteFile(filepath.Join("/proc/sys/net/ipv6/conf", name, key), []byte("0\n"), 0o644); e != nil && !errors.Is(e, os.ErrNotExist) {
+			return e
+		}
+	}
+	return nil
+}
+
+// removeTAP removes a TAP device prepareTAP made; a TUN device goes with its
+// OpenVPN by itself. Called only when no OpenVPN of the profile runs.
+var removeTAP = func(name string) error {
+	flags, e := os.ReadFile(filepath.Join("/sys/class/net", name, "tun_flags"))
+	if e != nil {
+		return nil
+	}
+	value, e := strconv.ParseUint(strings.TrimSpace(string(flags)), 0, 32)
+	if e != nil || value&0x0002 == 0 { // IFF_TAP
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if out, e := exec.CommandContext(ctx, "ip", "tuntap", "del", "dev", name, "mode", "tap").CombinedOutput(); e != nil {
+		return fmt.Errorf("cannot remove the TAP device: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (s *Service) clearDNS(id string) error {
+	// OpenVPN's down script removes the record; one killed leaves it.
 	name := deviceName(id)
-	if _, e := os.Stat(filepath.Join("/run/resolvconf/interfaces", name)); errors.Is(e, os.ErrNotExist) {
+	if !resolvconf.Has(name) {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -478,6 +551,27 @@ func (s *Service) dcoInterface(iface *net.Interface) bool {
 	return dco
 }
 
+// removeStaleDCO removes the DCO device of an OpenVPN that was killed
+// (SIGKILL, out of memory). Unlike a TUN device, an ovpn device does not go
+// with the process: it stays with that OpenVPN's addresses and routes, and a
+// pushed default route there would catch the way to the server at the next
+// start. Called only when no OpenVPN of the profile runs.
+var removeStaleDCO = func(name string) error {
+	if _, e := os.Stat(filepath.Join("/sys/class/net", name)); e != nil {
+		return nil
+	}
+	detail, e := linkDetail(name)
+	if e != nil || !dcoLinkJSON(detail) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if out, e := exec.CommandContext(ctx, "ip", "link", "del", "dev", name).CombinedOutput(); e != nil {
+		return fmt.Errorf("cannot remove the stale DCO device: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func dcoLinkJSON(data []byte) bool {
 	var links []struct {
 		LinkInfo struct {
@@ -513,50 +607,6 @@ func (s *Service) GetStatus(c *gin.Context) {
 		states = append(states, st)
 	}
 	rsp.OkRspWithData(c, gin.H{"available": toolErr == nil, "profiles": states})
-}
-
-func (s *Service) Install(c *gin.Context) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var rsp proto.Response
-	if _, err := exec.LookPath("openvpn"); err == nil {
-		rsp.OkRsp(c)
-		return
-	}
-	if err := apkpkg.Run("install", "openvpn"); err != nil {
-		rsp.ErrRsp(c, -1, "OpenVPN installation failed: "+err.Error())
-		return
-	}
-	rsp.OkRsp(c)
-}
-
-func (s *Service) Uninstall(c *gin.Context) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var rsp proto.Response
-
-	profiles, err := s.profiles()
-	if err != nil {
-		rsp.ErrRsp(c, -1, "cannot read OpenVPN profiles")
-		return
-	}
-	for _, profile := range profiles {
-		if err = s.stop(profile.ID); err != nil {
-			rsp.ErrRsp(c, -1, "OpenVPN could not be stopped: "+err.Error())
-			return
-		}
-	}
-	if err = os.Remove(filepath.Join(s.dir, "active")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		rsp.ErrRsp(c, -1, "cannot disable OpenVPN autostart")
-		return
-	}
-	if _, err = exec.LookPath("openvpn"); err == nil {
-		if err = apkpkg.Run("remove", "openvpn"); err != nil {
-			rsp.ErrRsp(c, -1, "OpenVPN removal failed: "+err.Error())
-			return
-		}
-	}
-	rsp.OkRsp(c)
 }
 
 func (s *Service) Import(c *gin.Context) {

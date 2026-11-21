@@ -34,8 +34,16 @@ var MessageSpecs = []MessageSpec{
 	{Key: "power.off", Kind: KindPower},
 	{Key: "hdmi.lost", Kind: KindHDMI},
 	{Key: "hdmi.restored", Kind: KindHDMI},
+	{Key: "hdmi.power-cycle", Kind: KindHDMI},
 	{Key: "security.lockout", Kind: KindSecurity, Vars: []string{"failures", "address", "minutes"}},
+	{Key: "security.attempt-limit", Kind: KindSecurity, Vars: []string{"attempts", "address", "minutes"}},
 	{Key: "security.new-address", Kind: KindSecurity, Vars: []string{"user", "address"}},
+	{Key: "watchdog.agent-silent", Kind: KindPower, Vars: []string{"minutes"}},
+	{Key: "watchdog.host-silent", Kind: KindPower, Vars: []string{"minutes"}},
+	{Key: "watchdog.reset", Kind: KindPower, Vars: []string{"minutes"}},
+	{Key: "watchdog.cycle", Kind: KindPower, Vars: []string{"minutes"}},
+	{Key: "watchdog.failed", Kind: KindPower, Vars: []string{"minutes", "error"}},
+	{Key: "watchdog.unknown", Kind: KindPower, Vars: []string{"minutes", "error"}},
 	{Key: "screen.bsod", Kind: KindScreen},
 	{Key: "screen.panic", Kind: KindScreen},
 	{Key: "test", Kind: KindTest},
@@ -123,6 +131,17 @@ func contains(list []string, item string) bool {
 // render puts an event into words: the template's text where it has one,
 // the standard message of the language elsewhere.
 func render(e Event, language string, template *Template) Rendered {
+	return renderFor(e, language, template, nil)
+}
+
+// renderFor is render for a channel whose text is markup: escape, when not
+// nil, makes the variables and details plain text in it. They hold text from
+// outside, such as what the host shows on its screen or a login form's user
+// name, which must not mention everyone or hide a link.
+func renderFor(e Event, language string, template *Template, escape func(string) string) Rendered {
+	if escape == nil {
+		escape = func(s string) string { return s }
+	}
 	m := standardMessage(language, e.Message)
 	if template != nil {
 		if own, ok := template.Messages[e.Message]; ok {
@@ -134,20 +153,24 @@ func render(e Event, language string, template *Template) Rendered {
 			}
 		}
 	}
+	device := deviceName()
 	vars := map[string]string{
-		"device":  deviceName(),
+		"device":  device,
 		"time":    e.Time.Format(time.DateTime + " MST"),
 		"details": e.Details,
 	}
 	for name, value := range e.Vars {
 		vars[name] = value
 	}
+	for name, value := range vars {
+		vars[name] = escape(value)
+	}
 	body := fill(m.Body, vars)
 	if e.Details != "" && !strings.Contains(m.Body, "{details}") {
 		if body != "" {
 			body += "\n\n"
 		}
-		body += e.Details
+		body += vars["details"]
 	}
 	// A title stays one line whatever a variable holds (a user name comes
 	// from a login form).
@@ -157,7 +180,7 @@ func render(e Event, language string, template *Template) Rendered {
 		Severity: e.Severity,
 		Title:    title,
 		Body:     body,
-		Device:   vars["device"],
+		Device:   device,
 		Time:     e.Time,
 		Image:    e.Image,
 	}

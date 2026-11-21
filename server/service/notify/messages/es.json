@@ -3,9 +3,14 @@
   "power.off": { "title": "Host apagado", "body": "El LED de encendido del host se ha apagado." },
   "hdmi.lost": { "title": "Señal HDMI perdida", "body": "El host ha dejado de enviar imagen." },
   "hdmi.restored": { "title": "Señal HDMI restablecida", "body": "El host vuelve a enviar imagen." },
+  "hdmi.power-cycle": { "title": "Se recomienda desconectar la alimentación", "body": "El receptor HDMI recibió un EDID actualizado, por ejemplo para corregir los colores. Desconecta el NanoKVM de toda fuente de alimentación y vuelve a conectarlo para aplicarlo." },
   "security.lockout": {
     "title": "Inicios de sesión bloqueados",
     "body": "{failures} inicios de sesión fallidos desde {address}: los accesos desde esta dirección están bloqueados durante {minutes} min."
+  },
+  "security.attempt-limit": {
+    "title": "Intentos de inicio de sesión limitados",
+    "body": "{attempts} intentos de inicio de sesión desde {address} en un minuto: los siguientes desde esta dirección se rechazan durante {minutes} min."
   },
   "security.new-address": {
     "title": "Inicio de sesión desde una dirección nueva",
@@ -13,5 +18,15 @@
   },
   "screen.bsod": { "title": "Pantalla azul en el host", "body": "Windows se ha detenido con un error." },
   "screen.panic": { "title": "Kernel panic en el host", "body": "La consola del host muestra un fallo." },
-  "test": { "title": "Notificación de prueba", "body": "Las notificaciones de este NanoKVM llegan a este canal." }
+  "test": { "title": "Notificación de prueba", "body": "Las notificaciones de este NanoKVM llegan a este canal." },
+  "action.button": { "title": "Botón pulsado", "body": "{actor} pulsó el botón {button} durante {seconds} s." },
+  "action.media-inserted": { "title": "Imagen montada", "body": "{actor} insertó {image} en la unidad virtual." },
+  "action.media-ejected": { "title": "Imagen expulsada", "body": "{actor} retiró la imagen de la unidad virtual." },
+  "journal.dropped": { "title": "Eventos no registrados", "body": "Se omitieron {count} eventos: más de los que el registro admite por minuto." },
+  "watchdog.agent-silent": { "title": "El agente de sensores no responde", "body": "El agente de sensores del equipo no ha enviado nada en {minutes} min, pero el equipo responde en la red USB: el agente se detuvo. No se hizo nada." },
+  "watchdog.host-silent": { "title": "El equipo no responde", "body": "El agente de sensores no ha enviado nada en {minutes} min y el equipo no responde en la red USB. No se pulsó nada: el vigilante está configurado solo para avisar." },
+  "watchdog.reset": { "title": "El vigilante reinició el equipo", "body": "El agente de sensores no envió nada en {minutes} min y el equipo no respondió en la red USB: se pulsó el botón de reinicio." },
+  "watchdog.cycle": { "title": "El vigilante apagó y encendió el equipo", "body": "El agente de sensores no envió nada en {minutes} min y el equipo no respondió en la red USB: se apagó y se volvió a encender." },
+  "watchdog.failed": { "title": "Falló la acción del vigilante", "body": "El equipo dejó de responder ({minutes} min de silencio), pero la acción falló: {error}" },
+  "watchdog.unknown": { "title": "El vigilante no pudo preguntar al equipo", "body": "El agente de sensores no ha enviado nada en {minutes} min y el NanoKVM no pudo preguntar al equipo si sigue vivo: {error}. No se pulsó nada." }
 }

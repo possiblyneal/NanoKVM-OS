@@ -5,77 +5,30 @@
  * published descriptor bit 14 is reserved.
  */
 #include "hwcrypto.h"
-static u8 *crypto_output;
-static dma_addr_t crypto_output_dma;
 static u64 crypto_submitted[HWCRYPTO_ALG_COUNT], crypto_completed[HWCRYPTO_ALG_COUNT];
-
-static int crypto_alloc_output(void)
-{
- crypto_output = kzalloc(HWCRYPTO_OUT_MAX, GFP_KERNEL);
- if (!crypto_output) return -ENOMEM;
- crypto_output_dma = dma_map_single(&pdev->dev, crypto_output,
-  HWCRYPTO_OUT_MAX, DMA_BIDIRECTIONAL);
- if (dma_mapping_error(&pdev->dev, crypto_output_dma)) {
-  kfree_sensitive(crypto_output); crypto_output = NULL; return -EIO;
- }
- dma_sync_single_for_cpu(&pdev->dev, crypto_output_dma,
-  HWCRYPTO_OUT_MAX, DMA_BIDIRECTIONAL);
- return 0;
-}
-static void crypto_free_output(void)
-{
- if (!crypto_output) return;
- memzero_explicit(crypto_output, HWCRYPTO_OUT_MAX);
- dma_unmap_single(&pdev->dev, crypto_output_dma,
-  HWCRYPTO_OUT_MAX, DMA_BIDIRECTIONAL);
- kfree_sensitive(crypto_output); crypto_output = NULL;
-}
 
 static bool crypto_is_hash(u32 alg)
 {
  return alg == HWCRYPTO_ALG_SHA1 || alg == HWCRYPTO_ALG_SHA256;
 }
-static bool crypto_b64_char(u8 c)
-{
- return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-  (c >= '0' && c <= '9') || c == '+' || c == '/';
-}
 
 static int crypto_validate(struct hwcrypto_request *r)
 {
- u32 block = 16;
  if (r->version != HWCRYPTO_ABI || r->algorithm < 1 ||
      r->algorithm >= HWCRYPTO_ALG_COUNT || r->encrypt > 1 ||
      memchr_inv(r->reserved, 0, sizeof(r->reserved))) return -EINVAL;
- if (!r->length || r->length > HWCRYPTO_MAX || !r->input) return -EINVAL;
- if (r->output_length > HWCRYPTO_OUT_MAX) return -EINVAL;
+ if (!r->length || r->length > SG2_LARGE || !r->input) return -EINVAL;
+ if (r->output_length > SG2_LARGE) return -EINVAL;
  if (crypto_is_hash(r->algorithm)) {
   if (r->length % 64 || r->key_length || r->mode || r->encrypt ||
       r->output_length) return -EINVAL;
   return 0;
  }
  if (!r->output) return -EINVAL;
- if (r->algorithm == HWCRYPTO_ALG_BASE64) {
-  u32 needed = r->encrypt ? DIV_ROUND_UP(r->length, 3) * 4 : r->length / 4 * 3;
-  if (r->key_length || r->mode || (!r->encrypt && r->length % 4)) return -EINVAL;
-  if (r->output_length < needed) return -EMSGSIZE;
-  return 0;
- }
- if (r->mode > HWCRYPTO_MODE_CTR || r->output_length < r->length) return -EINVAL;
- switch (r->algorithm) {
- case HWCRYPTO_ALG_AES:
-  if (r->key_length != 16 && r->key_length != 24 && r->key_length != 32) return -EINVAL;
-  break;
- case HWCRYPTO_ALG_DES:
-  block = 8; if (r->key_length != 8) return -EINVAL; break;
- case HWCRYPTO_ALG_TDES:
-  block = 8; if (r->key_length != 16 && r->key_length != 24) return -EINVAL; break;
- case HWCRYPTO_ALG_SM4:
-  if (r->key_length != 16) return -EINVAL;
-  break;
- default: return -EINVAL;
- }
- if (r->mode != HWCRYPTO_MODE_CTR && r->length % block) return -EINVAL;
+ if (r->algorithm != HWCRYPTO_ALG_AES || r->mode > HWCRYPTO_MODE_CTR ||
+     r->output_length < r->length) return -EINVAL;
+ if (r->key_length != 16 && r->key_length != 24 && r->key_length != 32) return -EINVAL;
+ if (r->mode != HWCRYPTO_MODE_CTR && r->length % 16) return -EINVAL;
  return 0;
 }
 
@@ -83,71 +36,48 @@ static int crypto_prepare_descriptor(struct hwcrypto_request *r,
  u32 *input_size, u32 *output_size, u32 *result_size)
 {
  bool hash = crypto_is_hash(r->algorithm);
- u32 block = (r->algorithm == HWCRYPTO_ALG_DES || r->algorithm == HWCRYPTO_ALG_TDES) ? 8 : 16;
- u32 i, pad = 0;
- *input_size = (hash || r->algorithm == HWCRYPTO_ALG_BASE64) ? r->length : ALIGN(r->length, block);
+ *input_size = hash ? r->length : ALIGN(r->length, 16);
  *output_size = 0;
  *result_size = hash ? 0 : r->length;
- memset(buffer + r->length, 0, *input_size - r->length);
- memset(desc, 0, DESC_BYTES);
- desc[0] = 0xf;
- desc[4] = lower_32_bits(buffer_dma); desc[5] = upper_32_bits(buffer_dma);
- desc[8] = *input_size;
+ memset(cur->in + r->length, 0, *input_size - r->length);
+ memset(cur->d, 0, DESC_BYTES);
+ cur->d[0] = 0xf;
+ cur->d[4] = lower_32_bits(cur->in_dma); cur->d[5] = upper_32_bits(cur->in_dma);
+ cur->d[8] = *input_size;
  if (hash) {
-  desc[0] |= BIT(19) | BIT(12);
-  desc[1] = r->algorithm == HWCRYPTO_ALG_SHA256 ? 3 : 1;
-  memcpy(&desc[10], r->state, r->algorithm == HWCRYPTO_ALG_SHA256 ? 32 : 20);
+  cur->d[0] |= BIT(19) | BIT(12);
+  cur->d[1] = r->algorithm == HWCRYPTO_ALG_SHA256 ? 3 : 1;
+  memcpy(&cur->d[10], r->state, r->algorithm == HWCRYPTO_ALG_SHA256 ? 32 : 20);
   return 0;
  }
- if (r->algorithm == HWCRYPTO_ALG_BASE64) {
-  if (!r->encrypt) {
-   if (buffer[r->length-1] == '=') pad++;
-   if (r->length >= 2 && buffer[r->length-2] == '=') pad++;
-   for (i = 0; i < r->length-pad; i++) if (!crypto_b64_char(buffer[i])) return -EINVAL;
-  }
-  *output_size = r->encrypt ? DIV_ROUND_UP(r->length, 3) * 4 : r->length / 4 * 3;
-  *result_size = *output_size - pad;
-  desc[0] |= BIT(13); desc[1] = r->encrypt;
-  desc[6] = lower_32_bits(crypto_output_dma); desc[7] = upper_32_bits(crypto_output_dma);
-  desc[10] = *output_size;
-  memset(crypto_output, 0, *output_size);
-  return 0;
- }
- desc[0] |= BIT(19);
+ cur->d[0] |= BIT(19);
  /* Ciphers write to a separate buffer. In-place requests (source ==
   * destination, as in the vendor driver) hung the SoC within minutes while
   * the H.265 encoder was active; the same requests out of place did not. */
- desc[6] = lower_32_bits(crypto_output_dma); desc[7] = upper_32_bits(crypto_output_dma);
+ cur->d[6] = lower_32_bits(cur->out_dma); cur->d[7] = upper_32_bits(cur->out_dma);
  *output_size = *input_size;
- memcpy(&desc[10], r->key, r->key_length);
- switch (r->algorithm) {
- case HWCRYPTO_ALG_AES:
-  desc[0] |= BIT(9);
-  desc[1] = r->key_length == 16 ? BIT(5) : r->key_length == 24 ? BIT(4) : BIT(3);
-  break;
- case HWCRYPTO_ALG_SM4: desc[0] |= BIT(11); desc[1] = BIT(5); break;
- case HWCRYPTO_ALG_DES: desc[0] |= BIT(10); break;
- case HWCRYPTO_ALG_TDES:
-  desc[0] |= BIT(10); desc[1] = BIT(3);
-  if (r->key_length == 16) memcpy((u8 *)&desc[10] + 16, r->key, 8);
-  break;
- }
+ memcpy(&cur->d[10], r->key, r->key_length);
+ /* AES, the only cipher offered */
+ cur->d[0] |= BIT(9);
+ cur->d[1] = r->key_length == 16 ? BIT(5) : r->key_length == 24 ? BIT(4) : BIT(3);
  if (r->mode != HWCRYPTO_MODE_ECB) {
-  desc[0] |= BIT(23);
-  desc[1] |= r->mode == HWCRYPTO_MODE_CBC ? BIT(1) : BIT(2);
-  memcpy(&desc[18], r->iv, block);
+  cur->d[0] |= BIT(23);
+  cur->d[1] |= r->mode == HWCRYPTO_MODE_CBC ? BIT(1) : BIT(2);
+  memcpy(&cur->d[18], r->iv, 16);
  }
  // CTR uses the encryption primitive in both directions.
- if (r->encrypt || r->mode == HWCRYPTO_MODE_CTR) desc[1] |= BIT(0);
+ if (r->encrypt || r->mode == HWCRYPTO_MODE_CTR) cur->d[1] |= BIT(0);
  return 0;
 }
 
 /* Sizes of a transaction between crypto_start_locked() and crypto_finish_locked(). */
 struct crypto_sizes { u32 input, output, result; };
 
-/* Start one bounded DMA transaction. Caller owns lock and CPU-owned buffer;
- * until crypto_finish_locked() the engine owns buffer, crypto_output and desc,
- * and the caller may only do work that touches none of them.
+/* Start one bounded DMA transaction. The caller owns a set of DMA memory
+ * (sg2_own()) with its input in cur->in. On success this returns with
+ * engine_lock held and bottom halves off: until crypto_finish_locked() the
+ * engine owns cur->in, cur->out and cur->d, and the caller may only do work
+ * that touches none of them and does not sleep.
  * No userspace pointers are dereferenced here; Crypto API and ioctl share this.
  */
 static int crypto_start_locked(struct hwcrypto_request *r, struct crypto_sizes *s)
@@ -156,12 +86,17 @@ static int crypto_start_locked(struct hwcrypto_request *r, struct crypto_sizes *
  if (poisoned) return -EIO;
  err = crypto_prepare_descriptor(r, &s->input, &s->output, &s->result);
  if (err) return err;
- dma_sync_single_for_device(&pdev->dev, buffer_dma, s->input, DMA_BIDIRECTIONAL);
- if (s->output) dma_sync_single_for_device(&pdev->dev, crypto_output_dma, s->output, DMA_BIDIRECTIONAL);
- dma_sync_single_for_device(&pdev->dev, desc_dma, DESC_BYTES, DMA_BIDIRECTIONAL);
+ dma_sync_single_for_device(&pdev->dev, cur->in_dma, s->input, DMA_BIDIRECTIONAL);
+ if (s->output) dma_sync_single_for_device(&pdev->dev, cur->out_dma, s->output, DMA_BIDIRECTIONAL);
+ dma_sync_single_for_device(&pdev->dev, cur->d_dma, DESC_BYTES, DMA_BIDIRECTIONAL);
  dma_wmb();
+ sg2_engine_lock();
+ if (poisoned) {	/* latched by an atomic request since the test above */
+  sg2_engine_unlock();
+  return -EIO;
+ }
  writel(7, regs + MASK); writel(7, regs + STATUS);
- writel(lower_32_bits(desc_dma), regs + DESC_LO); writel(upper_32_bits(desc_dma), regs + DESC_HI);
+ writel(lower_32_bits(cur->d_dma), regs + DESC_LO); writel(upper_32_bits(cur->d_dma), regs + DESC_HI);
  crypto_submitted[r->algorithm]++;
  writel(DMA_CTRL_VALUE, regs + CTRL);
  return 0;
@@ -178,16 +113,17 @@ static int crypto_finish_locked(struct hwcrypto_request *r, const struct crypto_
  // SG2002 TRM 22.3: bit0 is encryption completion, bit1 hash completion.
  // A hash has no ciphertext write and completes with 2, not AES's 1.
  if (err || status != (crypto_is_hash(r->algorithm) ? 2 : 1)) {
-  poisoned = true; __module_get(THIS_MODULE);
+  sg2_poison();
+  sg2_engine_unlock();
   pr_err("hwcrypto_crypto: algorithm=%u DMA uncertain status=%#x timeout=%d; pinned until reboot\n", r->algorithm, status, err);
   err = err ? err : -EIO;
   // Engine ownership is uncertain: retain every mapping and its memory.
   return err;
  }
  dma_rmb();
- dma_sync_single_for_cpu(&pdev->dev, desc_dma, DESC_BYTES, DMA_BIDIRECTIONAL);
- dma_sync_single_for_cpu(&pdev->dev, buffer_dma, input_size, DMA_BIDIRECTIONAL);
- if (output_size) dma_sync_single_for_cpu(&pdev->dev, crypto_output_dma, output_size, DMA_BIDIRECTIONAL);
+ dma_sync_single_for_cpu(&pdev->dev, cur->d_dma, DESC_BYTES, DMA_BIDIRECTIONAL);
+ dma_sync_single_for_cpu(&pdev->dev, cur->in_dma, input_size, DMA_BIDIRECTIONAL);
+ if (output_size) dma_sync_single_for_cpu(&pdev->dev, cur->out_dma, output_size, DMA_BIDIRECTIONAL);
  crypto_completed[r->algorithm]++;
  if (crypto_is_hash(r->algorithm)) {
   for (i = 0; i < (r->algorithm == HWCRYPTO_ALG_SHA256 ? 8 : 5); i++)
@@ -195,6 +131,7 @@ static int crypto_finish_locked(struct hwcrypto_request *r, const struct crypto_
  }
  r->output_length = result_size;
  writel(7, regs + STATUS); writel(initial_mask, regs + MASK);
+ sg2_engine_unlock();
  return 0;
 }
 
@@ -205,25 +142,37 @@ static int crypto_run_locked(struct hwcrypto_request *r)
  int err = crypto_start_locked(r, &s);
  return err ? err : crypto_finish_locked(r, &s);
 }
+/*
+ * After a request: clear the descriptor (key and IV) and the first SG2_SCRUB
+ * bytes of both buffers. That head is where key material passes through them:
+ * the block that derives the GHASH key or the CMAC subkeys, E(J0) and S0 of
+ * GCM and CCM, the key pad block of an HMAC. The rest of a request is the
+ * caller's text and stays in the buffers, which only this driver reads, until
+ * the next request of that set overwrites it or the module is unloaded
+ * (sg2_dma_free()). Clearing all of it took 0.84 ms of the 7.77 ms of a
+ * megabyte of ctr(aes) and 0.30 of the 4.58 ms of one of sha256. Nothing
+ * relies on a zeroed buffer: every request clears its own padding and lead.
+ */
+#define SG2_SCRUB 256u
 static void crypto_clean_locked(const struct hwcrypto_request *r)
 {
- /* Never touch a mapping whose DMA ownership is uncertain. */
- if (poisoned) return;
- memzero_explicit(buffer, ALIGN(r->length, 16));
- if (r->algorithm == HWCRYPTO_ALG_BASE64)
-  memzero_explicit(crypto_output, r->encrypt ? DIV_ROUND_UP(r->length, 3)*4 : r->length/4*3);
- else if (!crypto_is_hash(r->algorithm))
-  memzero_explicit(crypto_output, ALIGN(r->length, 16));
- memzero_explicit(desc, DESC_BYTES);
+ u32 n = min(ALIGN(r->length, 16), SG2_SCRUB);
+ /* Never touch the set whose DMA ownership is uncertain. */
+ if (cur == lost) return;
+ memzero_explicit(cur->in, n);
+ if (!crypto_is_hash(r->algorithm))
+  memzero_explicit(cur->out, n);
+ memzero_explicit(cur->d, DESC_BYTES);
 }
+static int sg2_run_direct(struct hwcrypto_request *r);	/* crypto_direct.inc */
 static long crypto_ioctl(unsigned int cmd, unsigned long arg)
 {
  struct hwcrypto_request r = {};
  int err;
  if (cmd == HWCRYPTO_INFO) {
   struct hwcrypto_info info = { .version = HWCRYPTO_ABI,
-   .algorithms = GENMASK(HWCRYPTO_ALG_COUNT-1, 1),
-   .max_input = HWCRYPTO_MAX, .max_output = HWCRYPTO_OUT_MAX };
+   .algorithms = BIT(HWCRYPTO_ALG_AES) | BIT(HWCRYPTO_ALG_SHA1) | BIT(HWCRYPTO_ALG_SHA256),
+   .max_input = SG2_LARGE, .max_output = SG2_LARGE };
   err = mutex_lock_interruptible(&lock); if (err) return err;
   info.poisoned = poisoned;
   memcpy(info.submitted, crypto_submitted, sizeof(crypto_submitted));
@@ -234,13 +183,19 @@ static long crypto_ioctl(unsigned int cmd, unsigned long arg)
  if (cmd != HWCRYPTO_RUN) return -ENOTTY;
  if (copy_from_user(&r, (void __user *)arg, sizeof(r))) { err = -EFAULT; goto clear; }
  err = crypto_validate(&r); if (err) goto clear;
+ /* On the pages of the user's buffers when the request qualifies. */
+ err = sg2_run_direct(&r);
+ if (err != -EAGAIN) {
+  if (!err && copy_to_user((void __user *)arg, &r, sizeof(r))) err = -EFAULT;
+  goto clear;
+ }
  err = mutex_lock_interruptible(&lock); if (err) goto clear;
  if (poisoned) { err = -EIO; goto unlock; }
- if (copy_from_user(buffer, u64_to_user_ptr(r.input), r.length)) { err = -EFAULT; goto clean; }
+ if (copy_from_user(cur->in, u64_to_user_ptr(r.input), r.length)) { err = -EFAULT; goto clean; }
  err = crypto_run_locked(&r);
  if (err) goto clean;
  if (!crypto_is_hash(r.algorithm) && copy_to_user(u64_to_user_ptr(r.output),
-     crypto_output, r.output_length)) err = -EFAULT;
+     cur->out, r.output_length)) err = -EFAULT;
  if (!err && copy_to_user((void __user *)arg, &r, sizeof(r))) err = -EFAULT;
 clean:
  crypto_clean_locked(&r);

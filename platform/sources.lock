@@ -10,13 +10,12 @@
 #   Only the listed paths are fetched; each is checked by its Git tree or
 #   blob id, so the content is verified however it is transported.
 
-buildroot https://buildroot.org/downloads/buildroot-2026.08.1.tar.xz 34fb7bea8a213ffde39cc02e61703391560f26e0850f03138c722d0b09880f2b
-linux      https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.1.tar.xz  fa595aad93734f829c963c2a90ef7c3673224fd7fdae7b49406e397cde2de231
+buildroot https://buildroot.org/downloads/buildroot-2026.08.2.tar.xz bc9497c8e3a734c277e541e2f7fcf9a6275dc92f75bd2f753b05981c54be8705
+linux      https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.5.tar.xz  8f293f83d54f0b7b9be56863ebc5e4ea79d73e530b4ae55c572be97ef39f0990
 u-boot     https://github.com/u-boot/u-boot/archive/refs/tags/v2026.10.tar.gz  f943a88389c8fd70a6b0d061a88267465e143c7ca6ea2b75837ab20f5b60c739
 
 osdrv      https://github.com/sophgo/osdrv.git               1b3a49649d18488ecf54fb4fcb6c27599e433fdc  .=2e17c3f6cec2205e0089e6341326333c12fdf1f2
 aic8800  https://github.com/radxa-pkg/aic8800.git  d13d07963cd15d731e2895e8288a04cca6152ac9  src/SDIO/driver_fw/driver/aic8800=69d01d7f6b245608c6f55f24e921a48517798411 src/SDIO/driver_fw/fw/aic8800=171d691f1538b996baad40fb2e639030aa0a53aa src/SDIO/driver_fw/fw/aic8800D80=bd537de207ce0b0ec4871a03094ba2033f162cc0 src/SDIO/driver_fw/fw/aic8800D80N=26ec1457136a206d7d2e103b617a96e91757a4c5 src/SDIO/driver_fw/fw/aic8800D80X2=c4954c202771cd9ec6b526d4fd4b88eb91b46f2f src/SDIO/driver_fw/fw/aic8800DC=60a63ad1a85c839904676689e1c3151c2e8b4cee debian/copyright=8dfc445409656856b3e265741692e42f19da8220
-cryptodev  https://github.com/cryptodev-linux/cryptodev-linux.git  08644db02d43478f802755903212f5ee506af73b  .=6babcb49f610d502f554cbc990d89b22223c3208
 sipeed-sdk  https://github.com/sipeed/LicheeRV-Nano-Build.git  d4003f15b35d43ad4842f427050ab2bba0114fa5  osdrv/extdrv/wireless/rtl8733bs=f4282244c91fd7852a7b24c6bda24075e8cbfe47 fsbl=a7ff72edc7332a1abab12b298aef97fa093a24a3 opensbi=21bbe9fa4ada20c2e8fa8c9ca09396584e0ea656 ramdisk/rootfs/common_musl_riscv64/usr/share/fw_vcodec=60cc76a9d6afbe4d38a623ff81ae55bd1cd08362
 
 # Official stable release v1.9, verified 2026-10-05; no moving branch.
@@ -37,22 +36,20 @@ tinyalsa  https://github.com/tinyalsa/tinyalsa.git  961babfe962e71d952ae734074cc
 # compat builds): no release has the zlib 1.3.2 API yet, which nanokvm-zlib must
 # export in place of Alpine's zlib. Move to the next release once it has it.
 zlib-ng    https://github.com/zlib-ng/zlib-ng.git            1ab945a841245634cc770b9c3d0e0150734ad013  .=8528d417a2c71d921a39c3ea63c1ed36de64e0a9
-# An xz release commit (Git, not a release tarball); liblzma in the server.
-xz         https://github.com/tukaani-project/xz.git         d3e650e63c110e830fd5391e7f8b45df0b91d3da  .=e19bc9622e52690e60dbc516d473fe0b90b4e63a
 opus       https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz          6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
-exfatprogs https://github.com/exfatprogs/exfatprogs/releases/download/1.4.3/exfatprogs-1.4.3.tar.xz  57226a8ec1bfbce06d68a42cde8cd980414a9457882e691fbce4a4f86c8d5f08
+exfatprogs https://github.com/exfatprogs/exfatprogs/releases/download/1.4.5/exfatprogs-1.4.5.tar.xz 68464a07d90e9fda5475df68800b88eac2bc76076d157fd13cd8d936e0c369b0
 i2c-tools  https://www.kernel.org/pub/software/utils/i2c-tools/i2c-tools-4.4.tar.gz  04d1e3b0cd88df8fb96e7709f374dd0b3561191b4c0363eaf873a074b8b7cb22
-lolcat     https://github.com/jaseg/lolcat/archive/refs/tags/v1.4.tar.gz  6ea43ee2b2bb2f15fc91812b72ebcdaa883052853ed8f055b6f8b38637bda909
+lolcat     https://github.com/jaseg/lolcat/archive/refs/tags/v1.5.tar.gz  2af79bed90e0bda52ae500d16e7e7022037fad10c487c317e7f0ff17ec4b14f5
 busybox    https://busybox.net/downloads/busybox-1.38.0.tar.bz2                34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2
 regdb      https://mirrors.edge.kernel.org/pub/software/network/wireless-regdb/wireless-regdb-2026.09.03.tar.xz  b22e0901227b820cd1c280abe681a15b773a5103a5e10dc442e94ebb34cbf58d
-go         https://go.dev/dl/go1.27.3.linux-amd64.tar.gz                       65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
-node https://nodejs.org/dist/v26.13.0/node-v26.13.0-linux-x64.tar.xz d28a96af6c38596f6d9d97c0ee531c13d238d757742387d1928de822d959e997
+go         https://go.dev/dl/go1.27.4.linux-amd64.tar.gz                       7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+node https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-x64.tar.xz 5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864
 pnpm       https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-12.8.1.tgz  8178a5581db169d9913fd6f918933b141cd6a760aab75a3c1f25e36a3ff1b5d8
 
 # Alpine packages and the root file system. qemu runs the riscv64 package
 # scripts on the build host.
-alpine https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/riscv64/alpine-minirootfs-3.24.3-riscv64.tar.gz 9714553757e7bf645eff5dcc52bdd206f358a7bed77874842567852e8326a51d
+alpine https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/riscv64/alpine-minirootfs-3.24.4-riscv64.tar.gz 010683db6c73b3ad1c334fc8f93f64ae748ef67ae6d69e964929aeaf8517bff3
 qemu       https://launchpad.net/ubuntu/+archive/primary/+files/qemu-user-static_8.2.2+ds-0ubuntu1.19_amd64.deb  ec80ee896fe8f57f7420f4d4076164cb0fa613df6848568cdf5d1a2dbe2347cb
 # The release signer (scripts/sign-release.sh): apk-tools and abuild-sign on the
 # x86_64 CI host. dl-cdn publishes a .sha256 for it, no signature.
-alpine-signer https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.3-x86_64.tar.gz f8e1cafba9b1b283b5d30d06f9885c8d2bc161ffe9083ade8e2e157813a53407
+alpine-signer https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.4-x86_64.tar.gz cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012

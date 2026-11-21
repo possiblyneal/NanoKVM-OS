@@ -13,17 +13,18 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode
 } from 'react';
-import { Popover, Tooltip, type PopoverProps } from 'antd';
+import { Popover, type PopoverProps } from 'antd';
 import clsx from 'clsx';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { ChevronLeftIcon, XIcon } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { useMediaQuery } from 'react-responsive';
 
 import { releasePointerMenuFocus } from '@/lib/menu-focus.ts';
 import { menuCloseSignalAtom, submenuOpenCountAtom } from '@/jotai/settings.ts';
+import { useMediaQuery } from '@/hooks/useMediaQuery.ts';
 
+import { MenuTooltip } from './menu-tooltip.tsx';
 import {
   MobileMenuItemContext,
   MobileMenuNavigationContext,
@@ -116,7 +117,7 @@ const MobileMenuPanel = ({
           <div className="flex h-8 min-w-0 items-center border-b border-neutral-700/80 px-1">
             <button
               type="button"
-              className="nanokvm-button-base flex size-[30px] shrink-0 items-center justify-center rounded text-neutral-300 hover:bg-neutral-700/80 hover:text-white"
+              className="nanokvm-button-base hover:text-fg-strong flex size-[30px] shrink-0 items-center justify-center rounded text-neutral-300 hover:bg-neutral-700/80"
               onClick={pop}
               aria-label={t('settings.back')}
             >
@@ -127,7 +128,7 @@ const MobileMenuPanel = ({
             </span>
             <button
               type="button"
-              className="nanokvm-button-base flex size-[30px] shrink-0 items-center justify-center rounded text-neutral-300 hover:bg-neutral-700/80 hover:text-white"
+              className="nanokvm-button-base hover:text-fg-strong flex size-[30px] shrink-0 items-center justify-center rounded text-neutral-300 hover:bg-neutral-700/80"
               onClick={close}
               aria-label={t('settings.close')}
             >
@@ -239,10 +240,15 @@ type MenuItemProps = {
   className?: string;
   disabled?: boolean;
   fresh?: boolean;
-  mobilePlacement?: 'left' | 'right';
+  mobilePlacement?: 'left' | 'right' | 'bottom';
   mobilePopoverClassName?: string;
   onOpenChange?: (open: boolean) => void;
   onIntent?: () => void;
+  // Outside a toolbar: the title is shown beside the icon, and className
+  // gives the trigger its size and shape.
+  label?: boolean;
+  // where the popover opens, when not below the trigger
+  placement?: PopoverProps['placement'];
 };
 export const MenuItem = ({
   title,
@@ -254,9 +260,11 @@ export const MenuItem = ({
   mobilePlacement,
   mobilePopoverClassName,
   onOpenChange,
-  onIntent
+  onIntent,
+  label = false,
+  placement: fixedPlacement
 }: MenuItemProps) => {
-  const isBigScreen = useMediaQuery({ minWidth: 640 });
+  const isBigScreen = useMediaQuery('(min-width: 640px)');
   const setCount = useSetAtom(submenuOpenCountAtom);
   const context = useContext(MobileMenuItemContext);
   const placement = mobilePlacement ?? context.mobilePlacement;
@@ -312,22 +320,31 @@ export const MenuItem = ({
     setCount((count) => (next ? count + 1 : Math.max(0, count - 1)));
     onOpenChangeRef.current?.(next);
   };
-  const popoverPlacement = placement
-    ? placement === 'right'
-      ? 'leftTop'
-      : 'rightTop'
-    : isBigScreen
-      ? 'bottomLeft'
-      : 'bottom';
-  const tooltipPlacement = placement ? (placement === 'right' ? 'left' : 'right') : 'bottom';
+  const popoverPlacement = fixedPlacement
+    ? fixedPlacement
+    : placement
+      ? placement === 'bottom'
+        ? 'top'
+        : placement === 'right'
+          ? 'leftTop'
+          : 'rightTop'
+      : isBigScreen
+        ? 'bottomLeft'
+        : 'bottom';
+  const tooltipPlacement = placement
+    ? placement === 'bottom'
+      ? 'top'
+      : placement === 'right'
+        ? 'left'
+        : 'right'
+    : 'bottom';
   const triggerNode = (
-    <Tooltip
+    <MenuTooltip
       title={title}
-      trigger={['hover', 'focus']}
-      mouseEnterDelay={0.6}
       placement={tooltipPlacement}
-      classNames={{ root: overlay }}
-      open={disabled ? undefined : !isOpen && isTooltipOpen}
+      overlayClassName={overlay}
+      blocked={isOpen || label}
+      open={disabled ? undefined : !label && !isOpen && isTooltipOpen}
       onOpenChange={disabled ? undefined : (next) => setIsTooltipOpen(next && !isOpenRef.current)}
     >
       <div
@@ -344,17 +361,23 @@ export const MenuItem = ({
           }
         }}
         aria-disabled={disabled}
+        data-open={isOpen || undefined}
         className={clsx(
-          'flex h-[30px] w-[30px] items-center justify-center rounded text-neutral-300',
+          label
+            ? 'flex items-center gap-3 text-sm'
+            : 'flex h-[30px] w-[30px] items-center justify-center rounded text-neutral-300',
           disabled
             ? 'cursor-not-allowed text-neutral-600 opacity-45'
-            : 'cursor-pointer hover:bg-neutral-700/80 hover:text-white',
+            : label
+              ? 'cursor-pointer hover:bg-neutral-700/50'
+              : 'hover:text-fg-strong cursor-pointer hover:bg-neutral-700/80',
           className
         )}
       >
         {icon}
+        {label && <span className="truncate">{title}</span>}
       </div>
-    </Tooltip>
+    </MenuTooltip>
   );
   return disabled ? (
     triggerNode
@@ -367,8 +390,20 @@ export const MenuItem = ({
       trigger="click"
       zIndex={placement ? 1100 : desktopMenuPopoverZIndex}
       placement={popoverPlacement}
-      align={placement ? { overflow: { shiftX: true, shiftY: true } } : undefined}
-      classNames={{ root: overlay }}
+      align={
+        placement === 'bottom'
+          ? { offset: [0, -16], overflow: { shiftX: true } }
+          : placement
+            ? { overflow: { adjustY: true, shiftX: true, shiftY: true } }
+            : undefined
+      }
+      classNames={{
+        root: clsx(
+          overlay,
+          !placement && 'nanokvm-menu-popover',
+          placement === 'bottom' && 'nanokvm-sheet-popover'
+        )
+      }}
       open={isOpen}
       onOpenChange={toggle}
       fresh={!!fresh}

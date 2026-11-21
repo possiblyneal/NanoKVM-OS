@@ -10,11 +10,12 @@ import { pollWhileVisible } from '@/lib/visible-poll.ts';
 import { timePreferencesAtom } from '@/hooks/useDeviceTime.ts';
 import { Panel } from '@/components/ui/settings.tsx';
 
-import { CommunityRepository } from './community';
 import { IndexSchedule } from './index-schedule';
 import styles from './mobile-tabs.module.css';
 
-type Package = { name: string; version: string };
+import '../../download-progress.css';
+
+type Package = { name: string; version: string; removalBlocked?: string };
 type PackageUpdate = { name: string; installed: string; available: string };
 type Operation = {
   state: string;
@@ -70,6 +71,8 @@ export const Software = () => {
   const [searching, setSearching] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionStarted, setActionStarted] = useState(false);
+  const [pendingAction, setPendingAction] = useState<{ action: string; package: string }>();
+  const [actionError, setActionError] = useState('');
   const [finishedOperations, setFinishedOperations] = useState(0);
   const [removal, setRemoval] = useState<{ name: string; preview: string }>();
   const refreshInFlight = useRef(false);
@@ -78,6 +81,7 @@ export const Software = () => {
   const operationState = useRef('');
 
   const working = busy || state?.operation.state === 'running';
+  const currentAction = pendingAction?.action || state?.operation.action || '';
   const showOperation =
     state?.operation.state === 'running' ||
     (actionStarted &&
@@ -127,17 +131,20 @@ export const Software = () => {
   }, [refresh, refreshStatus]);
 
   const run = async (action: string, name = '') => {
+    if (working) return;
     setActionStarted(true);
+    setActionError('');
+    setPendingAction({ action, package: name });
     setBusy(true);
     try {
       const rsp = await http.post(`/api/os/update/software/${action}`, { name });
-      if (rsp.code !== 0) message.error(rsp.msg);
-      else message.success(t('settings.software.started'));
+      if (rsp.code !== 0) setActionError(rsp.msg);
       await refreshStatus();
     } catch {
-      message.error(t('settings.software.requestFailed'));
+      setActionError(t('settings.software.requestFailed'));
     } finally {
       setBusy(false);
+      setPendingAction(undefined);
     }
   };
 
@@ -319,15 +326,17 @@ export const Software = () => {
                 <span className="min-w-0 truncate">
                   {pkg.name} <span className="text-fg-muted">{pkg.version}</span>
                 </span>
-                <Button
-                  size="small"
-                  danger
-                  icon={<Trash2Icon size={14} />}
-                  disabled={working || protectedPackages.has(pkg.name)}
-                  onClick={() => void previewRemoval(pkg.name)}
-                >
-                  {t('settings.software.remove')}
-                </Button>
+                {!pkg.removalBlocked && !protectedPackages.has(pkg.name) && (
+                  <Button
+                    size="small"
+                    danger
+                    icon={<Trash2Icon size={14} />}
+                    disabled={working}
+                    onClick={() => void previewRemoval(pkg.name)}
+                  >
+                    {t('settings.software.remove')}
+                  </Button>
+                )}
               </div>
             ))}
           </div>
@@ -340,29 +349,6 @@ export const Software = () => {
       children: (
         <div className="space-y-4">
           {updatesError && <Alert type="error" showIcon message={updatesError} />}
-          {showOperation && state?.operation.state === 'running' && (
-            <Alert
-              type="info"
-              showIcon
-              message={
-                state.operation.action && operationActions.has(state.operation.action)
-                  ? t(`settings.software.operation.${state.operation.action}`, {
-                      package: state.operation.package || ''
-                    })
-                  : t('settings.software.started')
-              }
-            />
-          )}
-          {showOperation && state?.operation.state === 'failed' && (
-            <Alert
-              type="error"
-              showIcon
-              message={state.operation.message || t('settings.software.failed')}
-            />
-          )}
-          {showOperation && state?.operation.state === 'succeeded' && (
-            <Alert type="success" showIcon message={t('settings.software.succeeded')} />
-          )}
           <Panel className="space-y-3">
             <div className="flex items-center justify-between gap-3 font-medium">
               <span>{t('settings.software.updateAvailable')}</span>
@@ -394,11 +380,6 @@ export const Software = () => {
               {t('settings.software.upgrade')}
             </Button>
           </Popconfirm>
-          {showOperation && state?.operation.log && (
-            <pre className="border-line m-0 max-h-48 overflow-auto rounded-lg border bg-black/30 p-3 text-xs whitespace-pre-wrap">
-              {state.operation.log}
-            </pre>
-          )}
         </div>
       )
     }
@@ -408,8 +389,36 @@ export const Software = () => {
     <div className="space-y-6">
       <p className="text-fg-muted mt-0 text-sm">{t('settings.software.description')}</p>
       <IndexSchedule />
-      <CommunityRepository disabled={working} onEnabled={() => void run('refresh')} />
       {indexWarning}
+      {actionError && <Alert type="error" showIcon message={actionError} />}
+      {working ? (
+        <div className="space-y-2" aria-busy="true">
+          <div role="status" className="text-fg text-sm">
+            {operationActions.has(currentAction)
+              ? t(`settings.software.operation.${currentAction}`, {
+                  package: pendingAction?.package || state?.operation.package || ''
+                })
+              : t('settings.software.started')}
+          </div>
+          <div
+            role="progressbar"
+            aria-label={t('settings.software.started')}
+            className="bg-surface-raised h-2 w-full overflow-hidden rounded-full"
+          >
+            <div className="download-progress-fill download-indeterminate" />
+          </div>
+        </div>
+      ) : showOperation && !actionError ? (
+        state?.operation.state === 'failed' ? (
+          <Alert
+            type="error"
+            showIcon
+            message={state.operation.message || t('settings.software.failed')}
+          />
+        ) : state?.operation.state === 'succeeded' ? (
+          <Alert type="success" showIcon message={t('settings.software.succeeded')} />
+        ) : null
+      ) : null}
       <Tabs
         className={styles.tabs}
         activeKey={activeTab}
@@ -426,6 +435,11 @@ export const Software = () => {
           </Button>
         }
       />
+      {showOperation && state?.operation.log && (
+        <pre className="border-line bg-shade/30 m-0 max-h-48 overflow-auto rounded-lg border p-3 text-xs whitespace-pre-wrap">
+          {state.operation.log}
+        </pre>
+      )}
       <Modal
         open={Boolean(removal)}
         title={t('settings.software.removeTitle', { package: removal?.name })}
@@ -438,7 +452,7 @@ export const Software = () => {
         }}
       >
         <p>{t('settings.software.removeDescription')}</p>
-        <pre className="border-line max-h-64 overflow-auto rounded-lg border bg-black/30 p-3 text-xs whitespace-pre-wrap">
+        <pre className="border-line bg-shade/30 max-h-64 overflow-auto rounded-lg border p-3 text-xs whitespace-pre-wrap">
           {removal?.preview}
         </pre>
       </Modal>

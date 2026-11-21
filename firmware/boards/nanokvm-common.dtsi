@@ -59,15 +59,31 @@
 		/* Video memory: one reusable CMA region of 144 MiB for every
 		 * video resolution. Linux uses its idle pages (movable
 		 * allocations only) and migrates them away when video asks.
-		 * The pre-ready-queue measurements were 39.8 MiB at portrait
+		 * Measured video use was 39.8 MiB at portrait
 		 * 1080p100, 53.9 MiB at 1440p60 with MJPEG, and 102.7 MiB at
 		 * 2160p30. Current QHD adds a 7.03 MiB VI block and can reclaim
-		 * 15.82 MiB of idle VPSS output buffers. Mixed-reader operation
-		 * is qualified on this shared region (docs/VIDEO.md). Spare capacity
-		 * lets an allocation use another range when
-		 * a page is busy (a pool sized to the peak failed on cold
+		 * 15.82 MiB of idle VPSS output buffers. Video, MJPEG and
+		 * frame-detection readers together fit this shared region
+		 * (docs/VIDEO.md). Spare capacity lets an allocation use another
+		 * range when a page is busy (a pool sized to the peak failed on cold
 		 * boots). Outside the region Linux keeps about 90 MiB for
 		 * unmovable kernel memory. */
+		/* Kernel crash log (pstore/ramoops): an oops panics and reboots,
+		 * and the dump and the last console output are kept here across
+		 * that reboot for /var/log/nanokvm-crash. The small core does not use
+		 * this range (platform/opensbi/README.md): it
+		 * lies above where U-Boot puts the DT and the initramfs (fdt_high
+		 * and initrd_high 0x8cffffff) and below its relocated copy at the
+		 * top of RAM. A power loss clears it. */
+		ramoops@8d000000 {
+			compatible = "ramoops";
+			reg = <0x8d000000 0x20000>;
+			record-size = <0x8000>;
+			console-size = <0x8000>;
+			/* Corrects or flags blocks a reset damaged. */
+			ecc-size = <16>;
+			no-map;
+		};
 		ion_region: ion {
 			compatible = "shared-dma-pool";
 			size = <0x09000000>;
@@ -223,16 +239,6 @@
 		reg = <0x8008000 0x1000 0x800a000 0x1000 >;
 	};
 
-	/* True random number generator (platform/modules/cv181x-trng). It sits
-	 * behind the efuse clock gates: while they are off, a register access
-	 * hangs the bus. Polled, so no interrupt. */
-	rng@2070000 {
-		compatible = "nanokvm,cv181x-trng";
-		reg = <0x2070000 0x1000>;
-		clocks = <&clk CLK_EFUSE>, <&clk CLK_APB_EFUSE>;
-		clock-names = "efuse", "apb_efuse";
-	};
-
 	vo@a080000 {
 		compatible = "cvitek,vo";
 		reg = <0xa080000 0x10000 0xa0c8000 0xa0 0xa0d1000 0x100 >;
@@ -247,11 +253,28 @@
 
 &cpu0 {
 	#cooling-cells = <2>;
-	// C906 has the pre-ratification T-Head vector ISA, not standard RVV 1.0.
+	// C906 has the pre-ratification T-Head vector ISA, not standard RVV 1.0,
+	// and the half-precision scalar instructions (Zfh, which includes Zfhmin).
 	riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicntr", "zicsr",
-			       "zifencei", "zihpm", "xtheadvector";
+			       "zifencei", "zihpm", "zfh", "zfhmin", "xtheadvector";
 };
 &{/soc} {
+	/*
+	 * The second C906 (C906L), which nanokvm_c906l starts as a coprocessor
+	 * (the Opus encoder of /dev/nanokvm-opus): SEC_SYS holds its boot
+	 * address, and any access to SEC_SYS hangs the bus while the efuse
+	 * clocks are gated; reset bit 6 of 0x03003024; the mailbox raises
+	 * interrupt 101 for this core.
+	 */
+	c906l: coprocessor@20b0000 {
+		compatible = "nanokvm,sg2002-c906l";
+		reg = <0x020b0000 0x1000>, <0x01900000 0x1000>;
+		reg-names = "sec-sys", "mailbox";
+		interrupts = <101 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk CLK_EFUSE>, <&clk CLK_APB_EFUSE>;
+		clock-names = "efuse", "apb-efuse";
+		resets = <&rst 294>;
+	};
 	soc_temp: temperature-sensor@30e0000 {
 		compatible = "sophgo,sg2002-tempsen";
 		reg = <0x030e0000 0x1000>;
@@ -322,6 +345,8 @@
 	mmc-pwrseq = <&wifi_pwrseq>;
 	status = "okay";
 };
+// The DMA router serves the AXI DMA controller, which this kernel does not build.
+&dmamux { status = "disabled"; };
 &mdio { status = "okay"; };
 &gmac0 { status = "okay"; };
 &i2c0 { status = "okay"; };
@@ -329,7 +354,12 @@
 &i2c2 { status = "okay"; };
 &i2c3 { status = "okay"; };
 &usb {
-	dr_mode = "peripheral";
+	// Device or host, chosen at run time (/sys/class/usb_role, set by
+	// S03usbdev from the USB mode setting). The controller starts as a
+	// device.
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
 	// Working device's FIFO partition, required for composite gadgets.
 	g-rx-fifo-size = <536>;
 	g-np-tx-fifo-size = <32>;

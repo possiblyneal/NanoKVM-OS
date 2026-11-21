@@ -13,16 +13,28 @@ import subprocess
 
 # Add-ons published apart from NanoKVM OS, with NAME-VERSION-rN version tags: RustDesk by the RustDesk add-on
 # workflow, the others by the add-on workflow (addon.yml). Pages indexes
-# them without an OS release. No published release pins one from the
+# them without an OS release; BASE below are part of every NanoKVM OS. No published release pins one from the
 # archived NanoKVM-OS-packages repository.
-ADDONS = ('nanokvm-rustdesk', 'nanokvm-ipmi', 'nanokvm-model-ocr', 'nanokvm-model-ocr-latin',
-          'nanokvm-model-ocr-cyrillic', 'nanokvm-model-ocr-chinese', 'nanokvm-model-screen')
+ADDONS = ('nanokvm-rustdesk', 'nanokvm-model-ocr', 'nanokvm-model-ocr-latin',
+          'nanokvm-model-ocr-cyrillic', 'nanokvm-model-ocr-chinese', 'nanokvm-model-screen',
+          'nanokvm-host-sensors')
+# Packages that an OS package provides and replaces, and that are no longer
+# built. Pages keeps serving their last releases: a device on a release whose
+# OS packages lack them installs them from there, and a rollback to such a
+# release needs them when its world names them.
+RETIRED = ('nanokvm-ipmi',)
 RELEASES = 'https://github.com/dormancygrace/NanoKVM-OS/releases/download/'
-SOURCES = tuple(RELEASES + name + '-' for name in ADDONS)
+SOURCES = tuple(RELEASES + name + '-' for name in ADDONS + RETIRED)
 # A release tag, which is also the APK's name without .apk.
-TAG = re.compile('(' + '|'.join(map(re.escape, ADDONS)) + r')-(\d+\.\d+\.\d+)-r(\d+)')
+TAG = re.compile('(' + '|'.join(map(re.escape, ADDONS + RETIRED)) + r')-(\d+\.\d+\.\d+)-r(\d+)')
 
 
+# The add-ons nanokvm-release depends on: part of every NanoKVM OS, off until
+# switched on, but built and published by their own workflows like the others,
+# so that each keeps its version until its sources change. Devices and the
+# image build install them from the add-on repository; the OS indexes offer
+# them too (assemble-apk-repo.py), for devices without that repository line.
+BASE = ('nanokvm-rustdesk', 'nanokvm-host-sensors', 'nanokvm-model-screen')
 MODEL_ADDONS = tuple(name for name in ADDONS if name.startswith('nanokvm-model-'))
 BUILD_ADDONS = tuple(name for name in ADDONS if name != 'nanokvm-rustdesk')
 
@@ -31,17 +43,15 @@ def selected_builds(paths, changed_pins=()):
     """Add-on CI targets for repository paths and changed sources.lock entries."""
     selected = set()
     common = {'.github/workflows/addon.yml', 'scripts/build-addon.py',
-              'scripts/addon_packages.py', 'scripts/next-addon-revision.py',
-              'tests/test-addon-packages.py', 'tests/test-build-addon.py',
-              'tests/test-next-addon-revision.py', 'LICENSE'}
+              'scripts/addon_packages.py', 'scripts/next-addon-revision.py', 'LICENSE'}
     calibration = {'det': 'ocr', 'latin': 'ocr-latin', 'latin-sure': 'ocr-latin',
                    'cyrillic': 'ocr-cyrillic', 'chinese': 'ocr-chinese',
                    'chinese-sure': 'ocr-chinese', 'screen': 'screen'}
     for path in paths:
         if path in common:
             selected.update(BUILD_ADDONS)
-        elif path.startswith(('addons/ipmi/', 'firmware/cpu/sysmon-runtime/', 'server/pkg/bmc/')) or path in {'server/go.mod', 'server/go.sum'}:
-            selected.add('nanokvm-ipmi')
+        elif path.startswith('addons/host-sensors/'):
+            selected.add('nanokvm-host-sensors')
         elif path.startswith('addons/model-'):
             name = 'nanokvm-' + path.split('/')[1]
             if name in MODEL_ADDONS:
@@ -58,8 +68,6 @@ def selected_builds(paths, changed_pins=()):
             selected.update(MODEL_ADDONS)
     if 'tpu-runtime' in changed_pins:
         selected.update(MODEL_ADDONS)
-    if 'go' in changed_pins:
-        selected.add('nanokvm-ipmi')
     return sorted(selected)
 
 
@@ -75,7 +83,8 @@ def manifest(data):
         if not re.fullmatch(r'[a-z0-9][a-z0-9+_.-]*[.]apk', name):
             raise ValueError(f'Invalid add-on filename: {name}')
         if not (item['url'].startswith(SOURCES) or re.fullmatch(
-                r'https://dormancygrace[.]github[.]io/NanoKVM-OS/package-store/objects/[a-f0-9]{64}/' + re.escape(name), item['url'])):
+                r'https://dormancygrace[.]github[.]io/NanoKVM-OS/(?:package-store/objects/[a-f0-9]{64}|addons/v[0-9.]+/riscv64)/'
+                + re.escape(name), item['url'])):
             raise ValueError(f'Invalid add-on source: {name}')
         if not re.fullmatch(r'[a-f0-9]{64}', item['sha256']):
             raise ValueError(f'Invalid add-on SHA256: {name}')

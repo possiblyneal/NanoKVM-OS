@@ -61,35 +61,64 @@ func vmRouter(r *gin.Engine) {
 	api.GET("/vm/gpio", service.GetGpio)                                       // get gpio
 	admin.POST("/vm/screen", middleware.RequireVideo, service.SetScreen)       // update screen
 	api.GET("/vm/screen", service.GetScreen)                                   // read shared screen settings
-	admin.GET("/vm/screen/text", service.GetScreenText)                        // read the text on the screen (TPU add-on)
+	admin.GET("/vm/screen/text", service.GetScreenText)                        // read the text on the screen (TPU)
 	admin.GET("/vm/screen/text/settings", service.GetScreenTextSettings)       // on or off, installed languages
 	admin.POST("/vm/screen/text/settings", service.SetScreenTextSettings)      // turn text recognition on or off
+	admin.POST("/vm/screen/text/language", service.SetScreenTextLanguage)      // install or remove the models of a language
 	api.GET("/vm/video/capabilities", service.GetVideoCapabilities)            // video choices and limits
 	admin.POST("/vm/video", middleware.RequireVideo, service.SetVideoSettings) // apply video settings together
+	admin.GET("/vm/video/watermark", service.GetWatermark)                     // the watermark of every stream
+	admin.POST("/vm/video/watermark", middleware.RequireVideo, service.SetWatermark)
 
 	api.GET("/vm/input-region", service.GetInputRegion)
 	api.POST("/vm/input-region", service.SetInputRegion)
-	api.GET("/vm/input-resolution", service.GetInputResolution)
 
-	admin.GET("/vm/terminal", service.Terminal) // web terminal
+	admin.GET("/vm/terminal", middleware.RequireRecentAuth(), service.Terminal) // web terminal
+	admin.GET("/vm/terminal/sessions", service.GetTerminalSessions)             // running shells
+	admin.DELETE("/vm/terminal/sessions/:id", service.CloseTerminalSession)     // end a shell
 
-	admin.GET("/vm/script", service.GetScripts)                    // get script
-	admin.POST("/vm/script/upload", service.UploadScript)          // upload script
-	admin.POST("/vm/script/run", service.RunScript)                // run script
-	admin.DELETE("/vm/script", service.DeleteScript)               // delete script
-	admin.POST("/vm/script/autostart", service.SetScriptAutostart) // run a script at startup
+	admin.GET("/vm/script", service.GetScripts)                                                    // get script
+	admin.POST("/vm/script/upload", middleware.RequireRecentAuth(), service.UploadScript)          // upload script
+	admin.POST("/vm/script/run", middleware.RequireRecentAuth(), service.RunScript)                // run script
+	admin.DELETE("/vm/script", service.DeleteScript)                                               // delete script
+	admin.POST("/vm/script/autostart", middleware.RequireRecentAuth(), service.SetScriptAutostart) // run a script at startup
+
+	// Scheduled tasks (Services > Scheduled tasks), in root's crontab.
+	admin.GET("/vm/schedule", service.GetScheduledTasks)
+	admin.POST("/vm/schedule", middleware.RequireRecentAuth(), service.SaveScheduledTask)
+	admin.DELETE("/vm/schedule", service.DeleteScheduledTask)
+	admin.POST("/vm/schedule/preview", service.PreviewSchedule)
+	admin.POST("/vm/schedule/run", middleware.RequireRecentAuth(), service.RunScheduledTask)
+	admin.GET("/vm/schedule/log", service.GetScheduledTaskLog)
+	admin.POST("/vm/script/python", service.InstallPython) // install Python 3 for .py scripts
 
 	admin.GET("/vm/device/virtual", service.GetVirtualDevice)     // get virtual device
 	admin.POST("/vm/device/virtual", service.UpdateVirtualDevice) // update virtual device
 	admin.PUT("/vm/device/virtual", service.SetUSBComposition)    // apply an entire composition
+	admin.PUT("/vm/usb/role", service.SetUSBRole)                 // gadget, host or off
+	admin.GET("/vm/usb/devices", service.GetUSBHostDevices)       // devices attached in the host role
 
 	admin.GET("/vm/serial-console", service.GetSerialConsole)        // headless-Linux console helper
 	admin.POST("/vm/serial-console/test", service.TestSerialConsole) // Enter on ttyGS0, read the prompt
 	// Public: the host fetches the script with curl/wget and has no credentials.
 	r.GET(vm.SerialConsoleScriptPath, service.ServeSerialConsoleScript)
 
+	// The managed computer's sensors, sent by the nanokvm-sensors agent.
+	vm.StartHostSensors()
+	api.GET("/vm/host-sensors", service.GetHostSensors)
+	admin.PUT("/vm/host-sensors", service.SetHostSensors)
+	admin.PUT("/vm/host-sensors/view", service.SetHostSensorsView)
+	admin.PUT("/vm/host-sensors/watchdog", service.SetHostWatchdog)
+	admin.GET("/vm/journal", service.GetJournal) // the event journal
+	// Public: the computer has no credentials. Network mode and the USB
+	// network only (PostHostSensors checks both).
+	r.POST(vm.HostSensorsIngestPath, service.PostHostSensors)
+	r.GET(vm.HostSensorsAgentPath, service.ServeHostSensorsAgent)
+	r.GET(vm.HostSensorsLinuxAgentPath, service.ServeHostSensorsLinuxAgent)
+
 	admin.GET("/vm/usb-internet", service.GetUSBInternet)
 	admin.PUT("/vm/usb-internet", service.SetUSBInternet)
+	admin.PUT("/vm/usb-host-access", service.SetUSBHostAccess)
 
 	admin.GET("/vm/memory/status", service.GetMemoryStatus)
 	admin.POST("/vm/memory/swap", service.SetMemorySwap)
@@ -109,19 +138,17 @@ func vmRouter(r *gin.Engine) {
 	admin.DELETE("/vm/oled/preview", service.DeleteOLEDPreview)
 
 	// Only supported by PCIe version
-	api.GET("/vm/hdmi", service.GetHdmiState)                                  // get HDMI state
-	api.POST("/vm/hdmi/reset", middleware.RequireVideo, service.ResetHdmi)     // reset hdmi
-	admin.POST("/vm/hdmi/enable", middleware.RequireVideo, service.EnableHdmi) // enable hdmi
-	admin.POST("/vm/hdmi/disable", service.DisableHdmi)                        // disable hdmi
+	api.GET("/vm/screen/preview", middleware.RequireVideo, service.ScreenPreview) // a small still picture for the overview page
+	api.GET("/vm/hdmi", service.GetHdmiState)                                     // get HDMI state
+	api.POST("/vm/hdmi/reset", middleware.RequireVideo, service.ResetHdmi)        // reset hdmi
+	admin.POST("/vm/hdmi/enable", middleware.RequireVideo, service.EnableHdmi)    // enable hdmi
+	admin.POST("/vm/hdmi/disable", service.DisableHdmi)                           // disable hdmi
 	admin.POST("/vm/hdmi/timeout", service.SetHdmiIdleTimeout)
 
-	admin.POST("/vm/ssh/keys/import", service.ImportSSHKeys) // append root public keys
-	admin.GET("/vm/ssh", service.GetSSHState)                // get SSH state
-	admin.POST("/vm/ssh/enable", service.EnableSSH)          // enable SSH
-	admin.POST("/vm/ssh/disable", service.DisableSSH)        // disable SSH
-
-	admin.GET("/vm/swap", service.GetSwap)  // get swap file size
-	admin.POST("/vm/swap", service.SetSwap) // set swap file size
+	admin.POST("/vm/ssh/keys/import", service.ImportSSHKeys)                        // append root public keys
+	admin.GET("/vm/ssh", service.GetSSHState)                                       // get SSH state
+	admin.POST("/vm/ssh/enable", middleware.RequireRecentAuth(), service.EnableSSH) // enable SSH
+	admin.POST("/vm/ssh/disable", service.DisableSSH)                               // disable SSH
 
 	admin.GET("/vm/mouse-jiggler", service.GetMouseJiggler)   // get mouse jiggler
 	admin.POST("/vm/mouse-jiggler/", service.SetMouseJiggler) // set mouse jiggler
@@ -140,11 +167,11 @@ func vmRouter(r *gin.Engine) {
 	admin.POST("/vm/bluetooth/enable", service.EnableBluetooth)   // load Bluetooth now and at boot
 	admin.POST("/vm/bluetooth/disable", service.DisableBluetooth) // unload Bluetooth, not at boot
 
-	admin.POST("/vm/tls", service.SetTls)                                  // enable/disable TLS
-	admin.GET("/vm/tls", service.GetTls)                                   // HTTPS and certificate status
-	admin.POST("/vm/tls/certificate", service.UploadTlsCertificate)        // install a custom certificate
-	admin.POST("/vm/tls/certificate/delete", service.DeleteTlsCertificate) // back to the generated certificate
-	admin.POST("/vm/tls/reload", service.ReloadTls)                        // serve the pair on disk
+	admin.POST("/vm/tls", service.SetTls)                                                                  // enable/disable TLS
+	admin.GET("/vm/tls", service.GetTls)                                                                   // HTTPS and certificate status
+	admin.POST("/vm/tls/certificate", middleware.RequireRecentAuth(), service.UploadTlsCertificate)        // install a custom certificate
+	admin.POST("/vm/tls/certificate/delete", middleware.RequireRecentAuth(), service.DeleteTlsCertificate) // back to the generated certificate
+	admin.POST("/vm/tls/reload", service.ReloadTls)                                                        // serve the pair on disk
 
 	admin.POST("/vm/system/reboot", service.Reboot) // reboot system
 }

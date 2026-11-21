@@ -1,4 +1,5 @@
 #!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034,SC3043 # OpenRC reads description; its sh has local
 
 description="NanoKVM boot, data and compatibility mounts"
 
@@ -51,9 +52,40 @@ apply_mount_policy() {
     done
 }
 
+# A kernel oops panics and reboots; ramoops (the board DT) keeps the dump and
+# the last console output across that reboot. Keep the newest five crashes in
+# /var/log/nanokvm-crash and free the region for the next one.
+# Each crash gets the next sequence number: the clock at boot may be wrong
+# or step back, so it only labels the directory. Removing a pstore file
+# erases its record, so the copy is synced to the card first.
+collect_crash() {
+    pstore=/sys/fs/pstore
+    crashes=/var/log/nanokvm-crash
+    [ -d "$pstore" ] || return 0
+    mountpoint -q "$pstore" || mount -t pstore pstore "$pstore" || return 1
+    set -- "$pstore"/*
+    [ -e "$1" ] || return 0
+    mkdir -p "$crashes" || return 1
+    last=$(find "$crashes" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*-*' |
+        sed 's|.*/||; s|-.*||' | awk '$1 + 0 > n { n = $1 + 0 } END { print n + 0 }')
+    crash=$crashes/$(printf '%06d' $((last + 1)))-$(date -u +%Y%m%dT%H%M%SZ)
+    mkdir "$crash" || return 1
+    if ! cp "$@" "$crash"/ || ! sync "$crash"/* "$crash" "$crashes" "${crashes%/*}"; then
+        # An incomplete attempt must not count as another retained crash.
+        # mkdir above succeeded, so this directory belongs to this attempt.
+        rm -rf "$crash"
+        return 1
+    fi
+    rm -f "$@"
+    ewarn "The kernel crashed before this boot; its log is in $crash"
+    find "$crashes" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*-*' | sed 's|.*/||' |
+        sort -rn | tail -n +6 | while read -r old; do rm -rf "${crashes:?}/$old"; done
+}
+
 start() {
     ebegin "Preparing NanoKVM storage"
     mkdir -p /boot /data /mnt /sys/kernel/config
+    collect_crash || ewarn "Could not keep the kernel crash log"
     # First: the board identity lives on /boot, the USB flags an older release
     # left there move from it (nanokvm-usb), and the data
     # steps below may give up.
@@ -78,7 +110,7 @@ start() {
         migration=/data/.nanokvm-stock-install
         if [ ! -L "$migration" ]; then
             for file in boot.img.gz alpine-rootfs.tar.gz recovery.sd mbr.old stock-boot.sd \
-                        root.shadow ssh-state settings.tar transaction.sha256 status formatting; do
+                        root.shadow ssh-state settings.tar transaction.sha256 status formatting board; do
                 rm -f "$migration/$file" || break
             done
             if [ ! -e "$migration" ] || rmdir "$migration"; then
@@ -103,7 +135,7 @@ start() {
     fi
     mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
     # f2fs background GC compacts the root partition whenever the device is
-    # idle, and wrote the SD card by megabytes per minute on an idle stand.
+    # idle, and writes the SD card by megabytes per minute on an idle device.
     # Foreground GC still reclaims space when free sections run low. Root is
     # mounted from the kernel command line, and OpenRC's root service is
     # not enabled, so an /etc/fstab entry would not apply.
@@ -113,22 +145,12 @@ start() {
     # SD card. apk fetches missing indexes again on first use after a boot.
     if ! mountpoint -q /var/cache/apk; then
         mkdir -p /var/cache/apk
-        # Once: the copies that earlier releases kept on the SD card.
-        rm -f /var/cache/apk/APKINDEX.*.tar.gz
         mount -t tmpfs -o nosuid,nodev,noexec,size=16m,mode=0755 apk-cache /var/cache/apk ||
             ewarn "APK indexes stay on the SD card"
     fi
 
-    rm -rf /mnt/data
-    ln -s "$compatibility_data" /mnt/data
-    for source in /usr/share/nanokvm/board-defaults/*; do
-        [ -f "$source" ] || continue
-        [ -e "$compatibility_data/${source##*/}" ] ||
-            cp "$source" "$compatibility_data/${source##*/}" || { eend 1; return 1; }
-    done
-    mkdir -p /mnt/system
-    rm -rf /mnt/system/ko
-    ln -s "/lib/modules/$(uname -r)/extra" /mnt/system/ko
+    # The media library reads /mnt/data/sensor_cfg.ini (S02config seeds it).
+    ln -sfn "$compatibility_data" /mnt/data
     eend $?
 }
 

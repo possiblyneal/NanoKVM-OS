@@ -69,8 +69,6 @@
  * policy is used only with shared CMA >=144 MiB; see docs/VIDEO.md. */
 #define qhd_ion_mib             54U
 
-#define LT6911_ADDR 	0x2B
-
 pthread_mutex_t vi_mutex;
 pthread_mutex_t hdmi_signal_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t vi_detection_thread;
@@ -350,6 +348,8 @@ uint16_t hdmi_res_list[][2] = {
     {2560, 1600},
     {2560, 1080},
     {3440, 1440},
+    {1280, 1440},
+    {2560, 2880},
     {720, 1280},
     {1080, 1920},
     {1088, 1920},
@@ -524,34 +524,18 @@ int get_hdmi_mode(void)
 
 int get_manual_resolution(void)
 {
-    uint8_t RW_Data[35];
-    FILE *fp;
-    int file_size;
+    char RW_Data[35];
     uint16_t tmp_width, tmp_height;
     int res = 0;
 
-    // get res
-    if(access("/run/nanokvm/width", F_OK) == 0){
-        fp = fopen("/run/nanokvm/width", "r");
-        fseek(fp, 0, SEEK_END);
-        file_size = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        fread(RW_Data, sizeof(char), file_size, fp);
-        fclose(fp);
-        RW_Data[file_size] = 0;
-        tmp_width = atoi((char*)RW_Data);
+    // get res; a missing or unreadable file keeps the default
+    if(nanokvm::read_small_file("/run/nanokvm/width", RW_Data, sizeof(RW_Data)) > 0){
+        tmp_width = atoi(RW_Data);
     } else {
         tmp_width = 1920;
     }
-    if(access("/run/nanokvm/height", F_OK) == 0){
-        fp = fopen("/run/nanokvm/height", "r");
-        fseek(fp, 0, SEEK_END);
-        file_size = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        fread(RW_Data, sizeof(char), file_size, fp);
-        fclose(fp);
-        RW_Data[file_size] = 0;
-        tmp_height = atoi((char*)RW_Data);
+    if(nanokvm::read_small_file("/run/nanokvm/height", RW_Data, sizeof(RW_Data)) > 0){
+        tmp_height = atoi(RW_Data);
     } else {
         tmp_height = 1080;
     }
@@ -584,7 +568,9 @@ int get_manual_resolution(void)
         || (tmp_width == 1080 && tmp_height == 1920)
         || (tmp_width == 1088 && tmp_height == 1920)
         || (tmp_width == 1440 && tmp_height == 2560);
-    if(tmp_height > vi_max_height && !portrait){
+    // 8:9, two QHD screens one above the other: taller than vi_max_height too.
+    const bool tall = tmp_width == 2560 && tmp_height == 2880;
+    if(tmp_height > vi_max_height && !portrait && !tall){
         tmp_height = vi_max_height;
         nanokvm::write_small_uint(vi_height_path, vi_max_height);
     }
@@ -788,13 +774,9 @@ static bool poll_hdmi_receiver(bool allow_auto_mode, bool initial = false,
 
 void get_hdmi_version()
 {
-	FILE *fp;
-	uint8_t RW_Data[2];
+	char RW_Data[3];
     system("/kvmapp/system/init.d/S15kvmhwd get_hdmi_version");
-	if(access("/etc/kvm/hdmi_version", F_OK) == 0){
-        fp = fopen("/etc/kvm/hdmi_version", "r");
-        fread(RW_Data, sizeof(char), 2, fp);
-        fclose(fp);
+	if(nanokvm::read_small_file("/etc/kvm/hdmi_version", RW_Data, sizeof(RW_Data)) > 0){
         if(RW_Data[0] == 'u'){
             // 6911uxc; S15kvmhwd publishes "ux"
             kvmv_cfg.hdmi_version = 1;
@@ -808,7 +790,6 @@ void get_hdmi_version()
             kvmv_cfg.hdmi_version = 0;
             debug("[hdmi]HDMI-C exist!\n");
         }
-        RW_Data[0] = 0;
     } else {
         kvmv_cfg.hdmi_version = 0;
     }
@@ -823,13 +804,6 @@ static bool service_hdmi_events(Events &events, uint64_t now,
     if (vi_refreshed && !capture_park.parked()) events.observe_vi(vi_state);
     const auto request = events.next(now, receiver_retry_pending.load(std::memory_order_relaxed));
     if (!request) return false;
-    static const bool trace = [] {
-        const char *value = std::getenv("NANOKVM_HDMI_IRQ_TRACE");
-        return value && !std::strcmp(value, "1");
-    }();
-    if (trace) std::fprintf(stderr, "[hdmi] receiver sample reason=%s edge=%u resync=%u vi=%u fresh=%u\n",
-        nanokvm::hdmi_poll_reason(request.reason), unsigned(request.edge), unsigned(request.resync),
-        unsigned(vi_state), unsigned(vi_refreshed));
     const bool changed = poll_hdmi_receiver(request.edge, false, request.edge || request.resync);
     events.completed(!receiver_retry_pending.load(std::memory_order_relaxed));
     return changed;
@@ -938,9 +912,9 @@ void* vi_subsystem_detection(void *)
                     }
                 } else if (try_res == 2) {
                     kvmv_cfg.hdmi_try_rounds = 0;
-                    // Cannot obtain HDMI input / No signal on HDMI. Keep the
-                    // one-second pause auto_try_res used to take, instead of
-                    // probing again after the 10 ms active poll.
+                    // Cannot obtain HDMI input / No signal on HDMI. Pause one
+                    // second instead of probing again after the 10 ms
+                    // active poll.
                     nanokvm::sleep_ms(1000);
                 }
             } else if (kvmv_cfg.vi_detect_state == 2){
@@ -1048,7 +1022,7 @@ bool jpg_dump(kvmv_data_t* dump_to, nanokvm::JpegBuffer *raw)
 static bool mjpeg_422_disabled = false;
 static unsigned mjpeg_422_frame_failures = 0;
 static unsigned mjpeg_422_video_failures = 0; // video encoder failures in a row
-static int mjpeg_chroma_choice = -1; // Legacy environment default until explicitly selected.
+static int mjpeg_chroma_choice = -1; // 4:2:2 until explicitly selected.
 static uint64_t mjpeg_last_video_ms = 0, mjpeg_last_jpeg_ms = 0;
 static unsigned mjpeg_last_video_width = 0, mjpeg_last_jpeg_width = 0;
 static bool mjpeg_resolution_limited = false;
@@ -1061,17 +1035,10 @@ static uint64_t mjpeg_monotonic_ms()
     clock_gettime(CLOCK_MONOTONIC, &time);
     return static_cast<uint64_t>(time.tv_sec) * 1000 + time.tv_nsec / 1000000;
 }
-// The environment switches, read on first use (-1: not read yet). The
-// server's environment does not change at runtime; callers hold vi_mutex.
-static int mjpeg_422_env = -1, mjpeg_force_copy_env = -1;
+// Callers hold vi_mutex.
 static bool mjpeg_422_requested()
 {
-    if (mjpeg_chroma_choice >= 0) return mjpeg_chroma_choice == 1;
-    if (mjpeg_422_env < 0) {
-        const char *requested = getenv("NANOKVM_MJPEG_422");
-        mjpeg_422_env = !requested || strcmp(requested, "0") != 0;
-    }
-    return mjpeg_422_env;
+    return mjpeg_chroma_choice != 0;
 }
 static bool mjpeg_video_reader_active(uint64_t now_ms)
 {
@@ -1080,14 +1047,6 @@ static bool mjpeg_video_reader_active(uint64_t now_ms)
 static bool mjpeg_jpeg_reader_active(uint64_t now_ms)
 {
     return nanokvm::reader_active(mjpeg_last_jpeg_ms, now_ms);
-}
-static bool mjpeg_force_copy()
-{
-    if (mjpeg_force_copy_env < 0) {
-        const char *copy = getenv("NANOKVM_DIAGNOSTIC_FORCE_COPY");
-        mjpeg_force_copy_env = copy && strcmp(copy, "1") == 0;
-    }
-    return mjpeg_force_copy_env;
 }
 static void disable_mjpeg_422(const char *reason)
 {
@@ -1101,7 +1060,7 @@ static nanokvm::StreamSize mjpeg_parallel_size(nanokvm::StreamSize size, uint8_t
 {
     if (codec != VENC_MJPEG) return size;
     mjpeg_resolution_limited = mjpeg_422_requested() && !mjpeg_422_disabled
-        && !frame_detect && !mjpeg_force_copy() && size.width > 1920
+        && !frame_detect && size.width > 1920
         && mjpeg_last_video_width > 1920 && mjpeg_video_reader_active(now_ms);
     return mjpeg_resolution_limited ? nanokvm::limit_stream_width(size, 1920) : size;
 }
@@ -1119,7 +1078,7 @@ static int mjpeg_capture_format(uint8_t codec, bool frame_detect, uint64_t now_m
     // output too: full-range BT.601 for JPEG decoders, the VPSS converting
     // the capture's 4:2:0 (its chroma resolution stays 4:2:0).
     if (!mjpeg_422_requested() || mjpeg_422_disabled || codec != VENC_MJPEG
-        || frame_detect || mjpeg_force_copy()
+        || frame_detect
         || (width > 1920 && mjpeg_last_video_width > 1920 && mjpeg_video_reader_active(now_ms)))
         return nanokvm::nv21_format();
     return nanokvm::nv16_format();
@@ -1149,7 +1108,6 @@ uint8_t get_mjpeg_chroma_status()
     if (mjpeg_last_jpeg_width > 1920 && mjpeg_last_video_width > 1920
         && mjpeg_video_reader_active(mjpeg_monotonic_ms())) state |= MJPEG_CHROMA_SHARED_VIDEO;
     if (kvmv_cfg.frame_detact != 0) state |= MJPEG_CHROMA_FRAME_DETECT;
-    if (mjpeg_force_copy()) state |= MJPEG_CHROMA_FORCE_COPY;
     pthread_mutex_unlock(&vi_mutex);
     return state;
 }
@@ -1479,6 +1437,27 @@ int kvmv_set_capture_fps(uint8_t fps)
     return 0;
 }
 
+int kvmv_set_first_capture_yuv420(uint8_t want)
+{
+    mmf_vi_yuv420_want_first(want);
+    return 0;
+}
+
+// Under vi_mutex like every other change of the VPSS outputs: a region is
+// never attached between an output's detach and its stop or reconfiguration.
+int kvmv_set_watermark(const uint32_t *argb, const int *geometry, int count, int ref_width, int margin)
+{
+    pthread_mutex_lock(&vi_mutex);
+    const int result = mmf_watermark_set(argb, geometry, count, ref_width, margin);
+    pthread_mutex_unlock(&vi_mutex);
+    return result;
+}
+
+int kvmv_watermark_missing(void)
+{
+    return mmf_watermark_missing();
+}
+
 static void apply_capture_rate(void)
 {
     static uint64_t last_ms = 0;
@@ -1622,13 +1601,13 @@ void kvmv_init(uint8_t _debug_info_en)
     else                    debug_en = 1;
 
     // The HDMI source may already be stable before the detection thread starts.
-    // Read UXC dimensions before MMF allocates VI pools; waiting for a new edge
-    // can leave the provisional FHD sensor geometry active on a QHD input.
-    // The later detection thread still handles hot-plug/resolution changes.
+    // Read the receiver's dimensions before MMF allocates VI pools: starting at
+    // the provisional FHD geometry on another input fails every frame (CSI
+    // bridge size errors, pre-raw retries) until detection restarts the
+    // capture. The later detection thread still handles hot-plug/resolution
+    // changes, and a failed read here leaves the provisional geometry.
     get_hdmi_version();
-    if (kvmv_cfg.hdmi_version == 1) {
-        poll_hdmi_receiver(false, true);
-    }
+    poll_hdmi_receiver(false, true);
 
     cam->hmirror(1);
     cam->vflip(1);
@@ -1689,9 +1668,24 @@ static int kvmv_read_img_locked(uint16_t _width, uint16_t _height, uint8_t _type
 
 // JPEG readers (the MJPEG stream, screenshots, MCP) take turns: one encodes
 // outside vi_mutex (frame_to_jpeg), and another must not take its output's
-// frame slot meanwhile. Lock order: jpeg_reader_mutex -> vi_mutex -> the JPEG
-// hold (kvm_mmf). Video reads take vi_mutex only.
+// frame slot meanwhile. Lock order: jpeg_reader_mutex -> vi_gate -> vi_mutex
+// -> the JPEG hold (kvm_mmf). Video reads pass vi_gate and take vi_mutex.
 static pthread_mutex_t jpeg_reader_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// A video read holds vi_mutex while its frame is in the encoder (15 of every
+// 16.7 ms at 2560x1440 and 60 Hz) and its thread takes the mutex again at
+// once, before a waiter runs. A JPEG read on its own output takes vi_mutex
+// twice for a short time and waited a video frame each time. The gate gives
+// it the next turn: it holds vi_gate while it waits for vi_mutex, and a video
+// read passes vi_gate before it takes vi_mutex. Never taken with vi_mutex held.
+static pthread_mutex_t vi_gate = PTHREAD_MUTEX_INITIALIZER;
+
+static void vi_lock_jpeg(void)
+{
+    pthread_mutex_lock(&vi_gate);
+    pthread_mutex_lock(&vi_mutex);
+    pthread_mutex_unlock(&vi_gate);
+}
 
 static int kvmv_read_img(uint16_t _width, uint16_t _height, uint8_t _type, uint16_t _qlty)
 {
@@ -1713,7 +1707,11 @@ static int kvmv_read_img_locked(uint16_t _width, uint16_t _height, uint8_t _type
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 1;
+    if (pthread_mutex_timedlock(&vi_gate, &ts) != 0) return -5;
+    // A video read only passes the gate; a JPEG read keeps it while it waits.
+    if (_type != VENC_MJPEG) pthread_mutex_unlock(&vi_gate);
     int mutex_res = pthread_mutex_timedlock(&vi_mutex, &ts);
+    if (_type == VENC_MJPEG) pthread_mutex_unlock(&vi_gate);
     if(mutex_res != 0){
         return -5;
     }
@@ -1789,7 +1787,7 @@ static int kvmv_read_img_locked(uint16_t _width, uint16_t _height, uint8_t _type
         }
         const bool jpeg_active = mjpeg_jpeg_reader_active(capture_now);
         const bool remove_nv16 = !mjpeg_422_requested() || mjpeg_422_disabled
-            || kvmv_cfg.frame_detact != 0 || mjpeg_force_copy()
+            || kvmv_cfg.frame_detact != 0
             || (_type == VENC_MJPEG && capture_format == nanokvm::nv21_format())
             || ((_type == VENC_H264 || _type == VENC_H265)
                 && (!jpeg_active || (output.width > 1920 && cam->format_width(nanokvm::nv16_format()) > 1920)));
@@ -1952,7 +1950,7 @@ static int kvmv_read_img_locked(uint16_t _width, uint16_t _height, uint8_t _type
                 native_result = mmf_vi_frame_pop_own(native_vi_ch, &native_len, &native_width,
                         &native_height, &native_format);
                 mmf_jpg_unhold();
-                pthread_mutex_lock(&vi_mutex);
+                vi_lock_jpeg();
                 if (native_result == 0 ? !mmf_vi_frame_leased(native_vi_ch)
                         : !cam->has_format(nanokvm::nv16_format())) {
                     native_vi_ch = -1;
@@ -2067,10 +2065,15 @@ static int kvmv_read_img_locked(uint16_t _width, uint16_t _height, uint8_t _type
                 const bool own_output = native_format == nanokvm::nv16_format();
                 int ret = frame_to_jpeg(native_vi_ch, native_width, native_height, &frame,
                     maxmin_data(99, 20, (int)_qlty), own_output);
-                if (own_output) pthread_mutex_lock(&vi_mutex);
-                if (ret < 0 && own_output && ret == IMG_VENC_ERROR && !tile_request)
+                // On its own output frame_to_jpeg returned with vi_mutex
+                // released; only a failure needs it again.
+                if (own_output && ret == IMG_VENC_ERROR && !tile_request) {
+                    vi_lock_jpeg();
                     disable_mjpeg_422("native JPEG encoding failed");
-                pthread_mutex_unlock(&vi_mutex);
+                    pthread_mutex_unlock(&vi_mutex);
+                } else if (!own_output) {
+                    pthread_mutex_unlock(&vi_mutex);
+                }
                 return ret;
             }
             if (tile_request) mmf_tile_map_reset(); // a copied frame bypasses the map
@@ -2240,12 +2243,8 @@ static void load_hdmi_board()
 {
     if(kvmv_cfg.hw_version == 0){
 
-        FILE *fp;
-	    uint8_t RW_Data[2];
-        if(access("/etc/kvm/hw", F_OK) == 0){
-            fp = fopen("/etc/kvm/hw", "r");
-            fread(RW_Data, sizeof(char), 1, fp);
-            fclose(fp);
+	    char RW_Data[2];
+        if(nanokvm::read_small_file("/etc/kvm/hw", RW_Data, sizeof(RW_Data)) >= 0){
             switch(RW_Data[0]){
                 case 'a':
                 case 'b':
@@ -2393,7 +2392,10 @@ static int set_capture_parked_locked(bool parked)
     }, [](bool enabled) { return cam->set_enabled(enabled); });
 }
 
-int kvmv_read_bgr_planar(uint16_t width, uint16_t height, uint8_t *out, uint32_t size)
+// scaled: a small picture of the whole screen whatever the input's size, for
+// people to look at. Otherwise the picture is the input's own size, for the
+// models, and the input is at most Full HD.
+static int read_bgr_planar(uint16_t width, uint16_t height, uint8_t *out, uint32_t size, bool scaled)
 {
     pthread_mutex_lock(&vi_mutex);
     // The same states the stream reader reports (kvmv_read_img): no cable,
@@ -2419,21 +2421,34 @@ int kvmv_read_bgr_planar(uint16_t width, uint16_t height, uint8_t *out, uint32_t
     // input is at most Full HD, whose video buffers leave the models room.
     // The lease keeps the geometry from changing until the picture is taken.
     const nanokvm::GeometrySnapshot geometry = vi_geometry.snapshot();
-    if (uint32_t(geometry.width) * geometry.height > 1920u * 1080u || geometry.width > 1920
-        || geometry.height > 1920) {
+    if (!scaled && (uint32_t(geometry.width) * geometry.height > 1920u * 1080u || geometry.width > 1920
+        || geometry.height > 1920)) {
         pthread_mutex_unlock(&vi_mutex);
         return -14;
     }
+    // A scaled picture is never larger than the screen.
+    const bool fits = scaled ? width <= geometry.width && height <= geometry.height
+                             : (geometry.width & ~1) == width && (geometry.height & ~1) == height;
     nanokvm::GeometryGate::Lease lease;
-    if ((geometry.width & ~1) != width || (geometry.height & ~1) != height
-        || !(lease = vi_geometry.lease(geometry))) {
+    if (!fits || !(lease = vi_geometry.lease(geometry))) {
         pthread_mutex_unlock(&vi_mutex);
         return -13;
     }
-    const int result = mmf_read_bgr_planar(width, height, out, size, 500);
+    // The models read the screen as it is; a picture for people is marked.
+    const int result = mmf_read_bgr_planar(width, height, out, size, 500, scaled);
     lease.release();
     pthread_mutex_unlock(&vi_mutex);
     return result;
+}
+
+int kvmv_read_bgr_planar(uint16_t width, uint16_t height, uint8_t *out, uint32_t size)
+{
+    return read_bgr_planar(width, height, out, size, false);
+}
+
+int kvmv_read_bgr_scaled(uint16_t width, uint16_t height, uint8_t *out, uint32_t size)
+{
+    return read_bgr_planar(width, height, out, size, true);
 }
 
 int kvmv_set_capture_parked(uint8_t parked)

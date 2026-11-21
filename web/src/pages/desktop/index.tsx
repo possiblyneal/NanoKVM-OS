@@ -1,10 +1,9 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useAuth } from '@/contexts/auth';
-import { Alert, Button, Spin, Splitter } from 'antd';
+import { Alert, Button, notification, Spin, Splitter } from 'antd';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { useMediaQuery } from 'react-responsive';
 
 import { getEncoderState } from '@/api/stream.ts';
 import { getInputRegion, getScreen, getVideoCapabilities, setControlRegionMode } from '@/api/vm.ts';
@@ -27,6 +26,8 @@ import {
 } from '@/jotai/screen.ts';
 import { usbInputAtom } from '@/jotai/usb-input.ts';
 import { useDeviceTime } from '@/hooks/useDeviceTime.ts';
+import { useMediaQuery } from '@/hooks/useMediaQuery.ts';
+import { useResponsiveDevice } from '@/hooks/useResponsiveDevice.ts';
 import { Head } from '@/components/head.tsx';
 
 import { CaptureStatusOverlay, useCaptureStatus } from './capture-status';
@@ -69,6 +70,8 @@ function getVideoMode() {
 
   return ['direct', 'h264', 'mjpeg'].includes(cookieVideoMode) ? cookieVideoMode : defaultVideoMode;
 }
+
+const powerCycleNoticeKey = 'nanokvm-power-cycle-notice';
 
 // Whether the device refuses MJPEG now (it does at 3840x2160). An unreadable
 // answer is not a refusal: the stream decides.
@@ -118,7 +121,25 @@ export const Desktop = () => {
   const { t } = useTranslation();
   // Load the device time format once for every displayed device time.
   useDeviceTime();
-  const isBigScreen = useMediaQuery({ minWidth: 850 });
+  const isBigScreen = useMediaQuery('(min-width: 850px)');
+  // A phone has the menu as a bar along the bottom, or along the right edge
+  // when turned sideways (menu/index.tsx); the screen ends before it.
+  const device = useResponsiveDevice();
+  // The console fills the window and never scrolls as a page: a drag that
+  // ends a scrolling list must not move the page under a phone's address bar.
+  useEffect(() => {
+    const root = document.documentElement;
+    const previous = root.style.overflow;
+    root.style.overflow = 'hidden';
+    return () => {
+      root.style.overflow = previous;
+    };
+  }, []);
+  const phoneBarRoom = device.isMobilePortrait
+    ? { paddingBottom: 'calc(56px + env(safe-area-inset-bottom))' }
+    : device.isPhoneLandscape
+      ? { paddingRight: 'calc(56px + env(safe-area-inset-right))' }
+      : undefined;
   // The PicoClaw sidebar renders once, into a node of its own that the side
   // panel or the full-screen overlay adopts. Moving between them (a resize
   // across the breakpoint) or the video area remounting (a host resolution
@@ -160,6 +181,34 @@ export const Desktop = () => {
       active = false;
     };
   }, [admin, videoModeKnown]);
+  // A Cube or Lite takes a new EDID, such as the RGB range that corrects pale
+  // colours, only after a power cycle. The reminder lives in Settings > Video,
+  // where only an admin can dismiss it; tell the admin once per tab here.
+  const [notifier, notifierHolder] = notification.useNotification();
+  useEffect(() => {
+    if (!admin) return;
+    let active = true;
+    getVideoCapabilities()
+      .then((rsp) => {
+        if (!active || rsp.code !== 0 || !rsp.data?.monitor?.powerCyclePending) return;
+        try {
+          if (sessionStorage.getItem(powerCycleNoticeKey)) return;
+          sessionStorage.setItem(powerCycleNoticeKey, '1');
+        } catch {
+          // Without session storage the notice shows on every load.
+        }
+        notifier.warning({
+          key: powerCycleNoticeKey,
+          message: t('videoSettings.powerCyclePending'),
+          description: t('videoSettings.powerCycleNotice'),
+          duration: 0
+        });
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [admin, notifier, t]);
   const [mjpegRefused, setMjpegRefused] = useState(false);
   const [encoderReady, setEncoderReady] = useState(false);
   const [encoderError, setEncoderError] = useState<string | null>(null);
@@ -393,8 +442,9 @@ export const Desktop = () => {
   }
 
   return (
-    <div className="h-dvh w-full overflow-hidden bg-neutral-950">
+    <div className="box-border h-dvh w-full overflow-hidden bg-black" style={phoneBarRoom}>
       <Head title={t('head.desktop')} />
+      {notifierHolder}
 
       <UpdateNotification />
       <ControlNotice />
@@ -480,7 +530,14 @@ export const Desktop = () => {
       {!isBigScreen && isPicoclawChatOpen ? (
         <div
           ref={adoptPicoclaw}
-          className="fixed inset-x-0 top-14 bottom-0 z-980 overflow-hidden bg-[#0d0d0f] shadow-2xl"
+          className="bg-panel fixed inset-x-0 top-14 bottom-0 z-980 overflow-hidden shadow-2xl"
+          style={
+            device.isMobilePortrait
+              ? { top: 0, bottom: 'calc(56px + env(safe-area-inset-bottom))' }
+              : device.isPhoneLandscape
+                ? { top: 0, right: 'calc(56px + env(safe-area-inset-right))' }
+                : undefined
+          }
         />
       ) : null}
       {/* After both slots: their refs adopt the host before the sidebar's

@@ -3,9 +3,14 @@
   "power.off": { "title": "Host powered off", "body": "The host's power LED turned off." },
   "hdmi.lost": { "title": "HDMI signal lost", "body": "The host stopped sending a picture." },
   "hdmi.restored": { "title": "HDMI signal restored", "body": "The host sends a picture again." },
+  "hdmi.power-cycle": { "title": "Power cycle recommended", "body": "The HDMI receiver got an updated EDID, for example for correct colours. Unplug the NanoKVM from all power and plug it back in to apply it." },
   "security.lockout": {
     "title": "Logins blocked",
     "body": "{failures} failed logins from {address}: logins from this address are blocked for {minutes} min."
+  },
+  "security.attempt-limit": {
+    "title": "Login attempts limited",
+    "body": "{attempts} login attempts from {address} in a minute: further attempts from this address are refused for {minutes} min."
   },
   "security.new-address": {
     "title": "Login from a new address",
@@ -13,5 +18,22 @@
   },
   "screen.bsod": { "title": "Blue screen on the host", "body": "Windows stopped with an error." },
   "screen.panic": { "title": "Kernel panic on the host", "body": "The host's console shows a crash." },
-  "test": { "title": "Test notification", "body": "Notifications from this NanoKVM reach this channel." }
+  "test": { "title": "Test notification", "body": "Notifications from this NanoKVM reach this channel." },
+  "action.button": { "title": "Button pressed", "body": "{actor} pressed the {button} button for {seconds} s." },
+  "action.media-inserted": { "title": "Image mounted", "body": "{actor} put {image} into the virtual drive." },
+  "action.media-ejected": { "title": "Image ejected", "body": "{actor} took the image out of the virtual drive." },
+  "journal.dropped": { "title": "Events not recorded", "body": "{count} events were left out: more than the journal takes in a minute." },
+  "watchdog.agent-silent": { "title": "Sensors agent silent", "body": "The host's sensors agent has sent nothing for {minutes} min, but the host answers on the USB network: the agent stopped. Nothing was done." },
+  "watchdog.host-silent": { "title": "Host does not respond", "body": "The host's sensors agent has sent nothing for {minutes} min and the host does not answer on the USB network. Nothing was pressed: the watchdog is set to notify." },
+  "watchdog.reset": { "title": "Host reset by the watchdog", "body": "The host's sensors agent sent nothing for {minutes} min and the host did not answer on the USB network: the reset button was pressed." },
+  "watchdog.cycle": { "title": "Host power-cycled by the watchdog", "body": "The host's sensors agent sent nothing for {minutes} min and the host did not answer on the USB network: it was switched off and on." },
+  "watchdog.failed": { "title": "Watchdog action failed", "body": "The host stopped responding ({minutes} min of silence), but the action failed: {error}" },
+  "watchdog.unknown": { "title": "Watchdog could not ask the host", "body": "The host's sensors agent has sent nothing for {minutes} min, and the NanoKVM could not ask the host whether it lives: {error}. Nothing was pressed." },
+  "settings.changed": { "title": "Settings changed", "body": "{actor} changed {setting}." },
+  "system.action": { "title": "NanoKVM action", "body": "{actor}: {action}." },
+  "system.started": { "title": "NanoKVM started", "body": "NanoKVM OS {version} started." },
+  "system.started.power": { "title": "NanoKVM started", "body": "NanoKVM OS {version} started after the power was switched on." },
+  "system.started.restart": { "title": "NanoKVM restarted", "body": "NanoKVM OS {version} started after a restart." },
+  "system.started.watchdog": { "title": "NanoKVM restarted by its watchdog", "body": "NanoKVM OS {version} started after the hardware watchdog reset the device: the system had stopped responding." },
+  "system.started.overheat": { "title": "NanoKVM restarted after overheating", "body": "NanoKVM OS {version} started after the chip switched itself off because it was too hot." }
 }

@@ -2,16 +2,19 @@ package router
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 
 	"NanoKVM-Server/middleware"
 	"NanoKVM-Server/recovery"
 	"NanoKVM-Server/service/controlmode"
+	"NanoKVM-Server/service/extensions/apkpkg"
 	"NanoKVM-Server/service/picoclaw"
+	"NanoKVM-Server/service/rustdesk"
 	"NanoKVM-Server/service/storage"
+	"NanoKVM-Server/service/vm"
 
-	"github.com/gin-gonic/contrib/static"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 )
@@ -27,23 +30,41 @@ var ownBodyLimitRoutes = []string{
 	"/api/extensions/openvpn/import",
 	"/api/extensions/wireguard/import",
 	"/api/vm/script/upload",
-	"/api/os/update/upload",
+	"/api/vm/video/watermark", // up to WatermarkMaxRequest
 	picoclawBasePath + picoclawActionsPath,
 	picoclawBasePath + picoclawMCPPath,
 	picoclawBasePath + picoclawLoadImagePath,
 }
 
+// The changes allowed while settings recovery waits for its reboot: signing
+// in (both steps), signing out and the reboot itself.
+var allowedDuringRecovery = map[string]bool{
+	"/api/system/recovery/reboot": true,
+	"/api/auth/login":             true,
+	"/api/auth/login/totp":        true,
+	"/api/auth/logout":            true,
+	"/api/auth/activity":          true,
+}
+
 func Init(r *gin.Engine) {
+	r.Use(middleware.SecurityHeaders())
+	// Before every route and static file: the managed computer reaches only
+	// the sensors agent's report and the serial console helper over usb0.
+	r.Use(middleware.USBHostGate(
+		middleware.USBRequest{Method: http.MethodPost, Path: vm.HostSensorsIngestPath},
+		middleware.USBRequest{Method: http.MethodGet, Path: vm.SerialConsoleScriptPath},
+	))
 	r.Use(standbyAdmission())
 	standbyRouter(r)
 	r.Use(func(c *gin.Context) {
-		if c.Request.Method != "GET" && c.Request.Method != "HEAD" && c.Request.Method != "OPTIONS" && (recovery.Engine{Root: "/"}).Pending() && c.Request.URL.Path != "/api/system/recovery/reboot" && c.Request.URL.Path != "/api/auth/login" && c.Request.URL.Path != "/api/auth/logout" {
+		if c.Request.Method != "GET" && c.Request.Method != "HEAD" && c.Request.Method != "OPTIONS" && !allowedDuringRecovery[c.Request.URL.Path] && (recovery.Engine{Root: "/"}).Pending() {
 			c.AbortWithStatusJSON(409, gin.H{"code": -1, "msg": "Settings recovery pending; reboot before changing settings."})
 			return
 		}
 		c.Next()
 	})
 	r.Use(middleware.LimitRequestBody(ownBodyLimitRoutes...))
+	r.Use(middleware.JournalChanges())
 	web(r)
 	server(r)
 	log.Debugf("router init done")
@@ -71,10 +92,49 @@ func web(r *gin.Engine) {
 	})
 
 	r.Use(assets(webPath))
-	r.Use(static.Serve("/", static.LocalFile(webPath, true)))
+	r.Use(staticFiles(webPath))
+}
+
+// addonSettingsChecked records that switchOffRemovedAddons has run once.
+var addonSettingsChecked = "/etc/kvm/addon-settings-checked"
+
+// switchOffRemovedAddons runs once, at the first start of a system on which
+// RustDesk and the computer sensors are part of every NanoKVM OS. Before,
+// they were add-ons, and removing one stopped it but left its setting on.
+// The APK world tells whether the user had installed it: apk writes there
+// what is installed by name, never a package that comes in as a dependency
+// of nanokvm-release. A package the world does not name was not installed
+// before this system brought it, so a setting it has is left from a removed
+// add-on and is switched off. The routers below read these settings.
+func switchOffRemovedAddons() {
+	if _, err := os.Stat(addonSettingsChecked); err == nil {
+		return
+	}
+	rustdeskChosen, err := apkpkg.Selected(rustdesk.Package)
+	if err != nil {
+		log.Errorf("removed add-on settings: %v", err)
+		return
+	}
+	sensorsChosen, err := apkpkg.Selected("nanokvm-host-sensors")
+	if err != nil {
+		log.Errorf("removed add-on settings: %v", err)
+		return
+	}
+	if err = rustdesk.SwitchOffStale(rustdeskChosen); err != nil {
+		log.Errorf("removed add-on settings: RustDesk: %v", err)
+		return
+	}
+	if err = vm.SwitchOffStaleHostSensors(sensorsChosen); err != nil {
+		log.Errorf("removed add-on settings: host sensors: %v", err)
+		return
+	}
+	if err = os.WriteFile(addonSettingsChecked, nil, 0o644); err != nil {
+		log.Errorf("removed add-on settings: %v", err)
+	}
 }
 
 func server(r *gin.Engine) {
+	switchOffRemovedAddons()
 	control := controlmode.GetManager()
 	picoclawService := picoclaw.NewService(control)
 	storageService := storage.NewService()
@@ -92,9 +152,7 @@ func server(r *gin.Engine) {
 	wsRouter(r)
 	downloadRouter(r)
 	extensionsRouter(r)
-	addonsRouter(r)
-	addonCatalogRouter(r)
-	bmcRouter(r)
+	bmcRouter(r, storageService)
 	notifyRouter(r)
 	rustdeskRouter(r)
 	osUpdateRouter(r)
@@ -103,7 +161,6 @@ func server(r *gin.Engine) {
 
 func LoopbackHTTPAllowedPaths() []string {
 	paths := PicoclawLoopbackHTTPAllowedPaths()
-	paths = append(paths, HIDLoopbackHTTPAllowedPaths()...)
 	paths = append(paths, BMCLoopbackHTTPAllowedPaths()...)
 	return paths
 }

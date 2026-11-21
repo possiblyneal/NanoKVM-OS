@@ -30,6 +30,16 @@ type remoteSession struct {
 	closeOnce sync.Once
 	readBytes atomic.Uint64
 	mounted   bool // guarded by Service.mu
+	// actor is who connected it, for the journal.
+	actor string
+	// location is where a URL source comes from, without credentials or a
+	// query, for the services that show it (Redfish).
+	location string
+	// ready gets the outcome of connecting, once: nil when the computer has
+	// the medium, the error otherwise. released closes when the session has
+	// let go of the drive.
+	ready    chan error
+	released chan struct{}
 }
 
 func (s *remoteSession) close() {
@@ -76,7 +86,7 @@ func (s *Service) ConnectRemote(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	r := &remoteSession{kind: "browser", ws: ws, closed: make(chan struct{})}
+	r := &remoteSession{kind: "browser", ws: ws, closed: make(chan struct{}), released: make(chan struct{}), actor: webActor(c)}
 	defer r.close()
 	stopWatch := middleware.WatchWebSocket(c.Request.Context(), ws)
 	defer stopWatch()
@@ -137,14 +147,17 @@ func (s *Service) ConnectRemote(c *gin.Context) {
 		}
 	}()
 	_ = s.serveRemote(r, reader, func() error {
+		recordMedium(r.actor, r.name)
 		return r.send(gin.H{"type": "mounted", "name": r.name, "size": r.size})
 	})
 }
 
-// Reconnect only the controller already bound to this gadget. Keep HID file
-// descriptors synchronized with the disconnect, matching local image mounts.
-// Caller holds the HID lock across LUN insertion and re-enumeration.
-func reconnectRemoteUSB() error {
+// reconnectUSB makes the computer read the USB devices anew, for a virtual
+// drive whose type or name changed (setDrive). Reconnect only the controller
+// already bound to this gadget. Keep HID file descriptors synchronized with
+// the disconnect. Caller holds the HID lock across LUN insertion and
+// re-enumeration.
+func reconnectUSB() error {
 	path := usbGadgetUDC
 	controller, err := os.ReadFile(path)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"NanoKVM-Server/internal/attention"
 	"NanoKVM-Server/service/controlmode"
 	"NanoKVM-Server/service/hid"
 	"NanoKVM-Server/service/inputcontrol"
@@ -25,6 +26,8 @@ const (
 	MouseEvent
 	ControlEvent
 	HoldKeepaliveEvent
+	// VisibilityEvent: [5, 1] the page is visible, [5, 0] hidden.
+	VisibilityEvent
 )
 
 const (
@@ -43,6 +46,7 @@ func NewClient(ws *websocket.Conn) *Client {
 		keyboardLedNotify: make(chan struct{}, 1),
 		keyboardLedDone:   make(chan struct{}),
 		lastHeartbeat:     time.Time{},
+		lastMessage:       time.Now(),
 		inputLease:        newInputLease(),
 	}
 
@@ -74,8 +78,14 @@ func (c *Client) Start() {
 		c.hid.MouseReports(c.mouse)
 	}()
 
+	// A page counts as visible until it says otherwise.
+	c.pageVisible = true
+	attention.PageShown()
 	_ = c.Read()
 	c.Close()
+	if c.pageVisible {
+		attention.PageHidden()
+	}
 }
 
 func (c *Client) Read() error {
@@ -90,6 +100,9 @@ func (c *Client) Read() error {
 		if err != nil {
 			return err
 		}
+		c.mutex.Lock()
+		c.lastMessage = time.Now()
+		c.mutex.Unlock()
 		if err := c.UpdateHeartbeat(); err != nil {
 			return err
 		}
@@ -109,7 +122,18 @@ func (c *Client) Read() error {
 			if len(data) == 1 {
 				c.keepHeldInputAlive()
 			}
+		case VisibilityEvent:
+			if len(data) == 2 && (data[1] == 1) != c.pageVisible {
+				c.pageVisible = data[1] == 1
+				if c.pageVisible {
+					attention.PageShown()
+				} else {
+					attention.PageHidden()
+				}
+			}
 		case KeyboardEvent:
+			// Input from any page shows somebody is there, with control or not.
+			attention.NoteInput(time.Now())
 			if !GetManager().CanControl(c) {
 				continue
 			}
@@ -120,6 +144,7 @@ func (c *Client) Read() error {
 			}
 			c.queueManualReport(c.keyboard, inputcontrol.ManualKeyboard, report, keyboardReportHeld(report), true)
 		case MouseEvent:
+			attention.NoteInput(time.Now())
 			if !GetManager().CanControl(c) {
 				continue
 			}
@@ -228,6 +253,19 @@ func (c *Client) Write(event string, data string) error {
 
 	_ = c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return c.ws.WriteMessage(websocket.TextMessage, messageByte)
+}
+
+// pageSilence: a page sends a heartbeat every 10 s, and a background tab
+// whose timers the browser throttles still about once a minute. One silent
+// this long is frozen: its JavaScript is suspended.
+const pageSilence = clientHeartbeatTimeout
+
+// pageAlive reports whether the page itself sent a frame recently. A client
+// made without NewClient has no record and counts as alive.
+func (c *Client) pageAlive(now time.Time) bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.lastMessage.IsZero() || now.Sub(c.lastMessage) < pageSilence
 }
 
 func (c *Client) UpdateHeartbeat() error {

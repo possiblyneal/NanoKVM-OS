@@ -3,9 +3,14 @@
   "power.off": { "title": "Hôte éteint", "body": "Le voyant d'alimentation de l'hôte s'est éteint." },
   "hdmi.lost": { "title": "Signal HDMI perdu", "body": "L'hôte n'envoie plus d'image." },
   "hdmi.restored": { "title": "Signal HDMI rétabli", "body": "L'hôte envoie de nouveau une image." },
+  "hdmi.power-cycle": { "title": "Coupure d’alimentation recommandée", "body": "Le récepteur HDMI a reçu un EDID mis à jour, par exemple pour des couleurs correctes. Débranchez le NanoKVM de toute alimentation puis rebranchez-le pour l’appliquer." },
   "security.lockout": {
     "title": "Connexions bloquées",
     "body": "{failures} échecs de connexion depuis {address} : les connexions depuis cette adresse sont bloquées pendant {minutes} min."
+  },
+  "security.attempt-limit": {
+    "title": "Tentatives de connexion limitées",
+    "body": "{attempts} tentatives de connexion depuis {address} en une minute : les suivantes depuis cette adresse sont refusées pendant {minutes} min."
   },
   "security.new-address": {
     "title": "Connexion depuis une nouvelle adresse",
@@ -13,5 +18,15 @@
   },
   "screen.bsod": { "title": "Écran bleu sur l'hôte", "body": "Windows s'est arrêté sur une erreur." },
   "screen.panic": { "title": "Kernel panic sur l'hôte", "body": "La console de l'hôte affiche un plantage." },
-  "test": { "title": "Notification de test", "body": "Les notifications de ce NanoKVM arrivent bien sur ce canal." }
+  "test": { "title": "Notification de test", "body": "Les notifications de ce NanoKVM arrivent bien sur ce canal." },
+  "action.button": { "title": "Bouton pressé", "body": "{actor} a appuyé sur le bouton {button} pendant {seconds} s." },
+  "action.media-inserted": { "title": "Image montée", "body": "{actor} a inséré {image} dans le lecteur virtuel." },
+  "action.media-ejected": { "title": "Image éjectée", "body": "{actor} a retiré l'image du lecteur virtuel." },
+  "journal.dropped": { "title": "Événements non enregistrés", "body": "{count} événements ont été omis : plus que le journal n'en accepte par minute." },
+  "watchdog.agent-silent": { "title": "L'agent des capteurs ne répond plus", "body": "L'agent des capteurs de l'hôte n'a rien envoyé depuis {minutes} min, mais l'hôte répond sur le réseau USB : l'agent est arrêté. Rien n'a été fait." },
+  "watchdog.host-silent": { "title": "L'hôte ne répond pas", "body": "L'agent des capteurs n'a rien envoyé depuis {minutes} min et l'hôte ne répond pas sur le réseau USB. Aucun bouton n'a été pressé : le chien de garde est réglé sur notifier." },
+  "watchdog.reset": { "title": "Hôte réinitialisé par le chien de garde", "body": "L'agent des capteurs n'a rien envoyé pendant {minutes} min et l'hôte n'a pas répondu sur le réseau USB : le bouton de réinitialisation a été pressé." },
+  "watchdog.cycle": { "title": "Hôte éteint puis rallumé par le chien de garde", "body": "L'agent des capteurs n'a rien envoyé pendant {minutes} min et l'hôte n'a pas répondu sur le réseau USB : il a été éteint puis rallumé." },
+  "watchdog.failed": { "title": "Échec de l'action du chien de garde", "body": "L'hôte ne répond plus ({minutes} min de silence), mais l'action a échoué : {error}" },
+  "watchdog.unknown": { "title": "Le chien de garde n'a pas pu interroger l'hôte", "body": "L'agent des capteurs n'a rien envoyé depuis {minutes} min et le NanoKVM n'a pas pu demander à l'hôte s'il est vivant : {error}. Aucun bouton n'a été pressé." }
 }

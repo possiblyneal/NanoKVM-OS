@@ -3,6 +3,7 @@ package common
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -182,37 +183,45 @@ func MonitorRefreshHz() int {
 // (ProgramMonitorProfileOnFirstStart), except on boards without programmable
 // EDID or that need a power cycle (Cube).
 func programmedMonitorProfileLocked(path string, height uint16) bool {
-	want, err := fileSHA256(path)
+	id := savedMonitorIdentityLocked()
+	want, err := monitorProfileSHA256(path, id)
 	if err != nil {
 		return false
 	}
 	recorded, err := os.ReadFile(monitorEDIDHashFile)
 	if err != nil {
-		legacy, legacyErr := fileSHA256(monitorProfilePath(height))
+		// A Cube or Lite without a recorded write has an unknown EDID:
+		// do not infer its rate from the saved setting.
+		if MonitorRequiresPowerCycle() {
+			return false
+		}
+		legacy, legacyErr := monitorProfileSHA256(monitorProfilePath(height), id)
 		return legacyErr == nil && legacy == want
 	}
 	return strings.TrimSpace(string(recorded)) == want
 }
 
-func recordMonitorProfileLocked(path string) {
-	sum, err := fileSHA256(path)
-	if err != nil {
-		_ = os.Remove(monitorEDIDHashFile)
-		return
+// MonitorStockProfile reports a Cube or Lite without a recorded EDID profile.
+// It may hold stock EDID or an unrecorded older write; neither justifies
+// inferring the size and rate from the profile Auto stands for elsewhere.
+func MonitorStockProfile() bool {
+	if !MonitorRequiresPowerCycle() {
+		return false
 	}
+	monitorMutex.Lock()
+	defer monitorMutex.Unlock()
+	_, err := os.Stat(monitorEDIDHashFile)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// recordMonitorProfileLocked records the hash of the EDID just written.
+func recordMonitorProfileLocked(data []byte) {
+	digest := sha256.Sum256(data)
+	sum := hex.EncodeToString(digest[:])
 	if atomicWriteMonitorFile(monitorEDIDHashFile, []byte(sum+"\n"), ".monitor_edid-*") != nil {
 		_ = os.Remove(monitorEDIDHashFile)
 		return
 	}
 	// nanokvm_update_edid reads the receiver back after writing it.
 	markReceiverVerifiedLocked(sum)
-}
-
-func fileSHA256(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
 }

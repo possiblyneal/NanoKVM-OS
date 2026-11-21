@@ -3,9 +3,14 @@
   "power.off": { "title": "ホストが停止しました", "body": "ホストの電源 LED が消灯しました。" },
   "hdmi.lost": { "title": "HDMI 信号が途絶えました", "body": "ホストが映像を出力しなくなりました。" },
   "hdmi.restored": { "title": "HDMI 信号が回復しました", "body": "ホストが再び映像を出力しています。" },
+  "hdmi.power-cycle": { "title": "電源の入れ直しを推奨", "body": "HDMI レシーバーの EDID が更新されました（色を正しくするためなど）。反映するには、NanoKVM をすべての電源から外して再接続してください。" },
   "security.lockout": {
     "title": "ログインをブロックしました",
     "body": "{address} からのログインが {failures} 回失敗しました。このアドレスからのログインは {minutes} 分間ブロックされます。"
+  },
+  "security.attempt-limit": {
+    "title": "ログイン試行を制限",
+    "body": "{address} から 1 分間に {attempts} 回のログイン試行：このアドレスからの以降の試行を {minutes} 分間拒否します。"
   },
   "security.new-address": {
     "title": "新しいアドレスからのログイン",
@@ -13,5 +18,15 @@
   },
   "screen.bsod": { "title": "ホストでブルースクリーン", "body": "Windows がエラーで停止しました。" },
   "screen.panic": { "title": "ホストで Kernel panic", "body": "ホストのコンソールにクラッシュが表示されています。" },
-  "test": { "title": "テスト通知", "body": "この NanoKVM からの通知はこのチャンネルに届きます。" }
+  "test": { "title": "テスト通知", "body": "この NanoKVM からの通知はこのチャンネルに届きます。" },
+  "action.button": { "title": "ボタンが押されました", "body": "{actor} が {button} ボタンを {seconds} 秒間押しました。" },
+  "action.media-inserted": { "title": "イメージをマウントしました", "body": "{actor} が {image} を仮想ドライブに挿入しました。" },
+  "action.media-ejected": { "title": "イメージを取り出しました", "body": "{actor} が仮想ドライブからイメージを取り出しました。" },
+  "journal.dropped": { "title": "記録されなかったイベント", "body": "{count} 件のイベントを省略しました（1 分あたりの記録上限を超過）。" },
+  "watchdog.agent-silent": { "title": "センサーエージェントが無応答", "body": "ホストのセンサーエージェントから {minutes} 分間データがありませんが、ホストは USB ネットワークで応答しています（エージェントが停止）。何も行いませんでした。" },
+  "watchdog.host-silent": { "title": "ホストが応答しません", "body": "センサーエージェントから {minutes} 分間データがなく、ホストは USB ネットワークでも応答しません。ウォッチドッグは通知のみの設定のため、ボタンは押していません。" },
+  "watchdog.reset": { "title": "ウォッチドッグがホストをリセット", "body": "センサーエージェントから {minutes} 分間データがなく、ホストが USB ネットワークで応答しなかったため、リセットボタンを押しました。" },
+  "watchdog.cycle": { "title": "ウォッチドッグが電源を入れ直しました", "body": "センサーエージェントから {minutes} 分間データがなく、ホストが USB ネットワークで応答しなかったため、電源を切って入れ直しました。" },
+  "watchdog.failed": { "title": "ウォッチドッグの操作に失敗", "body": "ホストが応答しなくなりましたが（{minutes} 分間無応答）、操作に失敗しました: {error}" },
+  "watchdog.unknown": { "title": "ウォッチドッグがホストに確認できません", "body": "センサーエージェントから {minutes} 分間データがなく、NanoKVM はホストの生存を確認できませんでした: {error}。ボタンは押していません。" }
 }

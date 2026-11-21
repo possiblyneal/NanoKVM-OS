@@ -177,11 +177,20 @@ func (c *ccm) tag(nonce, plaintext, adata []byte) ([]byte, error) {
 // From crypto/cipher/gcm.go
 // .
 func sliceForAppend(in []byte, n int) (head, tail []byte) {
-	if total := len(in) + n; cap(in) >= total {
-		head = in[:total]
+	// Check before adding: a wrapped total could bypass the capacity check.
+	// Like cipher.AEAD.Seal, an impossible output size is a caller error.
+	if n < 0 || n > math.MaxInt-len(in) {
+		panic("ccm: output length overflow")
+	}
+
+	if n <= cap(in)-len(in) {
+		// Spare capacity may hold Seal's plaintext. Extend without clearing
+		// it so exact in-place encryption can read before overwriting.
+		head = in[:len(in)+n]
 	} else {
-		head = make([]byte, total)
-		copy(head, in)
+		// Let append perform checked growth. This branch allocates a new
+		// backing array, so zeroing the new region cannot change plaintext.
+		head = append(in, make([]byte, n)...)
 	}
 	tail = head[len(in):]
 

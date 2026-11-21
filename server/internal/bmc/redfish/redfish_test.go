@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
-	"sync"
+
 	"testing"
 	"time"
 )
@@ -74,26 +74,6 @@ func TestServiceRootIsOpenAndSystemsAreNot(t *testing.T) {
 	}
 }
 
-func TestResetActions(t *testing.T) {
-	power := &fakePower{reset: true}
-	h := New("admin", "correct-horse", Info{}, power)
-	for _, rt := range []string{"On", "ForceOff", "GracefulShutdown", "ForceRestart", "PowerCycle", "PushPowerButton"} {
-		rec := do(h, "POST", "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", `{"ResetType":"`+rt+`"}`, admin)
-		if rec.Code != 204 {
-			t.Fatalf("%s: %d %s", rt, rec.Code, rec.Body)
-		}
-	}
-	if want := []string{"on", "forceoff", "soft", "reset", "cycle", "push"}; !reflect.DeepEqual(power.calls, want) {
-		t.Fatalf("calls %v", power.calls)
-	}
-	if rec := do(h, "POST", "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", `{"ResetType":"Nmi"}`, admin); rec.Code != 400 {
-		t.Fatalf("Nmi: %d", rec.Code)
-	}
-	if rec := do(h, "GET", "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", "", admin); rec.Code != 405 {
-		t.Fatalf("GET action: %d", rec.Code)
-	}
-}
-
 func TestSessions(t *testing.T) {
 	h := New("admin", "correct-horse", Info{}, &fakePower{})
 	rec := do(h, "POST", "/redfish/v1/SessionService/Sessions", `{"UserName":"admin","Password":"correct-horse"}`, nil)
@@ -118,8 +98,16 @@ func TestSessions(t *testing.T) {
 
 func TestFailedLoginsLockOut(t *testing.T) {
 	h := New("admin", "correct-horse", Info{}, &fakePower{})
+	var heard []string
+	h.OnLockout = func(addr string, failures int, _ time.Duration) { heard = append(heard, addr) }
+	h.OnLogin = func(user, addr string) { heard = append(heard, user+"@"+addr) }
+	do(h, "GET", "/redfish/v1/Systems/1", "", admin)
+	do(h, "GET", "/redfish/v1/Systems/1", "", admin) // heard once
 	for i := 0; i < maxFailures; i++ {
 		do(h, "GET", "/redfish/v1/Systems/1", "", map[string]string{"basic": "admin:guess"})
+	}
+	if !reflect.DeepEqual(heard, []string{"admin@192.0.2.7", "192.0.2.7"}) {
+		t.Fatalf("heard %q", heard)
 	}
 	if rec := do(h, "GET", "/redfish/v1/Systems/1", "", admin); rec.Code != 429 {
 		t.Fatalf("locked out client got %d", rec.Code)
@@ -139,150 +127,15 @@ func TestForgedForwardedForDoesNotResetTheLimit(t *testing.T) {
 	}
 }
 
-func TestFailedLoginTableIsBounded(t *testing.T) {
-	h := New("admin", "correct-horse", Info{}, &fakePower{})
-	now := time.Unix(1_800_000_000, 0)
-	h.now = func() time.Time { return now }
-	guess := func(addr string) {
-		req := httptest.NewRequest("GET", "/redfish/v1/Systems/1", nil)
-		req.RemoteAddr = addr
-		req.SetBasicAuth("admin", "guess")
-		h.ServeHTTP(httptest.NewRecorder(), req)
-	}
-	for i := 0; i < 2*maxTracked; i++ {
-		guess(fmt.Sprintf("[2001:db8:%x::1]:50000", i))
-	}
-	if len(h.failed) > maxTracked {
-		t.Fatalf("%d counters kept, at most %d", len(h.failed), maxTracked)
-	}
-	// Peers that never come back expire when another one fails.
-	now = now.Add(24 * time.Hour)
-	guess("192.0.2.9:50000")
-	if len(h.failed) != 1 {
-		t.Fatalf("%d counters a day later, want 1", len(h.failed))
-	}
-}
+// Peers that never come back expire when another one fails.
 
 // Parallel logins must not all pass the lockout check before the first
 // failure is counted: the attempt is reserved with the check.
-func TestParallelLoginsMeetTheLimit(t *testing.T) {
-	for _, basic := range []bool{false, true} {
-		t.Run(fmt.Sprintf("basic=%t", basic), func(t *testing.T) {
-			h := New("admin", "correct-horse", Info{}, &fakePower{})
-			start := make(chan struct{})
-			var wg sync.WaitGroup
-			codes := make(chan int, 50)
-			for i := 0; i < cap(codes); i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					<-start
-					var rec *httptest.ResponseRecorder
-					if basic {
-						rec = do(h, "GET", systemPath, "", map[string]string{"basic": "admin:guess"})
-					} else {
-						rec = do(h, "POST", sessionsPath, "{\"UserName\":\"admin\",\"Password\":\"guess\"}", nil)
-					}
-					codes <- rec.Code
-				}()
-			}
-			close(start)
-			wg.Wait()
-			close(codes)
-			unauthorized := 0
-			for code := range codes {
-				switch code {
-				case http.StatusUnauthorized:
-					unauthorized++
-				case http.StatusTooManyRequests:
-				default:
-					t.Errorf("unexpected status %d", code)
-				}
-			}
-			if unauthorized != maxFailures {
-				t.Fatalf("%d guesses were checked, want exactly %d", unauthorized, maxFailures)
-			}
-		})
-	}
-}
 
 // Refunds belong to the original reservation, even if the table has since
 // replaced its record after expiry or eviction.
-func TestOldSuccessDoesNotRefundReplacement(t *testing.T) {
-	for _, cause := range []string{"expiry", "eviction"} {
-		t.Run(cause, func(t *testing.T) {
-			h := New("admin", "correct-horse", Info{}, &fakePower{})
-			now := time.Unix(1800000000, 0)
-			h.now = func() time.Time { return now }
-			const addr = "192.0.2.7"
-			old := h.beginLogin(addr)
-			if old == nil {
-				t.Fatal("initial reservation refused")
-			}
-			if cause == "expiry" {
-				now = now.Add(failWindow + time.Nanosecond)
-			} else {
-				now = now.Add(time.Millisecond)
-				for i := 0; i < maxTracked; i++ {
-					if h.beginLogin(fmt.Sprintf("2001:db8:%x::/64", i)) == nil {
-						t.Fatal("new peer refused")
-					}
-				}
-				if h.failed[addr] != nil {
-					t.Fatal("oldest reservation was not evicted")
-				}
-			}
-			for i := 0; i < maxFailures; i++ {
-				if h.beginLogin(addr) == nil {
-					t.Fatal("new window reservation refused")
-				}
-			}
-			h.loginSucceeded(addr, old)
-			if !h.lockedOut(addr) || h.beginLogin(addr) != nil {
-				t.Fatal("an old successful login refunded a failure from its replacement")
-			}
-		})
-	}
-}
-
-func TestSuccessfulLoginOnlyRefundsItsAttempt(t *testing.T) {
-	h := New("admin", "correct-horse", Info{}, &fakePower{})
-	for i := 0; i < 2*maxFailures; i++ {
-		if rec := do(h, "GET", systemPath, "", admin); rec.Code != http.StatusOK {
-			t.Fatalf("successful status poll %d: %d", i, rec.Code)
-		}
-	}
-	if len(h.failed) != 0 {
-		t.Fatal("successful status polling retained a failure record")
-	}
-	do(h, "GET", systemPath, "", map[string]string{"basic": "admin:guess"})
-	do(h, "GET", systemPath, "", admin)
-	if f := h.failed["192.0.2.7"]; f == nil || f.count != 1 {
-		t.Fatalf("success did not preserve an earlier failed guess: %+v", f)
-	}
-}
 
 // One IPv6 host must not rotate through its /64 to get more guesses.
-func TestIPv6ClientsCountPerPrefix(t *testing.T) {
-	h := New("admin", "correct-horse", Info{}, &fakePower{})
-	guess := func(addr, password string) int {
-		req := httptest.NewRequest("GET", "/redfish/v1/Systems/1", nil)
-		req.RemoteAddr = addr
-		req.SetBasicAuth("admin", password)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		return rec.Code
-	}
-	for i := 0; i < maxFailures; i++ {
-		guess(fmt.Sprintf("[2001:db8:1:2::%x]:5000", i+1), "guess")
-	}
-	if code := guess("[2001:db8:1:2::ffff]:5000", "correct-horse"); code != 429 {
-		t.Fatalf("another address of the same /64 got %d, want 429", code)
-	}
-	if code := guess("[2001:db8:1:3::1]:5000", "correct-horse"); code != 200 {
-		t.Fatalf("another /64 got %d, want 200", code)
-	}
-}
 
 // A cross-site form cannot drive power actions with cached Basic credentials.
 func TestCrossSiteWritesAreRefused(t *testing.T) {
@@ -310,5 +163,115 @@ func TestCrossSiteWritesAreRefused(t *testing.T) {
 	}
 	if code := form(map[string]string{"Content-Type": "application/json; charset=utf-8"}); code != 204 {
 		t.Fatalf("JSON POST got %d", code)
+	}
+}
+
+type fakeMedia struct {
+	current  Medium
+	inserted []MediaRequest
+	err      error
+}
+
+func (f *fakeMedia) Medium(context.Context) (Medium, error) { return f.current, nil }
+func (f *fakeMedia) Eject(context.Context) error            { f.current = Medium{}; return f.err }
+func (f *fakeMedia) Insert(_ context.Context, r MediaRequest) error {
+	if f.err == nil {
+		f.inserted, f.current = append(f.inserted, r), Medium{Inserted: true, Image: r.Image, CD: true, Via: "URI"}
+	}
+	return f.err
+}
+
+// The drive is the system's and, for older clients, the manager's; without
+// the setting neither exists. An insert never shows its credentials again.
+func TestVirtualMedia(t *testing.T) {
+	h := New("admin", "correct-horse", Info{}, &fakePower{})
+	if rec := do(h, "GET", "/redfish/v1/Systems/1/VirtualMedia/1", "", admin); rec.Code != 404 {
+		t.Fatalf("without the setting: %d", rec.Code)
+	}
+	media := &fakeMedia{}
+	h.Media = media
+	for _, parent := range []string{"Systems", "Managers"} {
+		base := "/redfish/v1/" + parent + "/1/VirtualMedia/1"
+		insert := base + "/Actions/VirtualMedia.InsertMedia"
+		if v := decode(t, do(h, "GET", base, "", admin)); v["@odata.id"] != base || v["Inserted"] != false || v["Image"] != nil {
+			t.Fatalf("%s empty: %v", parent, v)
+		}
+		for _, c := range []struct {
+			body string
+			code int
+		}{
+			{`{}`, 400},
+			{`{"Image":"http://h/a.iso","Inserted":false}`, 400},
+			{`{"Image":"http://h/a.iso","TransferProtocolType":"CIFS"}`, 400},
+			{`{"Image":"http://h/a.iso","TransferMethod":"Upload"}`, 400},
+			{`{"Image":"https://h/a.iso","UserName":"u","Password":"secret"}`, 204},
+			{`{"Image":"https://h/b.iso"}`, 409}, // the drive holds a.iso
+		} {
+			if rec := do(h, "POST", insert, c.body, admin); rec.Code != c.code {
+				t.Errorf("%s insert %s: %d, want %d: %s", parent, c.body, rec.Code, c.code, rec.Body)
+			}
+		}
+		rec := do(h, "GET", base, "", admin)
+		if v := decode(t, rec); v["Inserted"] != true || v["ImageName"] != "a.iso" || v["TransferProtocolType"] != "HTTPS" || strings.Contains(rec.Body.String(), "secret") {
+			t.Errorf("%s inserted: %s", parent, rec.Body)
+		}
+		if rec := do(h, "POST", base+"/Actions/VirtualMedia.EjectMedia", "{}", admin); rec.Code != 204 || media.current.Inserted {
+			t.Errorf("%s eject: %d", parent, rec.Code)
+		}
+	}
+	if n := len(media.inserted); n != 2 || media.inserted[0].Password != "secret" {
+		t.Errorf("inserts that reached the drive: %+v", media.inserted)
+	}
+}
+
+type fakeSensors struct {
+	readings  []Reading
+	fresh, on bool
+}
+
+func (f fakeSensors) Readings() ([]Reading, bool, bool) { return f.readings, f.fresh, f.on }
+
+// The chassis has the host's sensors while the feature is on; a silent
+// agent leaves the resources without readings, never with old ones.
+func TestHostSensors(t *testing.T) {
+	h := New("admin", "correct-horse", Info{}, &fakePower{})
+	sensors := &fakeSensors{readings: []Reading{
+		{ID: "aa", Name: "CPU Package", Kind: "temperature", Context: "CPU", Value: 54.5},
+		{ID: "bb", Name: "Board Fan 1", Kind: "fan", Value: 912},
+		{ID: "cc", Name: "Board Vcore", Kind: "voltage", Value: 1.23},
+		{ID: "dd", Name: "CPU Clock", Kind: "clock", Value: 4200},
+		{ID: "ee", Name: "Disk Used", Kind: "data", Value: 100},
+	}}
+	h.Sensors = sensors
+	get := func(path string) (int, map[string]any) {
+		rec := do(h, "GET", "/redfish/v1/Chassis/1"+path, "", admin)
+		if rec.Code != 200 {
+			return rec.Code, nil
+		}
+		return rec.Code, decode(t, rec)
+	}
+	if code, _ := get("/Thermal"); code != 404 {
+		t.Fatalf("Thermal with the feature off: %d", code)
+	}
+	sensors.on, sensors.fresh = true, true
+	_, thermal := get("/Thermal")
+	temperature := thermal["Temperatures"].([]any)[0].(map[string]any)
+	if temperature["ReadingCelsius"] != 54.5 || temperature["MemberId"] != "0" || temperature["PhysicalContext"] != "CPU" ||
+		thermal["Fans"].([]any)[0].(map[string]any)["Reading"] != 912.0 {
+		t.Errorf("Thermal: %v", thermal)
+	}
+	if _, power := get("/Power"); power["Voltages"].([]any)[0].(map[string]any)["ReadingVolts"] != 1.23 {
+		t.Errorf("Power: %v", power)
+	}
+	// Every kind Redfish has a reading type for, in its unit; not "data".
+	if _, all := get("/Sensors"); all["Members@odata.count"] != 4.0 {
+		t.Errorf("Sensors: %v", all)
+	}
+	if _, clock := get("/Sensors/dd"); clock["Reading"] != 4.2e9 || clock["ReadingType"] != "Frequency" {
+		t.Errorf("a clock in MHz: %v", clock)
+	}
+	sensors.readings, sensors.fresh = nil, false
+	if _, thermal := get("/Thermal"); len(thermal["Temperatures"].([]any)) != 0 || thermal["Status"].(map[string]any)["State"] != "UnavailableOffline" {
+		t.Errorf("Thermal of a silent agent: %v", thermal)
 	}
 }

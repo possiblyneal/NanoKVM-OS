@@ -9,6 +9,11 @@ export function downloadImage(file?: string, sha256sum?: string) {
   return http.post('/api/download/image', data);
 }
 
+export async function checkImageUpload(file: File) {
+  const result = await http.get('/api/download/file/check', { name: file.name, size: file.size });
+  if (result.code !== 0) throw new Error(result.msg);
+}
+
 export function cancelDownloadImage() {
   return http.post('/api/download/image/cancel');
 }
@@ -21,7 +26,7 @@ export function imageEnabled() {
   return http.get<{ enabled: boolean }>('/api/download/image/enabled');
 }
 
-export type ImageDownloadStatus = {
+type ImageDownloadStatus = {
   downloadedBytes: number;
   totalBytes: number;
   bytesPerSecond: number;

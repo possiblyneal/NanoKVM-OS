@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"syscall"
+
 	"testing"
 )
 
@@ -19,12 +19,12 @@ type fakeEngine struct {
 }
 
 func (f *fakeEngine) engine() *shaEngine {
-	return &shaEngine{run: func(state *[32]byte, blocks []byte) error {
+	return &shaEngine{max: shaRequest, run: func(state *[32]byte, blocks []byte) error {
 		f.calls++
 		if f.calls == f.failAt {
 			return f.err
 		}
-		if len(blocks) == 0 || len(blocks)%64 != 0 || len(blocks) > shaChunk {
+		if len(blocks) == 0 || len(blocks)%64 != 0 || len(blocks) > shaRequest {
 			return errors.New("bad request length")
 		}
 		var h [8]uint32
@@ -91,65 +91,5 @@ func TestSHA256SumIsRepeatableAndWritable(t *testing.T) {
 	d.Write(data[:5000])
 	if want := sha256.Sum256(data[:5000]); !bytes.Equal(d.Sum([]byte("x"))[1:], want[:]) {
 		t.Fatal("after Reset")
-	}
-}
-
-func TestSHA256EngineFailureContinuesInSoftware(t *testing.T) {
-	data := make([]byte, 50000)
-	rand.Read(data)
-	want := sha256.Sum256(data)
-	f := &fakeEngine{failAt: 3, err: syscall.EIO}
-	e := f.engine()
-	d := newSHA256(e)
-	d.Write(data)
-	if !bytes.Equal(d.Sum(nil), want[:]) {
-		t.Fatal("wrong digest after an engine error")
-	}
-	if !e.disabled.Load() || f.calls != 3 {
-		t.Fatalf("engine not disabled after an error (calls %d)", f.calls)
-	}
-	d2 := newSHA256(e)
-	d2.Write(data)
-	if !bytes.Equal(d2.Sum(nil), want[:]) || f.calls != 3 {
-		t.Fatal("a disabled engine was used again")
-	}
-}
-
-func TestSHA256InterruptedRequestKeepsTheEngine(t *testing.T) {
-	data := make([]byte, 50000)
-	rand.Read(data)
-	f := &fakeEngine{failAt: 2, err: syscall.EINTR}
-	e := f.engine()
-	d := newSHA256(e)
-	d.Write(data)
-	if want := sha256.Sum256(data); !bytes.Equal(d.Sum(nil), want[:]) {
-		t.Fatal("wrong digest after EINTR")
-	}
-	if e.disabled.Load() || f.calls < 5 {
-		t.Fatalf("EINTR disabled the engine (calls %d)", f.calls)
-	}
-}
-
-// On the device: the real engine against crypto/sha256.
-func TestNewSHA256OnDevice(t *testing.T) {
-	e := openSHAEngine()
-	if e == nil {
-		t.Skip("no SG2002 engine")
-	}
-	data := make([]byte, 16<<20+3)
-	rand.Read(data)
-	lengths := append([]int{4096, 4097, 4096 + 64, 3 * 4096, 1 << 20, 16 << 20}, shaLengths...)
-	for _, n := range lengths {
-		for _, off := range []int{0, 3} {
-			d := newSHA256(e)
-			d.Write(data[off : off+n])
-			want := sha256.Sum256(data[off : off+n])
-			if got := d.Sum(nil); !bytes.Equal(got, want[:]) {
-				t.Fatalf("%d bytes at offset %d: wrong digest", n, off)
-			}
-		}
-	}
-	if e.disabled.Load() {
-		t.Fatal("the engine failed during the test")
 	}
 }

@@ -16,12 +16,10 @@ import (
 )
 
 const (
-	WiFiExistFile  = "/etc/kvm/wifi_exist"
-	WiFiApModeFile = "/tmp/wifiap"
+	WiFiApModeFile = "/run/nanokvm-wifiap"
 	WiFiSSID       = "/etc/kvm/wifi.ssid"
 	WiFiPasswd     = "/etc/kvm/wifi.pass"
 	WiFiConnect    = "/kvmapp/kvm/wifi_try_connect"
-	WiFiStateFile  = "/run/nanokvm/wifi_state"
 	WiFiScript     = "/etc/init.d/S30wifi"
 	WiFiApPassFile = "/kvmapp/kvm/ap.pass"
 )
@@ -30,7 +28,7 @@ func (s *Service) GetWifi(c *gin.Context) {
 	var rsp proto.Response
 
 	status := wifiControl.status()
-	status.ThisConnection = requestOnInterface(c, "wlan0")
+	status.ThisConnection = requestMayRideWifi(c)
 	rsp.OkRspWithData(c, status)
 }
 
@@ -159,46 +157,7 @@ func (s *Service) VerifyApLogin(c *gin.Context) {
 	rsp.OkRsp(c)
 }
 
-func (s *Service) ConnectWifi(c *gin.Context) {
-	var req proto.ConnectWifiReq
-	var rsp proto.Response
-
-	if err := proto.ParseFormRequest(c, &req); err != nil || legacyProfile(req.Ssid, req.Password).validate() != nil {
-		rsp.ErrRsp(c, -1, "invalid parameters")
-		return
-	}
-
-	if !reserveWifi() {
-		rsp.ErrRsp(c, -2, "Wi-Fi busy")
-		return
-	}
-	defer finishWifi(nil)
-	if err := connect(req.Ssid, req.Password); err != nil {
-		rsp.ErrRsp(c, -2, "failed to connect wifi")
-		return
-	}
-
-	// Waiting for Wi-Fi connection
-	maxTries := 7
-	if isConnected() {
-		maxTries = 3
-		time.Sleep(12 * time.Second)
-	}
-
-	for range maxTries {
-		time.Sleep(2 * time.Second)
-
-		if isConnected() && getWiFiSsid() != "" {
-			rsp.OkRsp(c)
-			log.Debugf("set wifi successfully: %s", req.Ssid)
-			return
-		}
-	}
-
-	rsp.ErrRsp(c, -3, "failed to get wifi status")
-}
-
-// legacyProfile is what the two legacy connect routes save: a personal
+// legacyProfile is what the AP-mode connect route saves: a personal
 // network, which S30wifi cannot start with a password wpa_passphrase
 // rejects (under 8 or over 63 characters, a line break).
 func legacyProfile(ssid, password string) wifiProfile {
@@ -255,25 +214,6 @@ func isSupported() bool {
 func isAPMode() bool {
 	_, err := os.Stat(WiFiApModeFile)
 	return err == nil
-}
-
-func isConnected() bool {
-	content, err := os.ReadFile(WiFiStateFile)
-	if err != nil {
-		return false
-	}
-
-	state := strings.ReplaceAll(string(content), "\n", "")
-	return state == "1"
-}
-
-func getWiFiSsid() string {
-	ssidByte, err := os.ReadFile(WiFiSSID)
-	if err != nil {
-		return ""
-	}
-
-	return strings.ReplaceAll(string(ssidByte), "\n", "")
 }
 
 func getApPassword() string {

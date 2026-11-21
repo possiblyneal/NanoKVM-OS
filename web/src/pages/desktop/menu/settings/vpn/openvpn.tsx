@@ -3,14 +3,12 @@ import { Alert, Button, Input, message, Modal, Popconfirm, Switch } from 'antd';
 import { FileUpIcon, KeyRoundIcon, Trash2Icon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { DOWNLOAD_TIMEOUT, SLOW_CALL_TIMEOUT } from '@/api/extensions/timeouts.ts';
 import { http } from '@/lib/http.ts';
 import { showRequestError } from '@/lib/show-request-error.ts';
 import { pollWhileVisible } from '@/lib/visible-poll.ts';
 import { confirmAction } from '@/components/ui/confirm.ts';
-import { Panel, SettingRow, SettingsSection, StatusBadge } from '@/components/ui/settings.tsx';
+import { Panel, SettingsSection, StatusBadge } from '@/components/ui/settings.tsx';
 
-import { ExtensionInstallResult } from './extension-install-result.tsx';
 import { profileTone } from './profile-tone.ts';
 import { VPNVersion } from './version';
 
@@ -120,29 +118,23 @@ export function OpenVPN({ setIsLocked }: { setIsLocked: (locked: boolean) => voi
     }
     const data = new FormData();
     Array.from(files).forEach((f) => data.append('files', f));
-    void run(() => http.post('/api/extensions/openvpn/import', data));
-  }
-  function install() {
-    void run(() =>
-      http.post('/api/extensions/openvpn/install', undefined, { timeout: DOWNLOAD_TIMEOUT })
-    );
-  }
-  function uninstall() {
-    void run(() =>
-      http.post('/api/extensions/openvpn/uninstall', undefined, { timeout: SLOW_CALL_TIMEOUT })
-    );
+    void run(() => http.post('/api/extensions/openvpn/import', data, { sensitive: true }));
   }
   async function saveCredentials() {
     if (!editing) return;
     if (
       await run(() =>
-        http.post('/api/extensions/openvpn/profile', {
-          id: editing.id,
-          action: 'credentials',
-          username,
-          password,
-          passphrase
-        })
+        http.post(
+          '/api/extensions/openvpn/profile',
+          {
+            id: editing.id,
+            action: 'credentials',
+            username,
+            password,
+            passphrase
+          },
+          { sensitive: true }
+        )
       )
     )
       clearCredentials();
@@ -151,54 +143,42 @@ export function OpenVPN({ setIsLocked }: { setIsLocked: (locked: boolean) => voi
     <div className="space-y-6">
       {loadFailed && <Alert type="error" showIcon message={t('vpn.loadFailed')} />}
       <SettingsSection>
-        <VPNVersion name="openvpn" />
-        <p className="text-fg-muted mt-0 text-sm">{t('vpn.openvpnDescription')}</p>
+        {available === true && (
+          <>
+            <VPNVersion name="openvpn" />
+            <p className="text-fg-muted mt-0 text-sm">{t('vpn.openvpnDescription')}</p>
+          </>
+        )}
+        {/* OpenVPN is installed with the system, on an updated device shortly
+            after the server starts; one removed on the Software page stays removed. */}
         {available === false && (
-          <ExtensionInstallResult
-            title={t('vpn.openvpnNotInstalled')}
-            description={t('vpn.openvpnInstallDescription')}
-            actionLabel={t('vpn.openvpnInstall')}
-            loading={busy}
-            onInstall={install}
-          />
+          <Alert type="warning" showIcon message={t('vpn.openvpnNotInstalled')} />
         )}
         {available === true && (
-          <SettingRow label={<StatusBadge tone="success">{t('vpn.openvpnInstalled')}</StatusBadge>}>
-            <Popconfirm
-              title={t('vpn.openvpnUninstall')}
-              description={t('vpn.openvpnUninstallWarning')}
-              onConfirm={uninstall}
-              okText={t('vpn.confirm')}
-              cancelText={t('vpn.cancel')}
-              disabled={busy}
-            >
-              <Button danger loading={busy} icon={<Trash2Icon size={16} />}>
-                {t('vpn.openvpnUninstall')}
+          <>
+            <input
+              ref={input}
+              type="file"
+              multiple
+              hidden
+              aria-label={t('vpn.openvpnImport')}
+              onChange={(e) => {
+                upload(e.target.files);
+                e.target.value = '';
+              }}
+            />
+            <div>
+              <Button
+                icon={<FileUpIcon size={16} />}
+                loading={busy}
+                disabled={available !== true}
+                onClick={() => input.current?.click()}
+              >
+                {t('vpn.openvpnImport')}
               </Button>
-            </Popconfirm>
-          </SettingRow>
+            </div>
+          </>
         )}
-        <input
-          ref={input}
-          type="file"
-          multiple
-          hidden
-          aria-label={t('vpn.openvpnImport')}
-          onChange={(e) => {
-            upload(e.target.files);
-            e.target.value = '';
-          }}
-        />
-        <div>
-          <Button
-            icon={<FileUpIcon size={16} />}
-            loading={busy}
-            disabled={available !== true}
-            onClick={() => input.current?.click()}
-          >
-            {t('vpn.openvpnImport')}
-          </Button>
-        </div>
       </SettingsSection>
 
       <SettingsSection>
@@ -280,7 +260,7 @@ export function OpenVPN({ setIsLocked }: { setIsLocked: (locked: boolean) => voi
             </ul>
           </Panel>
         )}
-        <p className="text-fg-muted m-0 text-xs">{t('vpn.openvpnNote')}</p>
+        {available === true && <p className="text-fg-muted m-0 text-xs">{t('vpn.openvpnNote')}</p>}
       </SettingsSection>
       <Modal
         title={t('vpn.credentials')}

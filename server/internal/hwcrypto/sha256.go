@@ -11,8 +11,9 @@ import (
 )
 
 // SHA-256 on the SG2002 crypto engine, through the hwcrypto module's
-// HWCRYPTO_RUN ioctl: whole 64-byte blocks, at most shaChunk bytes per
-// request, the big-endian chaining state in and out. On a NanoKVM (MB/s,
+// HWCRYPTO_RUN ioctl: whole 64-byte blocks, at most the module's request size
+// (64 KiB; 4 KiB before its long pieces) per request, the big-endian chaining
+// state in and out. shaChunk is what a hash buffers and the least it sends. On a NanoKVM (MB/s,
 // crypto/sha256 with the C906 block against the engine): 4 KiB 23 against
 // 110, 1 MiB 22 against 149, at a tenth of the CPU time. Below 1 KiB the
 // request costs more than it saves.
@@ -21,8 +22,13 @@ const shaChunk = 4096
 // shaEngine runs whole blocks on the engine, updating state.
 type shaEngine struct {
 	run      func(state *[32]byte, blocks []byte) error
+	max      int // bytes per request: a multiple of shaChunk
 	disabled atomic.Bool
 }
+
+// shaRequest is the most this package asks of one request: the module holds
+// its lock and, for its 0.2 ms, the engine that the video stream's packets need.
+const shaRequest = 64 << 10
 
 var (
 	shaEngineOnce sync.Once
@@ -31,7 +37,7 @@ var (
 
 // NewSHA256 returns a SHA-256 hash for bulk data (downloads, update
 // packages). A message of at most 4 KiB never reaches the engine: it is hashed
-// in software at Sum. Larger ones go to the engine 4 KiB at a time, and the
+// in software at Sum. Larger ones go to the engine in requests of up to its size, and the
 // last partial chunk and the padding are hashed in software. If the engine
 // fails, the hash continues in software from the same state and the engine is
 // not used again. Without the device this is crypto/sha256.
@@ -66,15 +72,19 @@ func (d *sha256Hybrid) Reset() {
 	d.n, d.total = 0, 0
 }
 
-// Write keeps the last chunk buffered until more data arrives, so that a
-// message of exactly 4 KiB stays in software.
+// Write sends a write longer than a chunk to the engine down to its last
+// whole block: io.Copy's 32 KiB writes are one request each. (When the last
+// chunk was kept back, each cost a second request of 4 KiB and a copy of
+// it: 110 MB/s against 135.) A shorter write is buffered, so that a message
+// of at most 4 KiB stays in software.
 func (d *sha256Hybrid) Write(p []byte) (int, error) {
 	n := len(p)
 	d.total += uint64(n)
 	for len(p) > 0 {
 		if d.n == 0 && len(p) > shaChunk {
-			d.blocks(p[:shaChunk])
-			p = p[shaChunk:]
+			c := min(len(p)&^(sha256.BlockSize-1), d.engine.max)
+			d.blocks(p[:c])
+			p = p[c:]
 			continue
 		}
 		c := copy(d.buf[d.n:], p)

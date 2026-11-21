@@ -9,20 +9,25 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"NanoKVM-Server/common"
 	"NanoKVM-Server/config"
+	"NanoKVM-Server/internal/gpioio"
 	"NanoKVM-Server/internal/oomscore"
 	"NanoKVM-Server/internal/startpriority"
+	"NanoKVM-Server/journal"
 	"NanoKVM-Server/logger"
 	"NanoKVM-Server/logs"
 	"NanoKVM-Server/middleware"
 	"NanoKVM-Server/osupdate"
 	"NanoKVM-Server/router"
 	"NanoKVM-Server/service/extensions/acme"
+	"NanoKVM-Server/service/extensions/apkpkg"
 	"NanoKVM-Server/service/failsafe"
 	"NanoKVM-Server/service/network"
+	"NanoKVM-Server/service/notify"
 	"NanoKVM-Server/service/stream"
 	"NanoKVM-Server/service/vm"
 	"NanoKVM-Server/service/vm/jiggler"
@@ -33,6 +38,16 @@ import (
 )
 
 func main() {
+	// nkos-totp-reset USER: the console way back into an account whose
+	// authenticator and recovery codes are lost. It edits the account file
+	// and exits; the running server reads the change on its next check.
+	if len(os.Args) > 1 && os.Args[1] == "totp-reset" {
+		os.Exit(totpReset(os.Args[2:]))
+	}
+	// The BOOT button held for 9 seconds (kvm_system): reset the settings.
+	if len(os.Args) > 1 && os.Args[1] == "factory-reset" {
+		os.Exit(factoryReset(os.Args[2:]))
+	}
 	// Ahead of the other boot services until the first viewer is served.
 	startpriority.Raise()
 	ctx, stopMemory := context.WithCancel(context.Background())
@@ -42,8 +57,10 @@ func main() {
 	go logs.RunArchive(ctx)
 	go acme.RunRenewal(ctx)
 	go osupdate.RunNoticeSchedule(ctx)
-	go osupdate.RunRepositoryMigrations(ctx)
+	go apkpkg.EnsureBasePackages(ctx)
 	go vm.ReconcileMdnsAfterBoot(ctx)
+	network.PublishDiscovery()
+	journalStart()
 	defer func() { stopMemory(); dispose() }()
 
 	run()
@@ -142,6 +159,12 @@ func initialize(stopMemory context.CancelFunc) {
 			logrus.Errorf("failed to program the monitor profile on the first start: %v", err)
 		} else if path != "" {
 			logrus.Infof("programmed the monitor profile %s on the first start", path)
+			if common.MonitorPowerCyclePending() {
+				// Nobody watched this write: a Cube or Lite takes the new EDID,
+				// such as the RGB range that corrects pale colours, only after
+				// a power cycle.
+				notify.Emit(notify.Event{Kind: notify.KindHDMI, Severity: notify.SeverityWarning, Message: "hdmi.power-cycle"})
+			}
 		}
 	}()
 
@@ -170,8 +193,10 @@ func run() {
 		// Every request is the administrator: other sites must not read
 		// the API or post to the device from the user's browser. Only the
 		// origins in security.allowedOrigins (a development web server)
-		// get cross-origin access.
-		r.Use(middleware.AllowedOriginCORS(), middleware.RejectCrossOriginWrites())
+		// get cross-origin access, and over plain HTTP only the device's
+		// own names: another site's name rebound to the device's address
+		// would pass the origin checks.
+		r.Use(middleware.RequireDeviceHost(), middleware.AllowedOriginCORS(), middleware.RejectCrossOriginWrites())
 	}
 
 	router.Init(r)
@@ -197,15 +222,21 @@ func run() {
 		httpsPortStr := strconv.Itoa(conf.Port.Https)
 
 		go func() {
-			server := utils.NewHTTPServer(utils.ListenAddr(conf.Host, httpsPortStr), r, os.Getenv("NANOKVM_HTTP2") != "off")
+			server := utils.NewHTTPServer(utils.ListenAddr(conf.Host, httpsPortStr), r, true)
 			// The pair comes from ServerCertificate, so an uploaded or renewed
 			// certificate applies to new connections without a restart.
-			server.TLSConfig = &tls.Config{GetCertificate: utils.ServerCertificate.GetCertificate}
+			// "h2" in NextProtos makes Serve set up HTTP/2 (see TLSListener).
+			server.TLSConfig = &tls.Config{
+				GetCertificate: utils.ServerCertificate.GetCertificate,
+				NextProtos:     []string{"h2", "http/1.1"},
+			}
 			listener, err := net.Listen("tcp", server.Addr)
 			if err != nil {
 				panic("start https server failed")
 			}
-			if err := server.ServeTLS(utils.RawListener(listener), "", ""); err != nil {
+			markListening()
+			limited := utils.LimitConnections(utils.RawListener(listener))
+			if err := server.Serve(utils.TLSListener(limited, server.TLSConfig)); err != nil {
 				panic("start https server failed")
 			}
 		}()
@@ -244,13 +275,49 @@ func run() {
 			}()
 		}
 
-		if err := utils.NewHTTPServer(httpAddr, r, true).ListenAndServe(); err != nil {
+		server := utils.NewHTTPServer(httpAddr, r, true)
+		listener, err := net.Listen("tcp", server.Addr)
+		if err != nil {
+			panic("start http server failed")
+		}
+		markListening()
+		if err := server.Serve(utils.LimitConnections(listener)); err != nil {
 			panic("start http server failed")
 		}
 	}
 }
 
+// markListening tells nanokvm-app that the web server accepts connections:
+// the boot services after it wait for this file (S95nanokvm removes it).
+func markListening() {
+	if err := os.WriteFile("/run/nanokvm/listening", nil, 0o644); err != nil {
+		log.Printf("cannot mark the server listening: %v", err)
+	}
+}
+
 func dispose() {
+	// Let go of a button a press still holds before the process ends.
+	if err := gpioio.Stop(); err != nil {
+		log.Printf("cannot release the ATX buttons: %v", err)
+	}
 	common.GetKvmVision().Close()
 	_ = logs.FlushArchives()
+}
+
+// journalStart records the start of the server, with the OS version and,
+// on the first start of a boot, why the chip came on.
+func journalStart() {
+	version := "?"
+	if raw, err := os.ReadFile("/kvmapp/version"); err == nil {
+		version = strings.TrimSpace(string(raw))
+	}
+	message, severity := "system.started", "info"
+	if reason := bootReason(); reason != "" {
+		message = "system.started." + reason
+		if reason == "watchdog" || reason == "overheat" {
+			severity = "warning"
+		}
+	}
+	journal.Default.Add(journal.Entry{Kind: "system", Severity: severity, Message: message,
+		Vars: map[string]string{"version": version, "actor": "NanoKVM"}})
 }

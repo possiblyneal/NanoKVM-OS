@@ -18,11 +18,13 @@ var settings = strings.Fields(`
  etc/kvm/mouse-jiggler etc/kvm/oled_sleep etc/kvm/oled_layout etc/kvm/memory.conf etc/kvm/GOMEMLIMIT
  etc/kvm/web-title etc/kvm/update-check.disabled etc/kvm/cpufreq etc/kvm/cpufreq.boot
  etc/kvm/monitor_resolution etc/kvm/monitor_portrait
- etc/kvm/monitor_portrait_resolution etc/kvm/monitor_edid_sha256
+ etc/kvm/monitor_portrait_resolution etc/kvm/monitor_edid_sha256 etc/kvm/monitor_identity
  etc/kvm/shortcuts.json etc/kvm/server.yaml etc/kvm/ssh_stop etc/kvm/mdns_disabled
- etc/kvm/hevc_vi_direct etc/kvm/hdmi_disable etc/kvm/hdmi_idle_timeout
- etc/kvm/mcp.json etc/kvm/ai-control.mode etc/kvm/autostart.list
- etc/kvm/wifi.ssid etc/kvm/wifi.pass etc/kvm/wifi.disabled etc/kvm/wifi.band_preference
+ etc/kvm/hevc_vi_direct etc/kvm/watermark.json etc/kvm/hdmi_disable etc/kvm/hdmi_idle_timeout etc/kvm/atx etc/kvm/screen-text-off
+ etc/kvm/mcp.json etc/kvm/ai-control.mode etc/kvm/autostart.list etc/kvm/host-sensors
+ etc/kvm/wifi.ssid etc/kvm/wifi.pass etc/kvm/wifi.disabled etc/kvm/wifi.band_preference etc/kvm/wifi.country
+ etc/kvm/wifi.ap.enabled etc/kvm/wifi.ap.ssid etc/kvm/wifi.ap.pass etc/kvm/wifi.ap.band etc/kvm/wifi.ap.channel
+ etc/kvm/wifi.ap.hidden etc/kvm/wifi.ap.subnet etc/kvm/wifi.ap.internet etc/kvm/wifi.ap.dns
  etc/kvm/usb-before-rustdesk.json
  etc/kvm/picoclaw-runtime.json etc/kvm/pwd
  kvmapp/kvm/fps kvmapp/kvm/qlty kvmapp/kvm/res kvmapp/kvm/type
@@ -63,7 +65,8 @@ func allowed(p string) bool {
 func users(p string) bool { return p == "etc/kvm/pwd" || p == "root/.ssh/authorized_keys" }
 func portable(p string) bool {
 	// A clone retains its own credentials, identity, network and hardware policy.
-	if users(p) || strings.HasPrefix(p, "etc/ssh/") || strings.HasPrefix(p, "boot/") || strings.HasPrefix(p, "etc/kvm/wifi") || strings.HasPrefix(p, "etc/kvm/network/") || strings.HasPrefix(p, "etc/kvm/monitor_") {
+	// ATX depends on the board (a Cube needs the KVM-B board), so a clone keeps its own.
+	if users(p) || p == "etc/kvm/atx" || strings.HasPrefix(p, "etc/ssh/") || strings.HasPrefix(p, "boot/") || strings.HasPrefix(p, "etc/kvm/wifi") || strings.HasPrefix(p, "etc/kvm/network/") || strings.HasPrefix(p, "etc/kvm/monitor_") {
 		return false
 	}
 	for _, prefix := range []string{"etc/kvm/wireguard/", "etc/kvm/openvpn/", "etc/kvm/tls/", "etc/kvm/acme/", "etc/nanokvm-rustdesk/", "root/.picoclaw/", "etc/kvm/usb/"} {

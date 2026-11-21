@@ -34,14 +34,6 @@ func MonitorPortraitStatus() (enabled bool, supported bool) {
 	return monitorPortraitEnabledLocked(), portraitSupportedLocked()
 }
 
-// PortraitSupported reports whether the portrait monitor profile can be
-// applied on this device. The native extended capture path requires the
-// QHD video memory (at least 54 MiB, see VideoPool).
-func PortraitSupported() bool {
-	_, supported := MonitorPortraitStatus()
-	return supported
-}
-
 // PortraitResolution returns the persisted portrait profile choice. Invalid
 // or missing state falls back to the known 1080x1920 profile.
 func PortraitResolution() uint16 {
@@ -60,8 +52,10 @@ func PortraitMaxSupported() bool {
 	return portraitMaxSupportedLocked()
 }
 
-// PortraitSupportedFor and PortraitMaxSupportedFor are PortraitSupported and
-// PortraitMaxSupported with another video pool than the booted one: the pool
+// PortraitSupportedFor and PortraitMaxSupportedFor report whether the portrait
+// and the maximum portrait profiles can be applied with another video pool
+// than the booted one (the native extended capture path requires the QHD
+// video memory, at least 54 MiB, see VideoPool): the pool
 // of a video memory mode the device would restart into.
 func PortraitSupportedFor(p VideoPool) bool {
 	monitorMutex.Lock()
@@ -259,7 +253,9 @@ func savedPortraitResolutionLocked() uint16 {
 	return resolution
 }
 
-func applyMonitorProfileLocked(path string) error {
+// applyMonitorProfileLocked writes a profile with an identity (nil: the
+// profile as shipped) and records the hash of what was written.
+func applyMonitorProfileLocked(path string, id *MonitorIdentity) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("monitor profile is unavailable: %w", err)
@@ -267,10 +263,22 @@ func applyMonitorProfileLocked(path string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("monitor profile is unavailable: %s is not a regular file", path)
 	}
-	if err = GetKvmVision().ApplyMonitorProfile(path); err != nil {
+	data, err := monitorProfileBytes(path, id)
+	if err != nil {
+		return fmt.Errorf("monitor profile is unavailable: %w", err)
+	}
+	target := path
+	if id != nil {
+		target = monitorIdentityProfileFile
+		if err := os.WriteFile(target, data, 0600); err != nil {
+			return fmt.Errorf("preparing the monitor profile failed: %w", err)
+		}
+		defer os.Remove(target)
+	}
+	if err = GetKvmVision().ApplyMonitorProfile(target); err != nil {
 		return err
 	}
-	recordMonitorProfileLocked(path)
+	recordMonitorProfileLocked(data)
 	return nil
 }
 

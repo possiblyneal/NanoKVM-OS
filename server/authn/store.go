@@ -52,6 +52,8 @@ type User struct {
 	TokenVersion       uint64 `json:"tokenVersion"`
 	MustChangePassword bool   `json:"mustChangePassword,omitempty"`
 	SystemAccount      bool   `json:"systemAccount,omitempty"`
+	// TOTP is the second factor; nil when it is off.
+	TOTP *TOTP `json:"totp,omitempty"`
 }
 
 type UserInfo struct {
@@ -59,6 +61,7 @@ type UserInfo struct {
 	Role          Role   `json:"role"`
 	Enabled       bool   `json:"enabled"`
 	SystemAccount bool   `json:"systemAccount,omitempty"`
+	TOTPEnabled   bool   `json:"totpEnabled,omitempty"`
 }
 
 type UserPatch struct {
@@ -122,6 +125,13 @@ func ValidatePassword(password string) error {
 	if length < 8 || length > 72 {
 		return errors.New("password must be between 8 and 72 bytes")
 	}
+	// Root's password is set from it through passwd, one line each: a line
+	// break would set another password.
+	for _, r := range password {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("password must not contain control characters")
+		}
+	}
 	return nil
 }
 
@@ -141,6 +151,7 @@ func (s *Store) List() ([]UserInfo, error) {
 			Role:          user.Role,
 			Enabled:       user.Enabled,
 			SystemAccount: user.SystemAccount,
+			TOTPEnabled:   user.TOTP != nil,
 		})
 	}
 	return users, nil
@@ -359,20 +370,11 @@ func (s *Store) Delete(actor, username string) error {
 	return s.saveLocked(db)
 }
 
-func (s *Store) SetPassword(username, password string) (*User, error) {
-	return s.SetPasswordAndRun(username, password, nil)
-}
-
-// SetPasswordAndRun commits the web password before running the optional
+// SetPasswordAndRunIf commits the web password before running the optional
 // system-side update. If that update fails, the account record is rolled back
-// while the store lock is still held.
-func (s *Store) SetPasswordAndRun(username, password string, afterCommit func() error) (*User, error) {
-	return s.SetPasswordAndRunIf(username, password, nil, afterCommit)
-}
-
-// SetPasswordAndRunIf is SetPasswordAndRun when the account passes expect,
-// checked under the store lock with the change, so the account cannot
-// change between the check and the commit.
+// while the store lock is still held. A non-nil expect must accept the
+// account, checked under the store lock with the change, so the account
+// cannot change between the check and the commit.
 func (s *Store) SetPasswordAndRunIf(username, password string, expect func(User) error, afterCommit func() error) (*User, error) {
 	if err := ValidatePassword(password); err != nil {
 		return nil, err
@@ -647,6 +649,7 @@ func cloneUser(user *User) *User {
 		return nil
 	}
 	copy := *user
+	copy.TOTP = user.TOTP.clone()
 	return &copy
 }
 

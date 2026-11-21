@@ -1,14 +1,14 @@
-import { Tooltip } from 'antd';
 import { useSetAtom } from 'jotai';
 import { useTranslation } from 'react-i18next';
 
 import { releasePointerMenuFocus } from '@/lib/menu-focus.ts';
 import { picoclawChatOpenAtom } from '@/jotai/picoclaw.ts';
 import { Robot } from '@/components/icons/robot.tsx';
+import { MenuTooltip } from '@/components/menu-tooltip.tsx';
 import { useDismissMobileMenu } from '@/components/mobile-menu-context.ts';
 
 type PicoclawProps = {
-  tooltipPlacement?: 'bottom' | 'left' | 'right';
+  tooltipPlacement?: 'top' | 'bottom' | 'left' | 'right';
 };
 
 export const Picoclaw = ({ tooltipPlacement = 'bottom' }: PicoclawProps) => {
@@ -17,7 +17,7 @@ export const Picoclaw = ({ tooltipPlacement = 'bottom' }: PicoclawProps) => {
   const dismissMobileMenu = useDismissMobileMenu();
 
   return (
-    <Tooltip title={t('picoclaw.title')} mouseEnterDelay={0.6} placement={tooltipPlacement}>
+    <MenuTooltip title={t('picoclaw.title')} placement={tooltipPlacement}>
       <div
         role="button"
         tabIndex={0}
@@ -29,7 +29,7 @@ export const Picoclaw = ({ tooltipPlacement = 'bottom' }: PicoclawProps) => {
           }
         }}
         aria-label={t('picoclaw.title')}
-        className="flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded text-neutral-300 hover:bg-neutral-700/80 hover:text-white"
+        className="hover:text-fg-strong flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded text-neutral-300 hover:bg-neutral-700/80"
         onClick={(event) => {
           releasePointerMenuFocus(event);
           dismissMobileMenu();
@@ -38,6 +38,6 @@ export const Picoclaw = ({ tooltipPlacement = 'bottom' }: PicoclawProps) => {
       >
         <Robot size={18} />
       </div>
-    </Tooltip>
+    </MenuTooltip>
   );
 };

@@ -14,7 +14,7 @@ scripts:
 - `/kvmapp` carries the current server, web UI and native vendor libraries;
 - `/data` remains exFAT;
 - partition 2 remains F2FS;
-- OpenRC wrappers call the already qualified board scripts in a visible order.
+- OpenRC wrappers call the existing board scripts in a visible order.
 
 There is no A/B partition scheme and no automatic rollback timer. Development
 FITs can be loaded manually from U-Boot. The installed migration uses a one-shot
@@ -83,35 +83,27 @@ The target repository list is:
 
 1. the signed NanoKVM repository on GitHub Pages, read through its v3 index
    (`https://dormancygrace.github.io/NanoKVM-OS/alpine/v3.24/riscv64/Packages.adb`; see [signing keys](#signing-keys));
-2. Alpine v3.24 `main`.
+2. Alpine v3.24 `main`;
+3. Alpine v3.24 `community`, right after `main` and from the same mirror.
 
-Alpine v3.24 `community` is off by default: the image needs nothing from it,
-and every apk run would parse its index too. The Software page switches it on
-(placed right after `main`, from the same mirror), and installing Tailscale or
-NetBird does so itself. The page refuses to switch it off while installed
-packages come only from it, and names them.
+A device updated from a release without the `community` line gets it from
+`nanokvm-base` (its post-upgrade script). A list that already has a
+`community` line of the same Alpine branch, from any mirror, stays as it is,
+and so does a list without an Alpine `main` line (a custom setup). The
+server adds the line again if it was removed, when it installs Tailscale or
+NetBird or a missing package of the network services.
 
-Devices from releases up to 3.2 list `community`. The server decides once
-(`server/osupdate/community.go`), after the edge migration below: it removes
-the line when `apk list --orphaned` shows no installed package that only
-`community` provides, and keeps it otherwise. It waits while `exfatprogs` or
-`i2c-tools` from `community` are still installed, until `nanokvm-base` replaces
-them, and while an index cannot be read (apk then warns and reports every
-package as orphaned). `/etc/kvm/apk-community.chosen` records that the decision
-is made, by the server or by the user, and it is not made again.
-
-Tailscale and NetBird come from the stable Alpine `community` repository,
-OpenVPN from `main`. They are optional and absent from the default
-`nanokvm-release` dependency set.
-
-Releases up to 3.1 also listed Alpine `edge/community`, tagged as
-`@edgecommunity`, for Tailscale and NetBird. Every apk run then parsed its index
-too: about 30% of the time of an `apk version` and 10 MB of memory on the
-device. The server removes that line once (`server/osupdate/edge.go`): world
-entries `NAME@edgecommunity` become `NAME>=INSTALLED`, so a package installed
-from edge is not downgraded to the older stable build and follows the stable
-branch once it catches up, and only then does the line go. A world entry with a
-tag that no repository has would stop every apk transaction.
+The OpenVPN 2 client (`openvpn`, from `main`) and the network services LLDP,
+SNMP and UPS (`lldpd` and `nut` from `community`, `net-snmp` from `main`) are
+installed with the system and kept installed; their services are off until
+switched on in the settings. They are not dependencies of `nanokvm-release`:
+apk resolves an update with the repository list it has before the update, and
+a device without the `community` line could not install such a release. The
+image selects them next to `nanokvm-release`; a device updated from a release
+without them gets them from the server shortly after its first start (see
+[updates](../../docs/UPDATES.md#component-versions-and-support)). Tailscale
+and NetBird come from `community` and are optional: they are installed on
+request.
 
 The NanoKVM repository is a rolling package channel within the selected
 stable Alpine branch. New signed revisions become available through ordinary
@@ -121,8 +113,9 @@ reserved for an explicit operator hold or a reproducibility test.
 
 Kernel, matching modules and board FITs use the same APK update path. The kernel
 trigger activates the board-specific FIT and records that a reboot is required.
-Full recovery images remain necessary for partition layout, filesystem, FIP or
-bootloader changes. Moving to another Alpine stable branch is an explicit system
+The bootloader (`fip.bin`) is updated by the `nanokvm-bootloader` package,
+which keeps `/boot/fip.prev` for recovery ([docs/UPDATES.md](../../docs/UPDATES.md));
+partition layout and filesystem changes need a full recovery image. Moving to another Alpine stable branch is an explicit system
 upgrade rather than an incidental package update.
 
 ## Signing keys
@@ -155,7 +148,10 @@ The repository has two indexes of the same abuild packages in `riscv64/`:
 - `APKINDEX.tar.gz`, the v2 index, contains the core abuild packages.
 - `Packages.adb`, the apk-tools v3 index, the same core packages on Pages.
 
-Add-ons have a repository of their own (below), not these indexes.
+Add-ons have a repository of their own (below). Pages makes the v3 index anew
+and adds, of each add-on `nanokvm-release` depends on (`BASE` in
+`scripts/addon_packages.py`), the newest version the channel's OS packages
+satisfy; the v2 index has core packages only.
 
 From v3.4.0 both indexes and every newly built core APK are signed only with
 ECDSA. APK v2 retains the historical `.SIGN.RSA256.<public-key-name>` marker:
@@ -185,12 +181,20 @@ Add-ons are in a repository of their own, one for both channels:
 `https://dormancygrace.github.io/NanoKVM-OS/addons/v3.24/riscv64/Packages.adb`.
 Devices read it from `/etc/apk/repositories.d/nanokvm-addons.list`, a file of
 `nanokvm-base` (from 3.5.0), so the update channel, which rewrites the OS line
-of `/etc/apk/repositories`, leaves it alone. It holds the newest six releases
-of each add-on in `ADDONS` (`scripts/addon_packages.py`) and only a v3 index;
-the OS indexes hold no add-on. An add-on states the first OS release it works
-with as `nanokvm-os>=VERSION` (firmware/alpine/packages/README.md). Devices
-below 3.5.0 have no add-on line: they get add-on updates after updating the
-OS.
+of `/etc/apk/repositories`, leaves it alone. It holds the newest three releases
+of each add-on in `ADDONS` (`scripts/addon_packages.py`) and only a v3 index.
+An add-on states the first OS release it works with as `nanokvm-os>=VERSION`
+(firmware/alpine/packages/README.md).
+
+`nanokvm-release` depends on RustDesk, the computer sensors and the screen
+model (`BASE`) by name, so the image and every device have them, off until
+switched on; they keep their own versions and releases. The image build reads
+the add-on repository next to its own packages, and devices resolve them from
+it. Devices below 3.5.0 have no add-on line: the OS folders hold the
+retained versions of the three too, and their v3 indexes offer the newest
+one that the channel's OS release satisfies (its `nanokvm-os` minimum and
+the server capabilities it needs), so that such a device can update;
+other add-ons reach it after that update.
 
 ### Publishing a release
 
@@ -235,8 +239,8 @@ Pages publishes two independently indexed and signed feeds:
 Stable excludes every prerelease (and beta tags even if mislabelled on GitHub).
 Beta selects the highest stable or beta version; the final release outranks its
 betas. Before the first beta it mirrors Stable. Each feed retains packages
-referenced by its six newest eligible releases. Neither includes add-ons:
-both channels read the one add-on repository. The root latest-image badge stays stable; the
+referenced by its six newest eligible releases. Neither includes add-ons
+other than those of `BASE`: both channels read the one add-on repository. The root latest-image badge stays stable; the
 `beta/latest-image/` page can also point to beta images.
 
 Release assembly compares package contents against the newest tested manifest
@@ -390,14 +394,17 @@ assets; local build output is not needed on this recovery path. Missing or
 corrupt storage stops with its tag in the error; restore its original files
 before retrying. The public OS release is not modified.
 
-To discard and rebuild an **OS version that has never been published**, discard
-both its OS draft and its `os-packages-<version>` release, plus both associated
-tags if present. Check that no published OS version used this storage first.
-Removing only the OS draft is insufficient: the allocator proposes the same
-version again, while the surviving published storage rejects a rebuilt set of
-bytes. This is a deliberate manual cleanup, never an automatic deletion by the
-publisher. Do not apply this procedure to a version that has ever been published;
-issue a new patch/beta version instead, retaining its existing files for clients.
+An **OS version that has never been published** cannot be rebuilt from another
+commit: its packages stay staged for that commit, as the
+`pages-candidate-os-<version>` Actions artifact for 90 days and, once the APK
+repository workflow has run, as the pending `os/<version>` snapshot in the Pages
+catalog, and staging refuses that version from any other commit. To abandon it,
+keep its draft and tag and release the next version instead. Deleting the draft
+does not free the version: the allocator then proposes it again, and the build
+fails at staging. Delete an abandoned draft only once a newer release of its
+channel exists. For a pushed tag, set the next version in `release.env`. Do not
+delete a version that has ever been published; issue a new patch/beta version
+instead, retaining its existing files for clients.
 
 If only the Pages dispatch failed after OS publication, rerunning the publisher
 or dispatching `apk-repository.yml` from main is sufficient. Existing published

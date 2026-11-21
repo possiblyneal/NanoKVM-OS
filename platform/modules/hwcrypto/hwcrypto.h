@@ -5,12 +5,16 @@
 #include <linux/ioctl.h>
 
 #define HWCRYPTO_ABI 1
+/* One message of HWCRYPTO_CTR_SHA1 and one chunk of HWCRYPTO_GCM. HWCRYPTO_RUN
+ * takes up to max_input of HWCRYPTO_INFO (64 KiB). */
 #define HWCRYPTO_MAX 4096
 #define HWCRYPTO_OUT_MAX 8192
+/* 2 to 4 were DES, 3DES and SM4, 7 was Base64, which the driver no longer
+ * offers; the numbers of the others and the size of the counters stay. */
 enum hwcrypto_algorithm {
- HWCRYPTO_ALG_AES = 1, HWCRYPTO_ALG_DES, HWCRYPTO_ALG_TDES, HWCRYPTO_ALG_SM4,
- HWCRYPTO_ALG_SHA1, HWCRYPTO_ALG_SHA256, HWCRYPTO_ALG_BASE64,
- HWCRYPTO_ALG_COUNT
+ HWCRYPTO_ALG_AES = 1,
+ HWCRYPTO_ALG_SHA1 = 5, HWCRYPTO_ALG_SHA256,
+ HWCRYPTO_ALG_COUNT = 8
 };
 enum hwcrypto_mode { HWCRYPTO_MODE_ECB, HWCRYPTO_MODE_CBC, HWCRYPTO_MODE_CTR };
 /* SHA requests transform complete 64-byte blocks. state contains/returns the
@@ -32,5 +36,83 @@ struct hwcrypto_info {
  __aligned_u64 completed[HWCRYPTO_ALG_COUNT];
 };
 #define HWCRYPTO_RUN _IOWR('K', 0xc2, struct hwcrypto_request)
+/* AES-GCM bulk data: AES-CTR with GCM's 32-bit counter on the engine and, while
+ * it runs, GHASH of the ciphertext on the CPU. length is a nonzero multiple of
+ * 16. h is the hash key E_K(0^128); xi (GHASH accumulator) and ctr (counter
+ * block, big-endian 32-bit counter in the last word) are in GCM byte order and
+ * come back advanced over the returned length. If a chunk after the first
+ * fails, the call succeeds with the completed prefix in length. Associated
+ * data, partial blocks, lengths and the tag stay with the caller.
+ *
+ * A failed call leaves the output as it was, with one exception, here and in
+ * HWCRYPTO_RUN: when input and output are the same buffer and the driver has
+ * the engine work on its pages (16-byte alignment; 8 KiB and more here,
+ * 16 KiB and more for HWCRYPTO_RUN with AES), EIO means the engine was given
+ * up while the request ran (another request lost it) and the buffer is partly
+ * written. The caller must fail its operation then. An engine that does not
+ * finish its work on the caller's pages stops the system: see
+ * docs/ACCELERATORS.md.
+ */
+struct hwcrypto_gcm_request {
+ __u32 version, encrypt, key_length, length;
+ __u8 key[32], h[16], xi[16], ctr[16];
+ __aligned_u64 input, output;
+ __u32 reserved[4];
+};
+#define HWCRYPTO_GCM _IOWR('K', 0xc4, struct hwcrypto_gcm_request)
+/* AES-GCM encryption of count whole messages (at most HWCRYPTO_GCM_BATCH_MAX,
+ * each of 1 to HWCRYPTO_MAX bytes) with one key in one start of the engine:
+ * the DTLS records of a burst. A message takes its length rounded up to 16
+ * and 16 bytes more of the driver's buffer, and all of them at most
+ * HWCRYPTO_GCM_BATCH_BYTES: 16 messages of up to 4080 bytes, 15 of
+ * HWCRYPTO_MAX; a larger batch is EINVAL. For each record: j0 is the counter block of
+ * its nonce (the 12-byte nonce, then 00 00 00 01), aad its associated data;
+ * length bytes at data are encrypted in place and the 16-byte tag is written
+ * after them, so data has length + 16 bytes. h is the hash key E_K(0^128).
+ * The results are written after the engine has finished every record; a call
+ * that fails with EFAULT may have written some of them, any other failure
+ * none. A caller that gets an error must not send any of the records.
+ */
+#define HWCRYPTO_GCM_BATCH_MAX 16
+#define HWCRYPTO_GCM_BATCH_BYTES 65536
+struct hwcrypto_gcm_batch_record {
+ __u8 j0[16], aad[16];
+ __u32 aad_length, length;
+ __aligned_u64 data;
+};
+struct hwcrypto_gcm_batch_request {
+ __u32 version, count, key_length, reserved;
+ __u8 key[32], h[16];
+ __aligned_u64 records;
+ __u32 reserved2[4];
+};
+#define HWCRYPTO_GCM_BATCH _IOWR('K', 0xc6, struct hwcrypto_gcm_batch_request)
+/* For each of count messages, in order: AES-128-CTR with key and the
+ * message's iv over crypt_length bytes (a nonzero multiple of 16) at
+ * crypt_offset (a multiple of 4), in place, then SHA-1 from the request's state over the first length
+ * bytes of the message as they are then (a multiple of 64, at most
+ * HWCRYPTO_MAX), the resulting state in the message's state. Both states are
+ * the canonical big-endian bytes; the caller pads the message and finishes
+ * the hash (for HMAC: the inner hash's padding in the message, the outer
+ * block itself). The engine runs the two as one chain, so the hash costs no
+ * second request. count returns the number of messages completed: if one
+ * after the first fails, the call succeeds with that prefix and leaves the
+ * others as they were.
+ */
+#define HWCRYPTO_CTR_SHA1_MAX 64
+struct hwcrypto_ctr_sha1_packet {
+ __aligned_u64 data;
+ __u32 length, crypt_offset, crypt_length, reserved;
+ __u8 iv[16], state[20];
+ __u32 reserved2;
+};
+struct hwcrypto_ctr_sha1_request {
+ __u32 version, count;
+ __u8 key[16], state[20];
+ __u32 reserved;
+ __aligned_u64 packets;
+ __u32 reserved2[4];
+};
+#define HWCRYPTO_CTR_SHA1 _IOWR('K', 0xc5, struct hwcrypto_ctr_sha1_request)
 #define HWCRYPTO_INFO _IOR('K', 0xc3, struct hwcrypto_info)
 #endif

@@ -12,14 +12,13 @@ import (
 
 func TestSignalingReadLimit(t *testing.T) {
 	// No media offer is made: only the actual signaling handler is exercised.
-	t.Setenv("NANOKVM_SRTP_AES", "software")
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.GET("/webrtc", ConnectLegacy)
+	router.GET("/webrtc", Connect)
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
 	dialer := websocket.Dialer{WriteBufferSize: 1024}
-	ws, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/webrtc", nil)
+	ws, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/webrtc?codec=h264", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,9 @@ import { http } from '@/lib/http';
 export type RustDeskConfig = {
   service_enabled: boolean;
   audio_enabled?: boolean;
+  local_pointer?: boolean;
+  // The direct listener: 127.0.0.1 unless connecting by address is on.
+  listen_address?: string;
   webrtc_enabled?: boolean;
   use_official_id_server: boolean;
   rendezvous_server: string;
@@ -14,18 +17,14 @@ export type RustDeskConfig = {
   max_clients: number;
 };
 export type RustDeskStatus = {
-  installed: boolean;
   supports_transport_settings?: boolean;
-  // The device video transport: RustDesk accepts WebRTC when it is webrtc.
-  video_transport?: 'direct' | 'webrtc' | 'mjpeg';
   supports_audio?: boolean;
   supports_audio_settings?: boolean;
+  supports_pointer_settings?: boolean;
   usb_audio_enabled?: boolean;
   version?: string;
   rustdesk_version?: string;
   source_url?: string;
-  update_version?: string;
-  available: boolean;
   running: boolean;
   config: RustDeskConfig;
   has_password: boolean;
@@ -34,14 +33,14 @@ export type RustDeskStatus = {
   runtime?: { registered: boolean; sessions: number };
 };
 export const getRustDeskStatus = (signal?: AbortSignal) =>
-  http.request<RustDeskStatus>({ method: 'get', url: '/api/addons/rustdesk/status', signal });
+  http.request<RustDeskStatus>({ method: 'get', url: '/api/rustdesk/status', signal });
 export const configureRustDesk = (data: RustDeskConfig) =>
   http.request<null>({
     method: 'put',
-    url: '/api/addons/rustdesk/config',
+    url: '/api/rustdesk/config',
     data,
-    timeout: 190000
+    timeout: 190000,
+    sensitive: true
   });
-export const rustDeskPackageAction = (
-  action: 'install' | 'upgrade' | 'remove' | 'check' | 'regenerate-password'
-) => http.post<null>('/api/addons/rustdesk/' + action, undefined, { timeout: 190000 });
+export const regenerateRustDeskPassword = () =>
+  http.post<null>('/api/rustdesk/regenerate-password', undefined, { timeout: 190000 });

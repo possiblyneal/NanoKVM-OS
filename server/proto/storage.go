@@ -2,12 +2,14 @@ package proto
 
 type GetImagesRsp struct {
 	Files []string `json:"files"`
+	// Sizes holds each file's size in bytes, by path.
+	Sizes map[string]int64 `json:"sizes"`
 }
 
 type MountImageReq struct {
-	File  string `json:"file" validate:"omitempty"`
-	Cdrom bool   `json:"cdrom" validate:"omitempty"`
-	Force bool   `json:"force" validate:"omitempty"`
+	File  string `json:"file" form:"file" validate:"omitempty"`
+	Cdrom bool   `json:"cdrom" form:"cdrom" validate:"omitempty"`
+	Force bool   `json:"force" form:"force" validate:"omitempty"`
 }
 
 type GetMountedImageRsp struct {

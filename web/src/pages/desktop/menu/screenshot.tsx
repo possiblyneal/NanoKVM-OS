@@ -1,11 +1,12 @@
 import { useRef, useState } from 'react';
-import { Button, message, Tooltip } from 'antd';
+import { Button, message } from 'antd';
 import { useAtomValue } from 'jotai';
 import { CameraIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { downloadScreenshot } from '@/lib/screenshot.ts';
 import { isHdmiEnabledAtom, screenshotSourceAtom } from '@/jotai/screen.ts';
+import { MenuTooltip } from '@/components/menu-tooltip.tsx';
 
 export const Screenshot = () => {
   const { t } = useTranslation();
@@ -45,17 +46,17 @@ export const Screenshot = () => {
   }
 
   return (
-    <Tooltip title={title} mouseEnterDelay={0.6}>
+    <MenuTooltip title={title}>
       <span className="flex shrink-0">
         <Button
           type="text"
           aria-label={title}
           disabled={!captureEnabled || !source || saving}
-          className={`flex! h-[30px]! w-[30px]! min-w-[30px]! items-center! justify-center! !p-0 [&_.ant-btn-icon]:flex! [&_.ant-btn-icon]:items-center! [&_svg]:block ${!captureEnabled || !source ? '!text-neutral-500' : '!text-neutral-300 hover:!text-white'}`}
+          className={`flex! h-[30px]! w-[30px]! min-w-[30px]! items-center! justify-center! !p-0 [&_.ant-btn-icon]:flex! [&_.ant-btn-icon]:items-center! [&_svg]:block ${!captureEnabled || !source ? '!text-neutral-500' : 'hover:!text-fg-strong !text-neutral-300'}`}
           onClick={() => void takeScreenshot()}
           icon={<CameraIcon size={19} strokeWidth={1.7} />}
         />
       </span>
-    </Tooltip>
+    </MenuTooltip>
   );
 };

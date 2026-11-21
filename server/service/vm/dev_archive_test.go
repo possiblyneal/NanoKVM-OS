@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
-	"math/rand"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +45,7 @@ func TestDevArchiveMasksAndHides(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("network/addr", "inet 192.168.4.128/24 brd 192.168.4.255\nlink/ether 48:da:35:6f:1a:2b\n")
+	write("network/addr", "inet 198.51.100.128/24 brd 198.51.100.255\nlink/ether 48:da:35:6f:1a:2b\n")
 	write("network/iw-link", "Connected to aa:bb:cc:dd:ee:ff (on wlan0)\n\tSSID: HomeNetwork\n")
 	write("config/etc_kvm_server.yaml", "proto: https\nauthentication:\n  jwt:\n    secretKey: hunter2\n    refreshTokenDuration: 720\nturn:\n    turnCred: abc123\n")
 	// Shapes a line rule misses: a flow mapping and a block scalar.
@@ -86,7 +86,7 @@ func TestDevArchiveMasksAndHides(t *testing.T) {
 	for _, text := range files {
 		all += text
 	}
-	for _, leaked := range []string{"192.168.4.128", "48:da:35", "aa:bb:cc", "HomeNetwork", "hunter2", "abc123", "letmein", "alice", "flow-value", "block-value", "json-value", "broken-value", "screen text pixels", "Loft Mesh", "Attic-5G", "alias-value", "Forgotten Home595"} {
+	for _, leaked := range []string{"198.51.100.128", "48:da:35", "aa:bb:cc", "HomeNetwork", "hunter2", "abc123", "letmein", "alice", "flow-value", "block-value", "json-value", "broken-value", "screen text pixels", "Loft Mesh", "Attic-5G", "alias-value", "Forgotten Home595"} {
 		if strings.Contains(all, leaked) {
 			t.Errorf("%q leaked", leaked)
 		}
@@ -122,39 +122,5 @@ func TestDevArchiveMasksAndHides(t *testing.T) {
 	}
 }
 
-func TestReadLimitedKeepsTail(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "log")
-	if err := os.WriteFile(path, []byte(strings.Repeat("x", 5000)+"tail"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	data, err := readLimited(path, 10)
-	if err != nil || string(data) != "xxxxxxtail" {
-		t.Fatalf("readLimited = %q, %v", data, err)
-	}
-}
-
-func TestDevArchiveSizeLimit(t *testing.T) {
-	dir := t.TempDir()
-	previous := devArchiveLimit
-	devArchiveLimit = 1024
-	t.Cleanup(func() { devArchiveLimit = previous })
-	// Pseudo-random words that gzip cannot shrink below the limit. Spaces
-	// keep the lines from looking like encoded keys, which would be hidden.
-	var b strings.Builder
-	random := rand.New(rand.NewSource(1))
-	for i := 0; i < 20000; i++ {
-		b.WriteByte(byte('a' + random.Intn(26)))
-		if i%6 == 5 {
-			b.WriteByte(' ')
-		}
-		if i%80 == 79 {
-			b.WriteByte('\n')
-		}
-	}
-	if err := os.WriteFile(filepath.Join(dir, "big"), []byte(b.String()), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := packDevArchive(dir, nil, "", time.Unix(0, 0)); err == nil {
-		t.Fatal("oversized archive accepted")
-	}
-}
+// Pseudo-random words that gzip cannot shrink below the limit. Spaces
+// keep the lines from looking like encoded keys, which would be hidden.

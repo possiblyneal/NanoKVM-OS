@@ -16,6 +16,19 @@ package common
         int (*fn)(unsigned char) = (int (*)(unsigned char))dlsym(RTLD_DEFAULT, "kvmv_set_capture_fps");
         return fn ? fn(fps) : -1;
     }
+    static int set_first_capture_yuv420(unsigned char want) {
+        int (*fn)(unsigned char) = (int (*)(unsigned char))dlsym(RTLD_DEFAULT, "kvmv_set_first_capture_yuv420");
+        return fn ? fn(want) : -1;
+    }
+    static int set_watermark(const unsigned int *argb, const int *geometry, int count, int ref_width, int margin) {
+        int (*fn)(const unsigned int *, const int *, int, int, int) =
+            (int (*)(const unsigned int *, const int *, int, int, int))dlsym(RTLD_DEFAULT, "kvmv_set_watermark");
+        return fn ? fn(argb, geometry, count, ref_width, margin) : -38;
+    }
+    static int watermark_missing(void) {
+        int (*fn)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "kvmv_watermark_missing");
+        return fn ? fn() : 0;
+    }
     static int capture_reclaim_pending(void) {
         int (*fn)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "kvmv_capture_reclaim_pending");
         // An older library cannot report completion: retain conservative retries.
@@ -34,9 +47,15 @@ package common
             (int (*)(unsigned short, unsigned short, unsigned char *, unsigned int))dlsym(RTLD_DEFAULT, "kvmv_read_bgr_planar");
         return fn ? fn(width, height, out, size) : -9;
     }
+    static int read_bgr_scaled(unsigned short width, unsigned short height, unsigned char *out, unsigned int size) {
+        int (*fn)(unsigned short, unsigned short, unsigned char *, unsigned int) =
+            (int (*)(unsigned short, unsigned short, unsigned char *, unsigned int))dlsym(RTLD_DEFAULT, "kvmv_read_bgr_scaled");
+        return fn ? fn(width, height, out, size) : -9;
+    }
 */
 import "C"
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -85,6 +104,11 @@ func GetKvmVision() *KvmVision {
 			log.Info("native capture worker disabled; using Go-paced blocking frame reads")
 		}
 
+		// kvmv_init starts the first capture; older libraries lack the symbol
+		// and start in 4:2:2. FirstCaptureYUV420 takes monitorMutex, so no
+		// monitorMutex holder may be first to call GetKvmVision: main calls it
+		// (Enable/DisableHdmiCapture) before the monitor profile goroutine.
+		C.set_first_capture_yuv420(C.uchar(boolToInt(FirstCaptureYUV420())))
 		logLevel := C.uint8_t(0)
 		C.kvmv_init(logLevel)
 		// Native VI mutex is ready; apply intent before HDMI readers start.
@@ -92,6 +116,9 @@ func GetKvmVision() *KvmVision {
 			log.Error("failed to select saved MJPEG chroma")
 		}
 		C.set_frame_detact(C.uint8_t(FrameDetectFrames(FrameDetectEnabled())))
+		if err := applyWatermark(kvmVision); err != nil {
+			log.Errorf("watermark not applied: %v", err)
+		}
 		log.Debugf("kvm vision initialized")
 	})
 
@@ -109,7 +136,7 @@ func (k *KvmVision) ReadMjpeg(width uint16, height uint16, quality uint16) (data
 		if k.closed {
 			return nil, -1
 		}
-		defer k.pauseCaptureLocked()()
+		// No pause of the video stream: see pauseCaptureLocked.
 		return readMjpegIntoOwnedStorage(width, height, quality)
 	})
 	// A refusal repeats on every tick while the input is 3840x2160.
@@ -121,17 +148,24 @@ func (k *KvmVision) ReadMjpeg(width uint16, height uint16, quality uint16) (data
 
 // ReadMjpegTiles reads tiled MJPEG (kvm_vision.h): MjpegTilesResult with a
 // message, 0 with a bare JPEG of the whole picture, 5 when nothing changed,
-// MjpegTilesUnsupported from a library without it.
-func (k *KvmVision) ReadMjpegTiles(width, height, quality uint16, key bool, maxTiles uint16) (data []byte, result int) {
+// MjpegTilesUnsupported from a library without it. With a bare JPEG, framed
+// is the same JPEG behind room for a whole-picture message header
+// (MjpegTilesWholeInPlace), or nil.
+func (k *KvmVision) ReadMjpegTiles(width, height, quality uint16, key bool, maxTiles uint16) (data, framed []byte, result int) {
 	data, result = readMjpegChecked(func() ([]byte, int) {
 		k.mutex.Lock()
 		defer k.mutex.Unlock()
 		if k.closed {
 			return nil, -1
 		}
-		defer k.pauseCaptureLocked()()
-		return readMjpegTilesIntoOwnedStorage(width, height, quality, key, maxTiles)
+		var data []byte
+		var result int
+		data, framed, result = readMjpegTilesIntoOwnedStorage(width, height, quality, key, maxTiles)
+		return data, result
 	})
+	if result != 0 {
+		framed = nil
+	}
 	if result < 0 && result != MjpegBlockedResult && result != MjpegTilesUnsupported {
 		log.Errorf("failed to read tiled kvm image: %v", result)
 	}
@@ -216,9 +250,20 @@ func (k *KvmVision) captureWorkerLocked() *videoCaptureWorker {
 }
 
 // Go-paced reads held k.mutex for their whole duration. The native-paced
-// stream reads without it, so every other native operation pauses the stream
-// and waits for its read in flight. The caller holds k.mutex (either mode)
-// and calls the returned function when done.
+// stream reads without it, so a native operation that changes the capture
+// pauses the stream and waits for its read in flight. The caller holds
+// k.mutex (either mode) and calls the returned function when done.
+//
+// A JPEG read is not such an operation: the library runs it beside a video
+// read under its own locks (vi_mutex, the JPEG reader mutex and the JPEG
+// hold), and on MJPEG's own output it waits for its frame and encodes with
+// vi_mutex released so that the video stream reads on. Pausing the stream for
+// every JPEG read made the two take turns: a 2560x1440 H.265 stream (15 ms a
+// frame in the encoder) beside an MJPEG viewer (about 22 ms a read: its frame
+// at 33 fps, the change map, the JPEG) ran at 27 fps each, with a third of the
+// CPU idle. Without the pause the video stream keeps 59 to 60 fps there and
+// MJPEG gets 23 to 26 (the library gives a waiting JPEG read the next turn
+// at its capture lock), with the CPU 91 to 93 % busy.
 func (k *KvmVision) pauseCaptureLocked() func() {
 	if k.capture == nil {
 		return func() {}
@@ -267,13 +312,33 @@ func (k *KvmVision) SetCaptureParked(parked bool) int {
 // height (even, at most 1920 wide) as B, G and R planes, the TPU models' input
 // layout. The capture must run: hold a capture lease while reading.
 func (k *KvmVision) ReadBGRPlanar(width, height int) ([]byte, error) {
+	return k.readBGR(width, height, false)
+}
+
+// ReadBGRScaled returns the whole screen scaled down by VPSS to width x
+// height (even, no larger than the input) in the same layout, whatever the
+// input's size. It comes from a VPSS channel of its own: the outputs of the
+// video and their encoders are not touched. Hold a capture lease while
+// reading.
+func (k *KvmVision) ReadBGRScaled(width, height int) ([]byte, error) {
+	return k.readBGR(width, height, true)
+}
+
+func (k *KvmVision) readBGR(width, height int, scaled bool) ([]byte, error) {
 	k.mutex.RLock()
 	defer k.mutex.RUnlock()
 	if k.closed {
 		return nil, ErrPlanarPictureUnavailable
 	}
 	out := make([]byte, width*height*3)
-	switch result := C.read_bgr_planar(C.ushort(width), C.ushort(height), (*C.uchar)(unsafe.Pointer(&out[0])), C.uint(len(out))); result {
+	data, size := (*C.uchar)(unsafe.Pointer(&out[0])), C.uint(len(out))
+	var result C.int
+	if scaled {
+		result = C.read_bgr_scaled(C.ushort(width), C.ushort(height), data, size)
+	} else {
+		result = C.read_bgr_planar(C.ushort(width), C.ushort(height), data, size)
+	}
+	switch result {
 	case 0:
 		return out, nil
 	case -9:
@@ -311,6 +376,33 @@ func (k *KvmVision) HasHDMISignal() bool {
 	}
 
 	return C.kvmv_hdmi_signal_active() != 0
+}
+
+// SetWatermark gives the native library the watermark blocks (mmf_watermark_set:
+// pixels one block after another, four ints of geometry each; no blocks
+// removes it): the regions shown, or a negative errno.
+func (k *KvmVision) SetWatermark(argb []uint32, geometry []int32, margin int) int {
+	k.mutex.RLock()
+	defer k.mutex.RUnlock()
+	if k.closed {
+		return -1
+	}
+	if len(argb) == 0 || len(geometry) < 4 {
+		return int(C.set_watermark(nil, nil, 0, 0, 0))
+	}
+	return int(C.set_watermark((*C.uint)(unsafe.Pointer(&argb[0])), (*C.int)(unsafe.Pointer(&geometry[0])),
+		C.int(len(geometry)/4), C.int(WatermarkRefWidth), C.int(margin)))
+}
+
+// WatermarkMissing is the number of watermark blocks missing on enabled
+// outputs after the native library's last attempt.
+func (k *KvmVision) WatermarkMissing() int {
+	k.mutex.RLock()
+	defer k.mutex.RUnlock()
+	if k.closed {
+		return 0
+	}
+	return int(C.watermark_missing())
 }
 
 func (k *KvmVision) SetFrameDetect(frame uint8) {
@@ -374,7 +466,10 @@ func (k *KvmVision) ApplyMonitorProfile(path string) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	args := []string{path}
+	pendingBefore := false
 	if cube {
+		_, statErr := os.Stat(monitorPowerCyclePendingFile)
+		pendingBefore = statErr == nil
 		// Marker is durable before writing: even a timeout or process crash can
 		// leave receiver flash changed. Do not erase it on uncertain failure.
 		if err := atomicWriteMonitorFile(monitorPowerCyclePendingFile, []byte("1\n"), ".monitor_pending-*"); err != nil {
@@ -387,8 +482,19 @@ func (k *KvmVision) ApplyMonitorProfile(path string) (err error) {
 		log.Errorf("monitor EDID programming failed: %v: %s", err, output)
 		return fmt.Errorf("monitor EDID programming failed")
 	}
+	// The receiver already held this EDID and its flash was not written: no
+	// power cycle is needed for it, so the reminder this call raised goes.
+	if cube && !pendingBefore && bytes.Contains(output, []byte(edidWriteSkipped)) {
+		if err := os.Remove(monitorPowerCyclePendingFile); err != nil && !os.IsNotExist(err) {
+			log.Warnf("cannot clear the power-cycle reminder: %v", err)
+		}
+	}
 	return nil
 }
+
+// edidWriteSkipped is what nanokvm_update_edid prints when the receiver
+// already holds the requested EDID.
+const edidWriteSkipped = "Requested EDID already installed; flash write skipped"
 
 // ReadMonitorEDID copies the HDMI receiver's EDID (256 bytes) under the same
 // serialization as ApplyMonitorProfile: nanokvm_update_edid reads it with the
@@ -474,8 +580,6 @@ func GetMjpegChromaStatus() (uint16, string) {
 		reason = "video"
 	case state&uint8(C.MJPEG_CHROMA_FRAME_DETECT) != 0:
 		reason = "frameDetection"
-	case state&uint8(C.MJPEG_CHROMA_FORCE_COPY) != 0:
-		reason = "diagnostic"
 	}
 	return active, reason
 }

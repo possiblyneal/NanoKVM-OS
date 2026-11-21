@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"NanoKVM-Server/journal"
 	"NanoKVM-Server/service/controlmode"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -159,7 +161,10 @@ func powerHandler(executor *toolExecutor, power PowerControl) protocol.ToolHandl
 			return nil, ToolOKResult{}, err
 		}
 		defer release()
-		if err := power.Do(ctx, action); err != nil {
+		// As with Redfish, an accepted action finishes even if the client goes away.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer cancel()
+		if err := power.Do(journal.WithActor(ctx, "MCP"), action); err != nil {
 			return nil, ToolOKResult{}, err
 		}
 		return nil, ToolOKResult{OK: true}, nil

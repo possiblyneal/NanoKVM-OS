@@ -18,7 +18,6 @@ use crate::{
     config::Config,
     framing::write_message,
     identity::RustDeskIdentity,
-    nanokvm::Identity,
     protocol::{
         relay_response, rendezvous_message, ConnType, RegisterPeer, RegisterPk, RegisterPkResult,
         RelayResponse, RendezvousMessage, RequestRelay,
@@ -35,7 +34,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub async fn run(
     config: Arc<Config>,
-    app_identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     mut shutdown: watch::Receiver<bool>,
     limits: server::ClientLimits,
@@ -49,7 +47,6 @@ pub async fn run(
         let started = time::Instant::now();
         let result = run_once(
             Arc::clone(&config),
-            Arc::clone(&app_identity),
             Arc::clone(&rustdesk_identity),
             shutdown.clone(),
             limits.clone(),
@@ -84,7 +81,6 @@ pub async fn run(
 
 async fn run_once(
     config: Arc<Config>,
-    app_identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     mut shutdown: watch::Receiver<bool>,
     limits: server::ClientLimits,
@@ -189,7 +185,6 @@ async fn run_once(
                         spawn_requested_relay(
                             request,
                             Arc::clone(&config),
-                            Arc::clone(&app_identity),
                             Arc::clone(&rustdesk_identity),
                             shutdown.clone(),
                             limits.clone(),
@@ -204,33 +199,32 @@ async fn run_once(
                             if !request.force_relay                                 && request.nat_type != crate::protocol::NatType::Symmetric as i32
                                 && request.webrtc_sdp_offer.is_empty()
                             {
-                                crate::direct::spawn(crate::direct::Request {peer:request.socket_addr, peer_v6:request.socket_addr_v6,relay:request.relay_server,lan:false},Arc::clone(&config),Arc::clone(&app_identity),Arc::clone(&rustdesk_identity),shutdown.clone(),limits.clone());
+                                crate::direct::spawn(crate::direct::Request {peer:request.socket_addr, peer_v6:request.socket_addr_v6,relay:request.relay_server,lan:false},Arc::clone(&config),Arc::clone(&rustdesk_identity),shutdown.clone(),limits.clone());
                                 continue;
                             }
                             spawn_fallback_relay(request.socket_addr, request.socket_addr_v6, request.relay_server,
-                                Arc::clone(&config), Arc::clone(&app_identity), Arc::clone(&rustdesk_identity),
+                                Arc::clone(&config), Arc::clone(&rustdesk_identity),
                                 shutdown.clone(), limits.clone());
                         } else {
                             let manager = webrtc.clone();
                             let config = Arc::clone(&config);
-                            let app = Arc::clone(&app_identity);
                             let rd = Arc::clone(&rustdesk_identity);
                             let shutdown = shutdown.clone();
                             let limits = limits.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = manager.answer(&request, Arc::clone(&config), Arc::clone(&app),
+                                if let Err(error) = manager.answer(&request, Arc::clone(&config),
                                     Arc::clone(&rd), shutdown.clone(), limits.clone()).await {
                                     if *shutdown.borrow(){return}
                                     eprintln!("RustDesk WebRTC unavailable: {error}; using relay");
                                     spawn_fallback_relay(request.socket_addr, request.socket_addr_v6, request.relay_server,
-                                        config, app, rd, shutdown, limits);
+                                        config, rd, shutdown, limits);
                                 }
                             });
                         }
                     }
                     Some(rendezvous_message::Union::FetchLocalAddr(request)) => {
                         let limits=limits.with_permissions(request.control_permissions.as_ref());
-                        crate::direct::spawn(crate::direct::Request{peer:request.socket_addr,peer_v6:request.socket_addr_v6,relay:request.relay_server,lan:true},Arc::clone(&config),Arc::clone(&app_identity),Arc::clone(&rustdesk_identity),shutdown.clone(),limits);
+                        crate::direct::spawn(crate::direct::Request{peer:request.socket_addr,peer_v6:request.socket_addr_v6,relay:request.relay_server,lan:true},Arc::clone(&config),Arc::clone(&rustdesk_identity),shutdown.clone(),limits);
                     }
                     _ => {}
                 }
@@ -243,7 +237,6 @@ async fn run_once(
 fn spawn_requested_relay(
     request: RequestRelay,
     config: Arc<Config>,
-    app_identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     shutdown: watch::Receiver<bool>,
     limits: server::ClientLimits,
@@ -286,7 +279,6 @@ fn spawn_requested_relay(
                 peer,
                 request.secure,
                 config,
-                app_identity,
                 rustdesk_identity,
                 shutdown,
                 limits,
@@ -306,7 +298,6 @@ pub(crate) fn spawn_fallback_relay(
     socket_addr_v6: Vec<u8>,
     offered_relay: String,
     config: Arc<Config>,
-    app_identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     shutdown: watch::Receiver<bool>,
     limits: server::ClientLimits,
@@ -353,7 +344,6 @@ pub(crate) fn spawn_fallback_relay(
                 peer,
                 true,
                 config,
-                app_identity,
                 rustdesk_identity,
                 shutdown,
                 limits,
@@ -374,7 +364,6 @@ async fn connect_relay(
     peer: SocketAddr,
     secure: bool,
     config: Arc<Config>,
-    app_identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     shutdown: watch::Receiver<bool>,
     limits: server::ClientLimits,
@@ -386,7 +375,7 @@ async fn connect_relay(
         ));
     }
     let pending_permit = limits
-        .try_pending()
+        .try_requested(peer.ip())
         .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "too many pending handshakes"))?;
     let target = time::timeout(CONNECT_TIMEOUT, relay_target(&config, &relay))
         .await
@@ -417,7 +406,6 @@ async fn connect_relay(
         stream,
         peer,
         config,
-        app_identity,
         rustdesk_identity,
         secure,
         shutdown,
@@ -497,7 +485,10 @@ async fn check_relay(
     addresses: Vec<SocketAddr>,
 ) -> io::Result<Vec<SocketAddr>> {
     if addresses.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "relay did not resolve"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "relay did not resolve",
+        ));
     }
     let host = address_host(relay);
     let configured = [config.relay_server.trim(), config.rendezvous_server.trim()]
@@ -541,7 +532,10 @@ async fn rendezvous_is_private(config: &Config) -> bool {
     let Ok(hbbs) = server_address(&config.rendezvous_server, RENDEZVOUS_PORT) else {
         return false;
     };
-    let Ok(Some(remote)) = lookup_host(hbbs).await.map(|mut addresses| addresses.next()) else {
+    let Ok(Some(remote)) = lookup_host(hbbs)
+        .await
+        .map(|mut addresses| addresses.next())
+    else {
         return false;
     };
     note_rendezvous(config, remote);
@@ -863,10 +857,9 @@ mod tests {
             let video = time::timeout(Duration::from_secs(20), async {
                 let mut count = 0;
                 while count < 120 {
-                    let message: Message = reader
-                        .read()
-                        .await
-                        .unwrap_or_else(|error| panic!("video ended after {count} messages: {error}"));
+                    let message: Message = reader.read().await.unwrap_or_else(|error| {
+                        panic!("video ended after {count} messages: {error}")
+                    });
                     if let Some(message::Union::VideoFrame(video)) = message.union {
                         let frames = match video.union {
                             Some(video_frame::Union::H264s(frames))
@@ -901,14 +894,40 @@ mod tests {
     #[test]
     fn only_internet_addresses_are_public() {
         for private in [
-            "0.0.0.0", "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.1.1",
-            "100.64.0.1", "192.0.0.8", "192.0.2.1", "198.18.0.1", "224.0.0.1", "240.0.0.1",
-            "255.255.255.255", "::", "::1", "fc00::1", "fd12::1", "fe80::1", "fec0::1",
-            "2001:db8::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "64:ff9b::1",
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "192.0.0.8",
+            "192.0.2.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "fec0::1",
+            "2001:db8::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::1",
         ] {
             assert!(!super::is_public(private.parse().unwrap()), "{private}");
         }
-        for public in ["1.1.1.1", "8.8.8.8", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        for public in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.128.0.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(super::is_public(public.parse().unwrap()), "{public}");
         }
     }
@@ -929,14 +948,26 @@ mod tests {
             rendezvous_server: "1.1.1.1".into(),
             ..Default::default()
         };
-        for refused in ["192.168.1.1:6379", "127.0.0.1:6379", "[::1]:11211", "10.0.0.5:21117"] {
+        for refused in [
+            "192.168.1.1:6379",
+            "127.0.0.1:6379",
+            "[::1]:11211",
+            "10.0.0.5:21117",
+        ] {
             let relay = super::relay_address(&official, refused);
             let error = super::relay_target(&official, &relay).await.unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{refused}"
+            );
         }
         for allowed in ["8.8.8.8:21117", "1.1.1.1:21117", "1.1.1.1"] {
             let relay = super::relay_address(&official, allowed);
-            assert!(super::relay_target(&official, &relay).await.is_ok(), "{allowed}");
+            assert!(
+                super::relay_target(&official, &relay).await.is_ok(),
+                "{allowed}"
+            );
         }
         // A configured relay, and an ID server on the LAN, may be private.
         let configured = crate::config::Config {
@@ -970,26 +1001,22 @@ mod tests {
             rendezvous_server: hbbs.local_addr().unwrap().to_string(),
             ..Default::default()
         });
-        let identity = std::sync::Arc::new(crate::nanokvm::Identity {
-            extension_id: "rustdesk".to_owned(),
-            token: "a".repeat(64),
-        });
         let rustdesk_identity =
             std::sync::Arc::new(RustDeskIdentity::load_from(&directory.join("state")).unwrap());
         let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
         let device = tokio::spawn(super::run_once(
             config,
-            identity,
             rustdesk_identity,
             shutdown,
             crate::server::ClientLimits::new(1),
             crate::webrtc::Manager::default(),
         ));
         let mut buffer = [0_u8; 2048];
-        let (_, device_address) = time::timeout(Duration::from_secs(5), hbbs.recv_from(&mut buffer))
-            .await
-            .unwrap()
-            .unwrap();
+        let (_, device_address) =
+            time::timeout(Duration::from_secs(5), hbbs.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
         // A length-delimited field whose length runs past the datagram.
         hbbs.send_to(&[0x0a, 0xff], device_address).await.unwrap();
         time::sleep(Duration::from_millis(300)).await;
@@ -1026,10 +1053,6 @@ mod tests {
                 "127.0.0.1:1".parse().unwrap(),
                 false,
                 config,
-                std::sync::Arc::new(crate::nanokvm::Identity {
-                    extension_id: "rustdesk".to_owned(),
-                    token: "a".repeat(64),
-                }),
                 std::sync::Arc::new(RustDeskIdentity::load_from(&directory.join("state")).unwrap()),
                 shutdown,
                 crate::server::ClientLimits::new(1),
@@ -1038,7 +1061,9 @@ mod tests {
         .await
         .expect("an invalid session ID must fail at once");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
-        assert!(time::timeout(Duration::from_millis(100), relay.accept()).await.is_err());
+        assert!(time::timeout(Duration::from_millis(100), relay.accept())
+            .await
+            .is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1049,7 +1074,9 @@ mod tests {
             ..Default::default()
         };
         let addresses = |list: &[&str]| -> Vec<SocketAddr> {
-            list.iter().map(|address| address.parse().unwrap()).collect()
+            list.iter()
+                .map(|address| address.parse().unwrap())
+                .collect()
         };
         let both = addresses(&["8.8.8.8:21117", "[2606:4700::1111]:21117"]);
         assert_eq!(

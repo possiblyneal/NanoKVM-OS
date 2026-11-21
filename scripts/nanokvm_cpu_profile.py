@@ -18,15 +18,16 @@ PROFILE = json.loads(PROFILE_FILE.read_text())
 
 
 def flags(kind='userspace'):
-    if kind not in ('userspace', 'kernel', 'bootloader', 'audio', 'openssl'):
+    if kind not in ('userspace', 'kernel', 'bootloader', 'audio', 'openssl', 'smallcore'):
         raise ValueError('Unknown CPU build profile: ' + kind)
     if kind == 'kernel' and PROFILE.get('kernel_lto', 'none') != 'none':
         raise ValueError('Production GCC kernel requires kernel_lto=none')
-    isa_kind = 'userspace' if kind in ('audio', 'openssl') else kind
+    isa_kind = 'userspace' if kind in ('audio', 'openssl', 'smallcore') else kind
     isa = PROFILE[isa_kind + '_isa']
-    if kind == 'openssl':
-        # No unconditional RVV instructions in general-purpose crypto code.
-        # Vectorization/stringop switches alone do not restrict all expansions.
+    if kind in ('openssl', 'smallcore'):
+        # openssl: no unconditional RVV instructions in general-purpose crypto
+        # code; vectorization/stringop switches alone do not restrict all
+        # expansions. smallcore: the second C906 (C906L) has no vector unit.
         isa = '_'.join(part for part in isa.split('_') if part != 'xtheadvector')
     result = [PROFILE.get(kind + '_optimization', PROFILE['optimization']),
               '-march=' + isa,
@@ -38,12 +39,22 @@ def flags(kind='userspace'):
     # -mstrict-align for portable kernels; KCFLAGS come last and override it.
     if kind == 'kernel' and not PROFILE.get('kernel_strict_align', True):
         result.append('-mno-strict-align')
+    # Kernel functions start on a 64-byte I-cache line. On the C906 (32 KiB
+    # 2-way I-cache) this cut L1I misses about 7% and CPU time 3-7% under a
+    # fixed kernel-heavy load; 16 and 32 did less, 128 raised jTLB misses.
+    # Built-in code takes the same line alignment from the linker script
+    # instead (kernel patch 0088, docs/KERNEL-HOT-TEXT.md); modules use this.
+    if kind == 'kernel' and PROFILE.get('kernel_function_align'):
+        result.append('-falign-functions=%d' % PROFILE['kernel_function_align'])
     # Keep handwritten/vendor RVV assembly; disable compiler autovectorization.
     result += ['-fno-tree-vectorize', '-fno-tree-slp-vectorize']
     if kind == 'openssl':
         # C906 memcpy and HTTPS measurements favor scalar inlining. Tree
         # vectorization flags alone do not control inline memory operations.
         result.append('-mstringop-strategy=scalar')
+        # Part of the measured layout of the hot functions
+        # (firmware/crypto/openssl-c906/README.md, "Function order").
+        result += ['-falign-functions=4', '-falign-jumps=4', '-falign-loops=4', '-falign-labels=4']
     return result
 
 
@@ -90,7 +101,7 @@ def record(output, compiler, kind='userspace', effective_flags=None):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('kind', choices=('userspace', 'kernel', 'bootloader', 'audio', 'openssl'))
+    p.add_argument('kind', choices=('userspace', 'kernel', 'bootloader', 'audio', 'openssl', 'smallcore'))
     p.add_argument('--record', type=Path)
     p.add_argument('--compiler')
     args = p.parse_args()

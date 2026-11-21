@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "Daya",
-    "showConfirm": "Konfirmasi",
-    "showConfirmTip": "Pengoperasian listrik memerlukan konfirmasi tambahan",
     "reset": "Mulai Ulang",
     "powerShort": "Data (tekan sebentar)",
     "powerLong": "Power (tekan lama)",
@@ -350,12 +348,13 @@
         "modeAlways": "Selalu terlihat",
         "keyboardLedStatus": "Indikator kunci keyboard",
         "keyboardLedStatusDesc": "Tampilkan Caps Lock, Num Lock, dan Scroll Lock komputer jarak jauh di bilah menu.",
+        "hostLedStatus": "Indikator daya dan disk",
+        "hostLedStatusDesc": "Tampilkan LED daya dan HDD komputer jarak jauh di bilah menu.",
         "icons": "Tombol bilah menu",
         "iconsDesc": "Menampilkan ikon submenu di bilah menu",
         "hiddenCount": "{{count}} disembunyikan",
         "showAll": "Tampilkan semua"
       },
-      "buttonColor": {},
       "browser": "Di browser ini",
       "browserDesc": "Disimpan hanya di browser ini; browser dan pengguna lain punya pengaturan sendiri.",
       "device": "Untuk semua di perangkat ini",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Unggah"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "LED daya dan disk komputer jarak jauh",
+      "powerLed": "LED daya",
+      "powerLedShort": "Pwr",
+      "hddLed": "LED HDD",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Status kunci keyboard jarak jauh",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "Simpan"
       },
-      "addons": {
-        "title": "Pengaya",
-        "packages": "Paket",
-        "install": "Instal"
-      },
       "title": "Perangkat lunak",
+      "packages": "Paket",
       "available": "Paket tersedia",
       "updatesTab": "Pembaruan",
       "search": "Cari",
@@ -741,10 +743,7 @@
       }
     },
     "rustdesk": {
-      "absent": "Belum terinstal",
       "stopped": "Berhenti",
-      "install": "Instal",
-      "remove": "Hapus",
       "save": "Simpan pengaturan",
       "server": "Server",
       "passwordMode": "Kata sandi",
@@ -798,8 +797,7 @@
       "eventHint": {
         "power": "host dinyalakan atau dimatikan; memerlukan kontrol ATX dengan LED daya terhubung.",
         "hdmi": "gambar hilang atau kembali, juga saat host mematikan layarnya; terdeteksi selama penangkapan video berjalan.",
-        "security": "alamat diblokir setelah login gagal, login dari alamat baru.",
-        "screen": "layar biru atau kernel panic, dikenali oleh add-on TPU; teks dibaca saat tidak ada yang menonton video, dan tangkapan layar dikirim bersamanya."
+        "security": "alamat diblokir setelah login gagal, terlalu banyak percobaan login IPMI, login dari alamat baru."
       },
       "field": {
         "token": "Token",
@@ -880,6 +878,7 @@
         "hdmi_lost": "Sinyal HDMI hilang",
         "hdmi_restored": "Sinyal HDMI pulih",
         "security_lockout": "Login diblokir",
+        "security_attempt-limit": "Percobaan masuk dibatasi",
         "security_new-address": "Login dari alamat baru",
         "screen_bsod": "Layar biru",
         "screen_panic": "Kernel panic",
@@ -925,16 +924,6 @@
         "authError": "Login tidak lagi berfungsi: {{error}}",
         "changed": "Layanan, ID klien, atau tenant berubah selama proses masuk. Masuk lagi."
       }
-    },
-    "addonPage": {
-      "failed": "Tidak dapat membaca nilai add-on",
-      "notRunning": "Layanan add-on tidak berjalan",
-      "refused": "Add-on menolaknya",
-      "saved": "Tersimpan",
-      "save": "Simpan",
-      "status": "Status",
-      "yes": "Ya",
-      "no": "Tidak"
     }
   },
   "picoclaw": {

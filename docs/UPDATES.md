@@ -18,14 +18,14 @@ reboot
 ```
 
 `apk update` refreshes repository indexes; `apk upgrade` installs the available
-updates. This release has nineteen core packages; optional add-ons and Alpine dependency
-updates are additional.
+updates. There are eighteen core packages; the packages released on their own
+(RustDesk, the computer sensors, the TPU models) and Alpine dependency updates
+are additional.
 
 Reboot when requested to activate updated kernel or bootloader files.
 Completed component transactions refresh affected services through
 **OpenRC**; an application update briefly disconnects video/control, and no
-separate apply command is required. Since v3.3.0, `nanokvm-bootloader`
-also updates the bootloader on the SD card. It verifies the written file and
+separate apply command is required. `nanokvm-bootloader` also updates the bootloader on the SD card. It verifies the written file and
 keeps `/boot/fip.prev` for recovery; see [bootloader updates](BOOT.md#updating-fipbin).
 
 ## Update notices and component versions
@@ -42,7 +42,7 @@ the new versions. **Check for updates daily** on the same page turns the check
 off; it is stored as `/etc/kvm/update-check.disabled`.
 
 APK keeps its repository indexes in RAM (a tmpfs on `/var/cache/apk`), so
-refreshing them no longer writes to the SD card. After a boot, apk downloads
+refreshing them does not write to the SD card. After a boot, apk downloads
 them again on first use; **Software → Packages** offers the refresh.
 
 ## Packages previously installed from local files
@@ -57,10 +57,14 @@ repository selections before upgrading:
 
 ```sh
 apk update
-apk add nanokvm-base nanokvm-app nanokvm-release nanokvm-kernel nanokvm-kmod nanokvm-firmware
+apk add nanokvm-base nanokvm-app nanokvm nanokvm-web nanokvm-release nanokvm-kernel nanokvm-kmod nanokvm-firmware
 apk upgrade
 reboot
 ```
+
+The recovery command keeps the old `nanokvm-app` name to clear local-file
+checksum selections in `world`. New releases provide it through
+`nanokvm-release`; no separate compatibility APK is needed.
 
 ## Signed indexes and automatic key migration
 
@@ -72,25 +76,29 @@ upgrading it moves the official NanoKVM repository from the earlier URLs on
 https://dormancygrace.github.io/NanoKVM-OS/alpine/v3.24/riscv64/Packages.adb
 ```
 
-From v3.4.0, new core packages and both indexes are signed only with ECDSA P-256.
-Devices on 3.3.x already trust this key and update normally. Devices that trust
+Core packages and both indexes are signed with ECDSA P-256. Devices that trust
 only the old RSA key must first install a transition release (2.5 through 3.3.x)
-or install the published EC key and current repository URL manually. The old
-RSA public key remains installed for historical packages and rollback.
+or install the published EC key and current repository URL manually; a device
+on a release before 3.3 uses 3.3.0, see
+[Component versions and support](#component-versions-and-support). The old
+RSA public key stays installed for older packages and rollback.
 Custom repositories and C906 overlay entries are left unchanged.
 
-The OS indexes contain core packages only. RustDesk, IPMI and model packages
-come from the separately signed add-on index on Pages. Add-ons update
-independently of OS releases; RustDesk is not installed in the full SD image.
+RustDesk, the computer sensors and the TPU models are released on their own and
+come from the separately signed add-on index on Pages; they update
+independently of OS releases. `nanokvm-release` depends on RustDesk, the
+computer sensors and the screen model by name, so every device and the full SD
+image have them; each stays off until switched on. The OS indexes offer the
+newest version of these three as well, so that a device without the add-on
+repository line (before 3.5.0) can update.
 
 ## Other migration cases
 
 - **Experimental C906 overlay:** follow the [stock Alpine migration instructions](../firmware/alpine/README.md#existing-c906-installations).
   Updating NanoKVM packages alone does not replace the overlay.
-- **Coming from a2 with OpenVPN 3:** the supported optional client is now
-  OpenVPN 2. Install it from VPN settings before reconnecting; existing profile
-  files are retained.
-- **Stock firmware or pre-v2 betas:** use the [full SD image](INSTALL.md). The [stock migration installer](stock-install.md) is an experimental development path pending device qualification.
+- **Coming from a2 with OpenVPN 3:** the supported client is OpenVPN 2,
+  installed with the system; existing profile files are retained.
+- **Stock firmware or pre-v2 betas:** use the [stock migration installer](STOCK-INSTALL.md) or the [full SD image](INSTALL.md).
   Legacy `.nkos` packages do not migrate the system to Alpine.
 - **Original v2.0-a1 image:** it predates the ready-to-use native update path
   documented here; use the full image for a fresh installation.
@@ -98,41 +106,68 @@ independently of OS releases; RustDesk is not installed in the full SD image.
 ## Installing and removing software
 
 Use **Settings → Software → Packages**, or `apk add NAME` / `apk del NAME`.
-APK resolves dependencies and verifies signatures. Software → Add-ons manages
-RustDesk, PicoClaw and acme.sh. RustDesk comes from the signed NanoKVM repository;
-PicoClaw and acme.sh use their upstream release downloads.
+APK resolves dependencies and verifies signatures. AI → Text recognition
+installs and removes the OCR models of each language from the signed add-on
+repository. AI → PicoClaw installs PicoClaw and Settings → System → Security
+installs acme.sh, both from their upstream release downloads.
 
 New full SD images use the OS release version. A package-only hotfix does not
 require a new image; the latest-image link continues to offer the newest
 published image. Component updates preserve the original installation metadata
-shown in About, including historical image numbers. Reflashing is not required
+shown in About, including the original image number. Reflashing is not required
 for routine updates.
 
 ## Component versions and support
 
-Starting with v3.3.0, each package keeps its version until its content changes.
+Each package keeps its version until its content changes.
 `nanokvm-release` identifies the overall release and requires its selected
 component versions. Different installed component versions are therefore normal.
 
-The v3.3.0 transition is also published on the previous `nkos.pesin.pro`
-repository so existing devices can obtain the automatic switch to Pages.
-That repository stays at 3.3.0; subsequent releases are served on Pages.
+The previous `nkos.pesin.pro` repository stays at 3.3.0, which switches a
+device to Pages. Releases before 3.3 receive no fixes, and direct updates from
+them are not supported. Such a device must first update to 3.3.0 from
+`nkos.pesin.pro` and boot it once with network access, so that 3.3.0 finishes
+its one-time repository migrations (removing Alpine `edge/community`
+(`@edgecommunity`), and switching Alpine `community` off when nothing needs
+it); it can then update to the current release.
+A device that skips this step keeps the edge repository line, and every apk
+run parses its index.
 
-Releases before 3.3 receive no further fixes. Compatibility for upgrading from
-those releases remains in 3.4 and 3.5; removal is planned for 3.6 after an audit.
+LLDP and UPS come from Alpine `community`, SNMP and OpenVPN from `main`. apk
+resolves an update with the repository list it has before the update, so
+`nanokvm-release` does not depend on these packages: a device without the
+`community` line could not take such a release. The image installs them next
+to `nanokvm-release`. On a device updated from a release without them, the
+post-upgrade script of `nanokvm-base` adds the `community` line, and the
+server installs the packages that are missing a few minutes after it starts,
+in the background, retrying until it succeeds. A package already installed
+only as a dependency of another one is added to the APK world, so it stays
+when that one is removed; a world entry with a version constraint or a
+repository tag stays as it is, and a package the world excludes (`!name`)
+stays out. A package that apk recorded as broken (a failed extraction or
+install script), whether one of the set or a package they depend on, is
+reinstalled with `apk fix`; apk records a requested package as complete when
+only the install script of one of its dependencies failed. It refuses an
+installation that would change an installed package (that waits for the next
+OS update) and adds no service to a runlevel. Once all of them are installed,
+complete and selected, and everything they depend on is complete, the server
+leaves the set alone: a package removed later on the Software page stays
+removed.
 
 ## Package publication and retention
 
 New GitHub Releases contain OS releases only: corresponding source, checksums,
 and, when built, the SD image and stock migration archive. APKs, indexes and
-add-on downloads live on GitHub Pages, including RustDesk's corresponding
-source and APKBUILD. Add-on version tags reserve package revisions without
-creating GitHub Releases.
+the downloads of packages released on their own live on GitHub Pages. Their
+version tags reserve package revisions without creating GitHub Releases. The
+source link such a package installs names the Git tree it was built from; for RustDesk that is its
+`nanokvm-rustdesk-VERSION-rN` tag (`addons/rustdesk`), whose third-party
+crates and Go modules are pinned by `Cargo.lock` and `go.sum`. No source
+archive is published.
 
 Pages retains the current stable OS release and two previous stable releases,
 only the latest beta, and the current version plus two previous versions of
-each add-on. RustDesk corresponding sources and APKBUILDs are exempt from
-retention and remain available for installed binaries. Packages shared by
+each package released on its own. Packages shared by
 retained releases remain available even when
 originally built earlier. The stable and beta repository URLs do not change.
 The beta feed selects the newer of the current stable and beta releases;
@@ -145,8 +180,10 @@ are the durable input to the next deployment. Completed production jobs stage
 consumes all outstanding candidates, including those from a completed run
 whose later step failed. PR and dry-run artifacts are never candidates. An OS
 candidate is stored while its release is a draft, but enters an update index
-only after the public OS release is published. At most one pending draft per
-channel is retained in addition to the published releases.
+only after the public OS release is published. Every pending draft newer than
+its channel's published release is retained, and of older ones only the newest.
+An APK that a feed serves is stored once, as that feed file; the catalog
+records where.
 
 Deployments are serialized, and losing a pending workflow dispatch does not
 lose a candidate: the next assembly scans all outstanding artifacts. A missing
@@ -163,11 +200,10 @@ is uploaded. An interrupted draft upload can therefore be retried with the
 matching new assembly. Once the candidate exists, retries only verify and
 publish the original downloads; they never mix newly signed files into that pair.
 
-### First migration from release assets
+### Bootstrapping Pages from release assets
 
-After merging the publication change, run **APK repository** on `main` with
-`bootstrap=true`. This imports the retained OS and add-on versions, their
-complete package sets and RustDesk source archives from the existing Releases.
+Running **APK repository** on `main` with `bootstrap=true` imports the retained
+OS and add-on versions and their complete package sets from existing Releases.
 It does not delete or change those releases. Subsequent deployments use Pages
 as their source and fail if the catalog is missing; bootstrap is never an
 implicit fallback.
@@ -176,9 +212,8 @@ Verify the deployed catalog, signed stable/beta/add-on indexes and their APKs
 before separately removing legacy technical/add-on releases. Existing RustDesk
 Releases remain as source-only archives so already installed APK source links
 continue working; their APKs are removed. Keep the add-on
-Git tags, which prevent reusing package revisions. Corresponding sources are also archived permanently under
-`package-store/sources/<tag>/`, including versions older than the binary
-retention window.
+Git tags, which prevent reusing package revisions and hold the source of the
+versions built for Pages.
 Migration and cleanup are separate operator actions; ordinary publication
 does not delete existing GitHub Releases or change a running device.
 

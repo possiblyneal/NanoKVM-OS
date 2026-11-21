@@ -5,7 +5,7 @@ import { inputLeaseHeaders } from '@/lib/input-lease.ts';
 import type { OledLayout } from '@/lib/oled/layout.ts';
 import type { ScreenTextResult } from '@/lib/screen-text';
 import type { TlsStatus } from '@/lib/tls-certificate';
-import type { VideoCapabilities } from '@/lib/video-model';
+import type { VideoCapabilities, VideoSettingsBody } from '@/lib/video-model';
 
 // get NanoKVM information
 export function getInfo() {
@@ -62,11 +62,6 @@ export function setGpio(type: string, duration: number) {
   return http.post('/api/vm/gpio', data, { headers: inputLeaseHeaders() });
 }
 
-// get gpio value
-export function getGpio() {
-  return http.get<{ pwr: boolean; hdd: boolean }>('/api/vm/gpio');
-}
-
 // Read the text on the screen with the TPU add-on: one recognition takes a
 // few seconds, up to 90 on the server. Aborting the request stops it there.
 // crop, fractions of the picture, reads only that area (at full size).
@@ -95,7 +90,12 @@ export function getScreenText(
 export type ScreenTextSettings = {
   // Text recognition is on: the toolbar button, MCP and PicoClaw read.
   enabled: boolean;
+  // The models of at least one language are installed, so it can read.
+  installed: boolean;
   languages: { name: string; installed: boolean }[];
+  // A language change waits or runs on the device: the languages may still
+  // change.
+  changing: boolean;
 };
 
 export function getScreenTextSettings() {
@@ -103,7 +103,22 @@ export function getScreenTextSettings() {
 }
 
 export function setScreenTextEnabled(enabled: boolean) {
-  return http.post<{ enabled: boolean }>('/api/vm/screen/text/settings', { enabled });
+  return http.post<ScreenTextSettings>('/api/vm/screen/text/settings', { enabled });
+}
+
+// Downloads or removes the models of a language: a download from the NanoKVM
+// add-on repository can take minutes on a slow link. The server gives apk up
+// to 30 minutes; the page waits a little longer, so that it usually hears the
+// server's answer instead of giving up first. An answer can still be lost
+// (a change started in another browser tab runs first, or the connection
+// drops), so after a lost answer the page reads the settings until they
+// report no language change running.
+export function setScreenTextLanguage(language: string, installed: boolean) {
+  return http.post<ScreenTextSettings>(
+    '/api/vm/screen/text/language',
+    { language, installed },
+    { timeout: 35 * 60 * 1000 }
+  );
 }
 
 // update screen arguments
@@ -126,11 +141,45 @@ export function getVideoCapabilities() {
 }
 
 // apply several video settings together; returns the new capabilities
-export function applyVideoSettings(
-  settings: Record<string, number | boolean | string>,
-  confirmPowerCycle = false
-) {
+export function applyVideoSettings(settings: VideoSettingsBody, confirmPowerCycle = false) {
   return http.post<VideoCapabilities>('/api/vm/video', { ...settings, confirmPowerCycle });
+}
+
+// The watermark drawn into every stream: blocks, each a PNG placed at x, y
+// in thousandths of the free room inside the margin (0 left or top, 500
+// centre, 1000 right or bottom). design is the editor's own record.
+export type WatermarkState = {
+  enabled: boolean;
+  margin: number;
+  design: string;
+  // image: the block's PNG, base64; empty if missing.
+  blocks: { x: number; y: number; image: string }[];
+  // Blocks are drawn for a refWidth-wide frame, each at most maxWidth x
+  // maxHeight, together at most maxArea pixels.
+  refWidth: number;
+  maxWidth: number;
+  maxHeight: number;
+  maxArea: number;
+  maxBlocks: number;
+  // PNG bytes of one block.
+  maxBytes: number;
+  // Blocks the device could not put on a running output (it tries again).
+  missing: number;
+};
+
+export function getWatermark() {
+  return http.get<WatermarkState>('/api/vm/video/watermark');
+}
+
+// A block's image (base64 PNG) replaces its picture; without it the block
+// keeps the saved picture of the same index.
+export function setWatermark(settings: {
+  enabled: boolean;
+  margin: number;
+  design: string;
+  blocks: { x: number; y: number; image?: string }[];
+}) {
+  return http.post<WatermarkState>('/api/vm/video/watermark', settings);
 }
 
 // get the device-level absolute mouse input region
@@ -302,6 +351,18 @@ export function setHostname(hostname: string) {
 }
 
 // get WebTitle
+export type ScreenPreview = {
+  state: 'ok' | 'disabled' | 'no-signal' | 'unavailable';
+  jpeg?: string; // base64
+  width?: number;
+  height?: number;
+};
+
+// A small still picture of the host screen; it starts no video session.
+export function getScreenPreview() {
+  return http.get<ScreenPreview>('/api/vm/screen/preview');
+}
+
 export function getWebTitle() {
   return http.get<{ title: string }>('/api/vm/web-title');
 }
@@ -367,7 +428,8 @@ export function uploadTLSCertificate(formData: FormData) {
     headers: {
       'Content-Type': 'multipart/form-data'
     },
-    data: formData
+    data: formData,
+    sensitive: true
   });
 }
 
@@ -454,10 +516,10 @@ export function setMemoryLimit(enabled: boolean, limit: number) {
 }
 
 export function importSSHKeys(keys: string, password: string) {
-  return http.post('/api/vm/ssh/keys/import', { keys, password });
+  return http.post('/api/vm/ssh/keys/import', { keys, password }, { sensitive: true });
 }
 
-export type DeviceInfo = {
+type DeviceInfo = {
   ips: { type: string; addr: string }[];
   mdns: string;
   application: string;
@@ -495,13 +557,13 @@ export type ScreenStatus = {
   mjpegMeasuredFps?: number;
   measuredKbps: number;
   // Where the H.264/H.265 encoder takes its frames (kvm_mmf.hpp): 0 no video
-  // encoder, 1 straight from capture, 2-7 through VPSS and why (older
+  // encoder, 1 straight from capture, 2-8 through VPSS and why (older
   // servers: absent).
   videoPath?: number;
   // Device-wide MJPEG frame detection, saved by the server.
   frameDetect: boolean;
 };
-export type CPUFrequency = {
+type CPUFrequency = {
   supported: boolean;
   throttled?: boolean;
   running: number;

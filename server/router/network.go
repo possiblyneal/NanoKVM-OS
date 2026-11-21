@@ -25,6 +25,7 @@ func networkRouter(r *gin.Engine) {
 	api.POST("/network/wol", service.WakeOnLAN) // wake on lan
 	api.GET("/network/wol/mac", service.GetMac) // get mac list
 	api.GET("/network/wol/interfaces", service.GetWolInterfaces)
+	api.GET("/network/peers", service.GetPeers) // the NanoKVMs announced on the local network
 
 	admin := r.Group("/api").Use(
 		middleware.CheckToken(),
@@ -36,9 +37,10 @@ func networkRouter(r *gin.Engine) {
 	admin.GET("/network/wifi/scan", service.ScanWifi)
 	admin.POST("/network/wifi/enabled", service.SetWifiEnabled)
 	admin.POST("/network/wifi/band-preference", service.SetWifiBandPreference)
+	admin.GET("/network/wifi/country", service.GetWifiCountry)
+	admin.POST("/network/wifi/country", service.SetWifiCountry)
 	admin.POST("/network/wifi/configure", service.ConfigureWifi)
 	admin.GET("/network/wifi", service.GetWifi)                    // get Wi-Fi information
-	admin.POST("/network/wifi/connect", service.ConnectWifi)       // connect Wi-Fi
 	admin.POST("/network/wifi/disconnect", service.DisconnectWifi) // disconnect Wi-Fi
 	admin.GET("/network/wifi/ap", service.GetWifiAP)
 	admin.POST("/network/wifi/ap", service.SetWifiAP)

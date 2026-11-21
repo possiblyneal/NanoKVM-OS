@@ -20,7 +20,7 @@ const tiledQueue = 8
 
 var (
 	tilesAvailable = common.MjpegTilesAvailable
-	readTiles      = func(width, height, quality uint16, key bool, maxTiles uint16) ([]byte, int) {
+	readTiles      = func(width, height, quality uint16, key bool, maxTiles uint16) ([]byte, []byte, int) {
 		return common.GetKvmVision().ReadMjpegTiles(width, height, quality, key, maxTiles)
 	}
 	releaseTiles = func() { common.GetKvmVision().ReleaseMjpegTiles() }
@@ -35,11 +35,18 @@ func newTiledClient(ctx context.Context) *mjpegClient {
 	}
 }
 
-// offerTile queues a message. A full queue is dropped: the viewer then takes
-// nothing but the next whole picture.
+// offerTile queues a message. A whole picture replaces the queued messages it
+// makes stale. A full queue is dropped: the viewer then takes nothing but the
+// next whole picture.
 func (c *mjpegClient) offerTile(message []byte, whole bool) bool {
 	if c.resync && !whole {
 		return false
+	}
+	if whole {
+		c.drainFrames()
+		c.frames <- message
+		c.resync = false
+		return true
 	}
 	select {
 	case c.frames <- message:
@@ -47,20 +54,19 @@ func (c *mjpegClient) offerTile(message []byte, whole bool) bool {
 		return true
 	default:
 	}
-	for drained := false; !drained; {
+	c.drainFrames()
+	c.resync = true
+	return false
+}
+
+func (c *mjpegClient) drainFrames() {
+	for {
 		select {
 		case <-c.frames:
 		default:
-			drained = true
+			return
 		}
 	}
-	c.resync = true
-	if whole {
-		c.frames <- message
-		c.resync = false
-		return true
-	}
-	return false
 }
 
 // tilesOnly: every viewer takes tiles and the device can find changes. With
@@ -99,7 +105,7 @@ func (t *tileDelivery) read(clients []*mjpegClient, delivery *frameDelivery, scr
 		key = key || c.resync
 	}
 	t.used = true
-	data, result := readTiles(screen.Width, screen.Height, uint16(quality), key, mjpegMaxTiles)
+	data, framed, result := readTiles(screen.Width, screen.Height, uint16(quality), key, mjpegMaxTiles)
 	status := result
 	if status == common.MjpegTilesResult {
 		status = 0
@@ -114,7 +120,7 @@ func (t *tileDelivery) read(clients []*mjpegClient, delivery *frameDelivery, scr
 		return false
 	}
 	if result == 0 && len(data) > 0 {
-		return delivery.offer(clients, data, now)
+		return delivery.offer(clients, data, framed, now)
 	}
 	message := data
 	if result != common.MjpegTilesResult || len(message) == 0 {

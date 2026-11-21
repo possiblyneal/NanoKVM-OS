@@ -107,6 +107,7 @@ for boot in current previous older; do
 	copy "logs/$boot" /var/log/nanokvm-boots/$boot/boot.json /var/log/nanokvm-boots/$boot/system.log \
 		/var/log/nanokvm-boots/$boot/kernel.log /var/log/nanokvm-boots/$boot/application.log
 done
+run logs/kernel-crashes sh -c 'for f in /var/log/nanokvm-crash/*/*; do [ -f "$f" ] || continue; echo "== $f"; cat "$f"; done'
 run logs/dmesg dmesg
 run logs/messages tail -n 2000 /var/log/messages
 run logs/logread logread
@@ -138,6 +139,8 @@ copy hardware /etc/kvm/hw /etc/kvm/board-profile /etc/kvm/hdmi_version /etc/kvm/
 	/etc/kvm/monitor_portrait /etc/kvm/monitor_portrait_resolution /etc/kvm/oled_exist /etc/kvm/oled_sleep /etc/kvm/oled_layout
 # Labelled: a bare 64-character hash line would be hidden as a possible key.
 run hardware/edid-hashes sh -c 'for f in monitor_edid_sha256 monitor_edid_verified; do echo "$f: $(cat /etc/kvm/$f 2>/dev/null)"; done'
+# Whether a custom monitor identity is set, not its fields: they can be a real monitor's serial number.
+run hardware/monitor-identity sh -c '[ -f /etc/kvm/monitor_identity ] && echo custom || echo nanokvm'
 run hardware/usb-gadget sh -c 'cd /sys/kernel/config/usb_gadget 2>/dev/null && find . -type f ! -name serialnumber | sort | while read -r f; do printf "%s: %s\n" "$f" "$(head -c 256 "$f" 2>/dev/null | tr "\n" " ")"; done'
 run hardware/udc sh -c 'for u in /sys/class/udc/*; do echo "$u $(cat "$u/state" 2>/dev/null) $(cat "$u/current_speed" 2>/dev/null)"; done'
 run hardware/lsusb lsusb
@@ -159,9 +162,10 @@ run network/link ip -s link
 run network/nft nft list ruleset
 run network/iw-dev iw dev
 run network/iw-link iw dev wlan0 link
+run network/iw-reg iw reg get
 run network/netstat netstat -tunlp
 run network/links sh -c 'for n in /sys/class/net/*; do echo "${n##*/} $(cat "$n/operstate" 2>/dev/null) carrier=$(cat "$n/carrier" 2>/dev/null) speed=$(cat "$n/speed" 2>/dev/null) mtu=$(cat "$n/mtu" 2>/dev/null)"; done'
-copy network /proc/net/dev /proc/net/snmp /etc/resolv.conf /etc/kvm/wifi.band_preference \
+copy network /proc/net/dev /proc/net/snmp /etc/resolv.conf /etc/kvm/wifi.band_preference /etc/kvm/wifi.country \
 	/etc/kvm/wifi.freq_list /etc/kvm/wifi.freq_list_2.4 /etc/kvm/wifi.freq_list_5 /etc/kvm/wifi.hidden \
 	/etc/kvm/mdns_disabled /etc/kvm/network/ipv6
 run network/vpn-presence sh -c 'for d in /var/lib/tailscale /etc/wireguard /etc/openvpn /var/lib/netbird /etc/netbird; do [ -e "$d" ] && echo "$d present"; done; true'
@@ -169,7 +173,7 @@ run network/vpn-presence sh -c 'for d in /var/lib/tailscale /etc/wireguard /etc/
 # Settings: an allow-list. Not read: .jwt_secret, .picoclaw_internal_token,
 # pwd, server.key, server.crt, scripts/, Wi-Fi and VPN configuration.
 copy config /etc/kvm/server.yaml /etc/kvm/date-time.json /etc/kvm/memory.conf \
-	/etc/kvm/ai-control.mode /etc/kvm/apk-community.chosen /etc/kvm/screen-text-language \
+	/etc/kvm/ai-control.mode /etc/kvm/screen-text-language \
 	/etc/kvm/mcp.json /etc/kvm/picoclaw-runtime.json
 run config/usb-flags ls -la /etc/kvm/usb
 

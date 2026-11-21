@@ -5,17 +5,26 @@ device and runs them as root: on demand, or once at every startup.
 
 ## Scripts on the device
 
+Scripts run as root: uploading, running and starting them at boot ask for the
+password again ([confirming the password](TWO-FACTOR.md#confirming-the-password-for-actions-that-act-as-root)).
+
 - **Upload** takes a `.sh` or `.py` file. Scripts are stored in
   `/etc/kvm/scripts`; uploading a file with an existing name replaces it.
 - A `.sh` script is executed directly, so it needs a `#!/bin/sh` (or
   `#!/bin/bash`) first line. A `.py` script runs with `/usr/bin/python3`;
-  install Python from **Settings → Software** first.
-- **Run** waits for the script and shows its output. **Run in background**
-  starts it and returns at once; its output is discarded.
+  the Scripts window offers to install Python 3 when a `.py` script is
+  uploaded or run without it (about 13 MiB to download, 35 MiB on the device).
+- **Run** waits for the script and shows its output: at most 50 seconds (then
+  the script and what it started are stopped) and the first 64 KiB of output.
+  A script that fails shows its output and exit code. **Run in background**
+  starts it and returns at once, without a time limit; its output is
+  discarded.
 - **Delete** removes the script and its startup mark.
 
 Scripts run as root with the full rights of the device. Run only scripts you
 have read.
+
+To run a script on a schedule, see [Scheduled tasks](SCHEDULE.md).
 
 ## Run at startup
 
@@ -62,9 +71,3 @@ script name relative to `/etc/kvm/scripts`):
 The Scripts window shows this state under the switch. To stop a script that
 is still running, end it from **Terminal**, for example with `pkill -f
 my-agent`.
-
-### Earlier versions
-
-Older versions had a `/api/vm/autostart` API that stored scripts in
-`/etc/kvm/autostart`, but nothing ran them. The API is gone; mark a script in
-the Scripts window instead.

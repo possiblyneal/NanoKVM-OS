@@ -22,6 +22,16 @@ const hdmiCaptureWarmupDuration = time.Second
 // reload does not park and resume them.
 var hdmiCaptureParkDelay = 20 * time.Second
 
+// Until the first capture demand of this run there is no page to reload, so
+// the outputs park at once: the VPSS converted every frame for 20 s after
+// each boot with nobody reading them. Parking does not need the capture open:
+// CapturePark disables the outputs of a later start right after it creates
+// them, under the same lock, so the VPSS does not run until a reader comes.
+var hdmiCaptureFirstParkDelay time.Duration
+
+// hdmiCaptureHadDemand records the first viewer or capture lease of this run.
+var hdmiCaptureHadDemand bool
+
 // Disabled pools can remain busy until the last VPSS job returns its frame.
 var hdmiCaptureReclaimDelay = time.Second
 
@@ -110,6 +120,7 @@ func EnableHdmiCapture() {
 	defer hdmiMutex.Unlock()
 
 	setHDMI(true)
+	previewCaptureSwitched()
 	hdmiDemand.MarkWarming(time.Now().Add(hdmiCaptureWarmupDuration))
 	hdmiStoppedForIdle = false
 	hdmiIdleGeneration++
@@ -124,6 +135,7 @@ func DisableHdmiCapture() {
 	defer hdmiMutex.Unlock()
 
 	setHDMI(false)
+	previewCaptureSwitched()
 	hdmiDemand.ClearReadyAt()
 	hdmiStoppedForIdle = false
 	hdmiIdleGeneration++
@@ -286,6 +298,75 @@ func AcquireHdmiCaptureLeaseForRead(ctx context.Context) (func(), func() bool, e
 	return releaseRead, claimFresh, nil
 }
 
+// hdmiBackgroundReads counts reads that nobody watches (the crash-screen
+// watch). They are not capture demand: a read every few seconds must not
+// restart the park timer, or capture would never park without viewers.
+var hdmiBackgroundReads int
+
+// hdmiKeepCapture reports a watch that needs the screen while nobody views it
+// (the crash-screen watch): the idle timeout then leaves capture running,
+// parked between its reads. Stopping and restarting it for each read would
+// reset the receiver of a PCIe board, which the target sees as a monitor
+// unplugged and plugged in again.
+var hdmiKeepCapture = func() bool { return false }
+
+// acquireHdmiBackgroundRead admits a background read; capture stopped for
+// idle starts again. It refuses while HDMI is disabled. A capture it unparked
+// is parked again on release.
+func acquireHdmiBackgroundRead(ctx context.Context) (func(), bool) {
+	select {
+	case hdmiCaptureReadSlot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false
+	}
+	hdmiMutex.Lock()
+	if isHdmiDisabled() {
+		hdmiMutex.Unlock()
+		<-hdmiCaptureReadSlot
+		return nil, false
+	}
+	if hdmiStoppedForIdle {
+		// The watch was turned on after the idle timeout stopped capture.
+		resumeHdmiCaptureLocked()
+		hdmiStoppedForIdle = false
+		scheduleHdmiIdleTimerLocked()
+	}
+	hdmiBackgroundReads++
+	unparked := hdmiCaptureParked && !hdmiHasCaptureDemandLocked()
+	if unparked {
+		resumeParkedCaptureLocked()
+	}
+	readyAt := hdmiDemand.ReadyAt()
+	hdmiMutex.Unlock()
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			hdmiMutex.Lock()
+			hdmiBackgroundReads--
+			if hdmiBackgroundReads == 0 && !hdmiHasCaptureDemandLocked() && hdmiParkTimer == nil &&
+				!hdmiStoppedForIdle && !isHdmiDisabled() {
+				// Unparked for the read, or its park deadline passed during
+				// it (the timer left that to this release): park now.
+				parkCaptureLocked()
+			}
+			hdmiMutex.Unlock()
+			<-hdmiCaptureReadSlot
+		})
+	}
+	if wait := time.Until(readyAt); wait > 0 {
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			release()
+			return nil, false
+		case <-timer.C:
+		}
+	}
+	return release, true
+}
+
 func acquireHdmiCaptureLease() (func(), time.Time) {
 	hdmiMutex.Lock()
 	hdmiDemand.AcquireLease()
@@ -314,6 +395,7 @@ func reconcileHdmiCaptureDemandLocked() {
 	stopHdmiParkTimerLocked()
 
 	if hdmiHasCaptureDemandLocked() {
+		hdmiCaptureHadDemand = true
 		resumeParkedCaptureLocked()
 		if hdmiStoppedForIdle && !isHdmiDisabled() {
 			resumeHdmiCaptureLocked()
@@ -342,6 +424,9 @@ func scheduleHdmiParkTimerLocked() {
 	}
 
 	delay := hdmiCaptureParkDelay
+	if !hdmiCaptureHadDemand {
+		delay = hdmiCaptureFirstParkDelay
+	}
 	if hdmiCaptureParked {
 		if !captureReclaimPending() {
 			return
@@ -357,20 +442,28 @@ func scheduleHdmiParkTimerLocked() {
 			return
 		}
 		hdmiParkTimer = nil
-		if !setCaptureParked(true) {
-			if hdmiCaptureParked {
-				scheduleHdmiParkTimerLocked()
-			} else {
-				log.Info("video capture not parked; it keeps converting frames without viewers")
-			}
+		// A background read schedules the park again when it ends.
+		if hdmiBackgroundReads > 0 {
 			return
 		}
-		if !hdmiCaptureParked {
-			hdmiCaptureParked = true
-			log.Debug("parked video capture without viewers")
-		}
-		scheduleHdmiParkTimerLocked()
+		parkCaptureLocked()
 	})
+}
+
+func parkCaptureLocked() {
+	if !setCaptureParked(true) {
+		if hdmiCaptureParked {
+			scheduleHdmiParkTimerLocked()
+		} else {
+			log.Info("video capture not parked; it keeps converting frames without viewers")
+		}
+		return
+	}
+	if !hdmiCaptureParked {
+		hdmiCaptureParked = true
+		log.Debug("parked video capture without viewers")
+	}
+	scheduleHdmiParkTimerLocked()
 }
 
 // A frame read resumes parked outputs by itself; resuming here first keeps
@@ -416,6 +509,11 @@ func scheduleHdmiIdleTimerLocked() {
 		}
 
 		hdmiIdleTimer = nil
+		if hdmiKeepCapture() {
+			// Checked again after another timeout, in case the watch is turned off.
+			scheduleHdmiIdleTimerLocked()
+			return
+		}
 		setHDMI(false)
 		hdmiDemand.ClearReadyAt()
 		hdmiStoppedForIdle = true

@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "Tænd/sluk-knap",
-    "showConfirm": "Bekræftelse",
-    "showConfirmTip": "Strømdrift kræver en ekstra bekræftelse",
     "reset": "Nulstillingsknap",
     "powerShort": "Tænd/sluk-knap (kort tryk)",
     "powerLong": "Tænd/sluk-knap (langt tryk)",
@@ -350,12 +348,13 @@
         "modeAlways": "Altid synlig",
         "keyboardLedStatus": "Tastaturlåseindikatorer",
         "keyboardLedStatusDesc": "Vis Caps Lock, Num Lock og Scroll Lock for fjerncomputeren i menulinjen.",
+        "hostLedStatus": "Strøm- og diskindikatorer",
+        "hostLedStatusDesc": "Vis fjerncomputerens strøm- og HDD-lysdioder i menulinjen.",
         "icons": "Knapper i menulinjen",
         "iconsDesc": "Vis undermenuikoner i menulinjen",
         "hiddenCount": "{{count}} skjult",
         "showAll": "Vis alle"
       },
-      "buttonColor": {},
       "browser": "I denne browser",
       "browserDesc": "Gemmes kun i denne browser; andre browsere og brugere har deres egne.",
       "device": "For alle på denne enhed",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Upload"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "Fjerncomputerens strøm- og disklysdioder",
+      "powerLed": "Strømlysdiode",
+      "powerLedShort": "Pwr",
+      "hddLed": "HDD-lysdiode",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Status for låse på fjernkeyboard",
@@ -622,12 +628,8 @@
       "indexSchedule": {
         "save": "Gem"
       },
-      "addons": {
-        "title": "Tilføjelser",
-        "packages": "Pakker",
-        "install": "Installér"
-      },
       "title": "Software",
+      "packages": "Pakker",
       "available": "Tilgængelige pakker",
       "updatesTab": "Opdateringer",
       "search": "Søg",
@@ -738,10 +740,7 @@
       }
     },
     "rustdesk": {
-      "absent": "Ikke installeret",
       "stopped": "Stoppet",
-      "install": "Installér",
-      "remove": "Fjern",
       "save": "Gem indstillinger",
       "server": "Server",
       "passwordMode": "Adgangskode",
@@ -795,8 +794,7 @@
       "eventHint": {
         "power": "værten blev tændt eller slukket; kræver ATX-styring med tilsluttet strøm-LED.",
         "hdmi": "billedet gik tabt eller kom tilbage, også når værten slukker sin skærm; registreres, mens videooptagelsen kører.",
-        "security": "en adresse blokeret efter mislykkede logins, et login fra en ny adresse.",
-        "screen": "en blå skærm eller en kernel panic, genkendt af TPU-tilføjelsen; teksten læses, når ingen ser videoen, og sendes med et skærmbillede."
+        "security": "en adresse blokeret efter mislykkede logins, for mange IPMI-loginforsøg, et login fra en ny adresse."
       },
       "field": {
         "token": "Token",
@@ -877,6 +875,7 @@
         "hdmi_lost": "HDMI-signal mistet",
         "hdmi_restored": "HDMI-signal genoprettet",
         "security_lockout": "Logins blokeret",
+        "security_attempt-limit": "Loginforsøg begrænset",
         "security_new-address": "Login fra en ny adresse",
         "screen_bsod": "Blå skærm",
         "screen_panic": "Kernel panic",
@@ -922,16 +921,6 @@
         "authError": "Login virker ikke længere: {{error}}",
         "changed": "Tjenesten, klient-id'et eller tenant blev ændret under login. Log ind igen."
       }
-    },
-    "addonPage": {
-      "failed": "Kunne ikke læse tilføjelsens værdier",
-      "notRunning": "Tilføjelsens tjeneste kører ikke",
-      "refused": "Tilføjelsen afviste det",
-      "saved": "Gemt",
-      "save": "Gem",
-      "status": "Status",
-      "yes": "Ja",
-      "no": "Nej"
     }
   },
   "picoclaw": {

@@ -1,12 +1,18 @@
 import { ChangeEvent, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { Button, Divider, Input } from 'antd';
-import type { InputRef } from 'antd';
+import type { InputRef, PopoverProps } from 'antd';
 import clsx from 'clsx';
 import { useSetAtom } from 'jotai';
 import { DownloadIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { cancelDownloadImage, downloadImage, imageEnabled, statusImage } from '@/api/download.ts';
+import {
+  cancelDownloadImage,
+  checkImageUpload,
+  downloadImage,
+  imageEnabled,
+  statusImage
+} from '@/api/download.ts';
 import { notifyAuthExpired } from '@/lib/auth-events.ts';
 import { readTransferProgress, transferBytes } from '@/lib/download-progress';
 import { pollWhileVisible } from '@/lib/visible-poll.ts';
@@ -17,7 +23,16 @@ import './download-progress.css';
 
 const imageUpdatedEvent = 'nanokvm:image-updated';
 
-export const DownloadImage = () => {
+// label, className, placement: the button outside a toolbar (see MenuItem).
+export const DownloadImage = ({
+  label = false,
+  className,
+  placement
+}: {
+  label?: boolean;
+  className?: string;
+  placement?: PopoverProps['placement'];
+} = {}) => {
   const { t } = useTranslation();
   const setKeyboardLock = useSetAtom(keyboardLockAtom);
 
@@ -30,6 +45,7 @@ export const DownloadImage = () => {
   const [isCancelling, setIsCancelling] = useState(false);
   const [isRemoteDownloading, setIsRemoteDownloading] = useState(false);
   const [diskEnabled, setDiskEnabled] = useState<boolean | null>(null);
+  const [checkingFile, setCheckingFile] = useState(false);
   const [diskCheckFailed, setDiskCheckFailed] = useState(false);
   const [popoverKey, setPopoverKey] = useState(0);
 
@@ -41,6 +57,7 @@ export const DownloadImage = () => {
   const pollingGeneration = useRef(0);
   const remoteDownloadActive = useRef(false);
   const fileUploadActive = useRef(false);
+  const [localUpload, setLocalUpload] = useState<AbortController | null>(null);
   const downloadRequestGeneration = useRef(0);
 
   const startInitialPolling = useEffectEvent(() => startStatusPolling());
@@ -264,6 +281,23 @@ export const DownloadImage = () => {
       });
   }
 
+  async function checkAndUpload(file: File | null) {
+    if (!file || checkingFile) return;
+    const generation = downloadRequestGeneration.current;
+    setCheckingFile(true);
+    try {
+      await checkImageUpload(file);
+      if (generation === downloadRequestGeneration.current) upload(file);
+    } catch (error) {
+      if (generation !== downloadRequestGeneration.current) return;
+      stopStatusPolling();
+      setStatus('failed');
+      setLog(error instanceof Error ? error.message : t('download.failed'));
+    } finally {
+      if (generation === downloadRequestGeneration.current) setCheckingFile(false);
+    }
+  }
+
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0] ?? null;
     if (!file || !/\.(iso|img)$/i.test(file.name)) {
@@ -280,7 +314,7 @@ export const DownloadImage = () => {
   }
 
   function upload(file: File | null) {
-    if (!file) return;
+    if (!file || localUpload) return;
 
     if (!file || !/\.(iso|img)$/i.test(file.name)) {
       setStatus('failed');
@@ -299,6 +333,8 @@ export const DownloadImage = () => {
     setProgress(readTransferProgress());
     setTransferName(file.name);
 
+    const controller = new AbortController();
+    setLocalUpload(controller);
     const formData = new FormData();
     formData.append('file', file);
 
@@ -307,6 +343,7 @@ export const DownloadImage = () => {
       headers: {
         'X-SHA256-Sum': checksum
       },
+      signal: controller.signal,
       body: formData
     })
       .then(async (response) => {
@@ -327,8 +364,17 @@ export const DownloadImage = () => {
       .catch((error: unknown) => {
         fileUploadActive.current = false;
         stopStatusPolling();
+        if (controller.signal.aborted) {
+          setStatus('idle');
+          setLog('');
+          window.dispatchEvent(new Event(imageUpdatedEvent));
+          return;
+        }
         setStatus('failed');
         setLog(error instanceof Error ? error.message : t('download.failed'));
+      })
+      .finally(() => {
+        setLocalUpload(null);
       });
 
     startStatusPolling();
@@ -378,7 +424,7 @@ export const DownloadImage = () => {
         </Button>
       )}
       {diskEnabled === true && (
-        <div className="space-y-2">
+        <fieldset disabled={checkingFile} className="min-w-0 space-y-2">
           <div>
             <div className="mb-1 text-neutral-500">{t('download.input')}</div>
             <div className="flex items-center gap-1">
@@ -428,7 +474,7 @@ export const DownloadImage = () => {
                     : 'cursor-pointer hover:bg-neutral-500'
                 )}
                 onDrop={(e) => {
-                  if (status === 'in_progress') return; // deaktiviert
+                  if (checkingFile || status === 'in_progress') return; // deaktiviert
                   e.preventDefault();
                   setIsDragging(false);
                   const file = e.dataTransfer.files?.[0] ?? null;
@@ -442,17 +488,17 @@ export const DownloadImage = () => {
                   setSelectedFile(file);
                 }}
                 onDragOver={(e) => {
-                  if (status === 'in_progress') return; // deaktiviert
+                  if (checkingFile || status === 'in_progress') return; // deaktiviert
                   e.preventDefault();
                   setIsDragging(true); // Datei wird über den Bereich gezogen
                 }}
                 onDragLeave={(e) => {
-                  if (status === 'in_progress') return; // deaktiviert
+                  if (checkingFile || status === 'in_progress') return; // deaktiviert
                   e.preventDefault();
                   setIsDragging(false); // Maus verlässt Bereich
                 }}
                 onClick={() => {
-                  if (status === 'in_progress') return; // deaktiviert
+                  if (checkingFile || status === 'in_progress') return; // deaktiviert
                   document.getElementById('file-upload')?.click();
                 }}
               >
@@ -472,14 +518,15 @@ export const DownloadImage = () => {
               <Button
                 type="primary"
                 className="h-10 w-16 shrink-0 border-2 px-0"
-                onClick={() => upload(selectedFile)}
+                loading={checkingFile}
+                onClick={() => checkAndUpload(selectedFile)}
                 disabled={status === 'in_progress' || !selectedFile}
               >
                 {t('download.ok')}
               </Button>
             </div>
           </div>
-        </div>
+        </fieldset>
       )}
       {transferring && (
         <div className="mt-4 space-y-2">
@@ -494,6 +541,11 @@ export const DownloadImage = () => {
               )}
             </span>
             <span className="tabular-nums">{percentLabel}</span>
+            {localUpload && (
+              <Button danger size="small" onClick={() => localUpload?.abort()}>
+                {t('download.cancel')}
+              </Button>
+            )}
           </div>
           <div
             role="progressbar"
@@ -547,7 +599,11 @@ export const DownloadImage = () => {
     <MenuItem
       title={t('download.title')}
       icon={
-        <span className="download-toolbar-icon" aria-hidden="true">
+        <span
+          className="download-toolbar-icon"
+          style={label ? { width: 18, height: 18 } : undefined}
+          aria-hidden="true"
+        >
           <DownloadIcon size={18} />
           {transferring && (
             <>
@@ -567,6 +623,9 @@ export const DownloadImage = () => {
       }
       content={content}
       onOpenChange={handleOpenChange}
+      label={label}
+      className={className}
+      placement={placement}
     />
   );
 };

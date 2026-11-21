@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "전원",
-    "showConfirm": "확인",
-    "showConfirmTip": "전원 작업에는 추가 확인이 필요합니다",
     "reset": "리셋",
     "powerShort": "전원 (짧게 누르기)",
     "powerLong": "전원 (길게 누르기)",
@@ -350,12 +348,13 @@
         "modeAlways": "항상 보이기",
         "keyboardLedStatus": "키보드 잠금 표시기",
         "keyboardLedStatusDesc": "원격 컴퓨터의 Caps Lock, Num Lock, Scroll Lock 상태를 메뉴 막대에 표시합니다.",
+        "hostLedStatus": "전원 및 디스크 표시등",
+        "hostLedStatusDesc": "메뉴 표시줄에 원격 컴퓨터의 전원 및 HDD LED를 표시합니다.",
         "icons": "메뉴 막대 버튼",
         "iconsDesc": "메뉴 바에 하위 메뉴 아이콘을 표시합니다",
         "hiddenCount": "{{count}}개 숨김",
         "showAll": "모두 표시"
       },
-      "buttonColor": {},
       "browser": "이 브라우저",
       "browserDesc": "이 브라우저에만 저장되며, 다른 브라우저와 사용자는 각자의 설정을 가집니다.",
       "device": "이 장치의 모든 사용자",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "업로드"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "원격 컴퓨터의 전원 및 디스크 LED",
+      "powerLed": "전원 LED",
+      "powerLedShort": "Pwr",
+      "hddLed": "HDD LED",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "원격 키보드 잠금 상태",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "저장"
       },
-      "addons": {
-        "title": "추가 기능",
-        "packages": "패키지",
-        "install": "설치"
-      },
       "title": "소프트웨어",
+      "packages": "패키지",
       "available": "사용 가능한 패키지",
       "updatesTab": "업데이트",
       "search": "검색",
@@ -744,10 +746,7 @@
       }
     },
     "rustdesk": {
-      "absent": "설치되지 않음",
       "stopped": "중지됨",
-      "install": "설치",
-      "remove": "제거",
       "save": "설정 저장",
       "server": "서버",
       "passwordMode": "비밀번호",
@@ -801,8 +800,7 @@
       "eventHint": {
         "power": "호스트가 켜지거나 꺼졌을 때. 전원 LED가 연결된 ATX 제어가 필요합니다.",
         "hdmi": "화면이 끊기거나 돌아왔을 때(호스트가 디스플레이를 끈 경우 포함). 비디오 캡처가 실행되는 동안 감지됩니다.",
-        "security": "로그인 실패 후 차단된 주소, 새 주소에서의 로그인.",
-        "screen": "TPU 애드온이 인식한 블루 스크린 또는 kernel panic. 아무도 비디오를 보지 않을 때 텍스트를 읽고, 스크린샷을 함께 보냅니다."
+        "security": "로그인 실패 후 차단된 주소, 너무 많은 IPMI 로그인 시도, 새 주소에서의 로그인."
       },
       "field": {
         "token": "토큰",
@@ -883,6 +881,7 @@
         "hdmi_lost": "HDMI 신호 끊김",
         "hdmi_restored": "HDMI 신호 복구됨",
         "security_lockout": "로그인 차단됨",
+        "security_attempt-limit": "로그인 시도 제한됨",
         "security_new-address": "새 주소에서 로그인",
         "screen_bsod": "블루 스크린",
         "screen_panic": "Kernel panic",
@@ -928,16 +927,6 @@
         "authError": "로그인이 더 이상 작동하지 않습니다: {{error}}",
         "changed": "로그인하는 동안 서비스, 클라이언트 ID 또는 테넌트가 바뀌었습니다. 다시 로그인하세요."
       }
-    },
-    "addonPage": {
-      "failed": "애드온 값을 읽을 수 없습니다",
-      "notRunning": "애드온 서비스가 실행 중이 아닙니다",
-      "refused": "애드온이 거부했습니다",
-      "saved": "저장됨",
-      "save": "저장",
-      "status": "상태",
-      "yes": "예",
-      "no": "아니요"
     }
   },
   "picoclaw": {

@@ -12,6 +12,7 @@ import { Panel, SettingRow, SettingsSection, StatusBadge } from '@/components/ui
 import { IPv6 } from './ipv6.tsx';
 import { WifiAccessPoint } from './wifi-ap.tsx';
 import { WifiBandTag } from './wifi-band';
+import { WifiCountry } from './wifi-country.tsx';
 import { groupWifiNetworks, type WifiGroup } from './wifi-networks';
 import { operationDone, type Pending } from './wifi-pending.ts';
 import { SavedWifi } from './wifi-saved.tsx';
@@ -583,7 +584,16 @@ export const Wifi = () => {
             {
               key: 'ap',
               label: t('settings.network.wifiAp.title'),
-              children: <WifiAccessPoint />
+              children: (
+                <div className="space-y-6">
+                  <WifiCountry
+                    state={state}
+                    locked={locked}
+                    onRestarting={() => track({ enabled: true })}
+                  />
+                  <WifiAccessPoint />
+                </div>
+              )
             }
           ]}
         />

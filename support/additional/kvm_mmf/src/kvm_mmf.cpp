@@ -16,6 +16,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <mutex>
+#include <vector>
 #include <time.h>
 
 #include <fcntl.h>		/* low-level i/o */
@@ -31,6 +32,7 @@
 #include "cvi_sys.h"
 #include <linux/vpss_uapi.h>
 #include "cvi_ive.h"
+#include "cvi_region.h"
 #include "sample_comm.h"
 #include "kvm_mmf.hpp"
 #include "internal/frame_buffer.hpp"
@@ -105,9 +107,7 @@ static VENC_PACK_S *venc_pack_storage[MMF_VENC_MAX_CHN];
 static CVI_U32 venc_pack_capacity[MMF_VENC_MAX_CHN];
 
 /*
- * H.26x encoder tuning. /run/nanokvm-venc-tune, a volatile key=value file,
- * overrides the defaults below for A/B measurements and is read when a channel
- * is created.
+ * H.26x encoder tuning, fixed values.
  *
  * Every viewer asks for an IDR when it needs one (a new subscriber, WebRTC
  * PLI, Direct and RustDesk recovery), so periodic IDRs only cost bits and
@@ -142,44 +142,30 @@ struct venc_tuning_t {
 	int ip_qp_delta = 2;
 	int row_qp_delta = -1; // -1: driver default
 	int thrd_lv = -1;
-	int stats = 0;        // 1: per-second statistics in /run/nanokvm-venc-stats
 	int buf_kb = 0;       // stream buffer; 0: sized from the picture (venc_stream_buffer)
 	int jpeg_buf_kb = 0;  // JPEG bitstream buffer; 0: sized from the picture (jpeg_stream_buffer)
 };
 
-static venc_tuning_t venc_tuning;
-static constexpr uint64_t venc_pending_limit_ms = 3000;
-
-static venc_tuning_t load_venc_tuning(void)
-{
-	venc_tuning_t t;
-	FILE *f = fopen("/run/nanokvm-venc-tune", "r");
-	if (!f) return t;
-	char key[64];
-	int value;
-	while (fscanf(f, " %63[a-z0-9_] = %d", key, &value) == 2) {
-		if (!strcmp(key, "idr_seconds")) t.idr_seconds = value;
-		else if (!strcmp(key, "h264_high")) t.h264_high = value;
-		else if (!strcmp(key, "min_qp")) t.min_qp = value;
-		else if (!strcmp(key, "min_iqp")) t.min_iqp = value;
-		else if (!strcmp(key, "max_qp")) t.max_qp = value;
-		else if (!strcmp(key, "max_iqp")) t.max_iqp = value;
-		else if (!strcmp(key, "max_iprop")) t.max_iprop = value;
-		else if (!strcmp(key, "ip_qp_delta")) t.ip_qp_delta = value;
-		else if (!strcmp(key, "row_qp_delta")) t.row_qp_delta = value;
-		else if (!strcmp(key, "thrd_lv")) t.thrd_lv = value;
-		else if (!strcmp(key, "stats")) t.stats = value;
-		else if (!strcmp(key, "buf_kb")) t.buf_kb = value;
-		else if (!strcmp(key, "jpeg_buf_kb")) t.jpeg_buf_kb = value;
-	}
-	fclose(f);
-	fprintf(stderr, "[kvm_mmf] VENC tuning override: idr_seconds=%d h264_high=%d qp=%d..%d iqp=%d..%d "
-		"max_iprop=%d ip_qp_delta=%d row_qp_delta=%d thrd_lv=%d stats=%d buf_kb=%d jpeg_buf_kb=%d\n",
-		t.idr_seconds, t.h264_high, t.min_qp, t.max_qp, t.min_iqp, t.max_iqp,
-		t.max_iprop, t.ip_qp_delta, t.row_qp_delta, t.thrd_lv, t.stats, t.buf_kb, t.jpeg_buf_kb);
-	fflush(stderr);
-	return t;
-}
+static const venc_tuning_t venc_tuning;
+// Longer than the encoder driver's own limit (2 s after its first poll that
+// timed out, osdrv patch 0029, plus a poll): the driver always ends the wait
+// first, with the frame or with its abort.
+static constexpr uint64_t venc_pending_limit_ms = 5000;
+// The encoder driver's status for a frame it gave up on (osdrv patch 0029):
+// the frame did not finish, the core was reset, and its stream never comes.
+#ifndef CVI_ERR_VENC_FRAME_ABORTED
+#define CVI_ERR_VENC_FRAME_ABORTED CVI_ERR_VENC_SYS_NOTREADY
+#endif
+// The same, when the core's reset did not complete: the core may still work
+// on the frame's buffers, and it takes no new channel.
+#ifndef CVI_ERR_VENC_CORE_FAILED
+#define CVI_ERR_VENC_CORE_FAILED CVI_ERR_VENC_NOT_PERM
+#endif
+// How a channel's submitted frame ended when the driver gave up on it (0
+// while it has not): nothing is left to drain, and teardown destroys the
+// channel before releasing the frame's input. After CVI_ERR_VENC_CORE_FAILED
+// the input and the channel's pool are kept instead.
+static int venc_frame_aborted[MMF_VENC_MAX_CHN];
 
 /*
  * Video memory shortage. The pools are sized to the measured peak, so their
@@ -208,68 +194,11 @@ static void note_video_memory(bool short_now)
 	video_memory_short_last_ms = now;
 }
 
-// Per-second encoder statistics for measurements (venc_tuning.stats).
-struct venc_stats_t {
-	uint64_t start_us;
-	unsigned frames, keyframes;
-	uint64_t bytes, key_bytes, max_bytes;
-	uint64_t qp_sum, key_qp_sum, mse_sum;
-};
-
-static venc_stats_t venc_stats;
-
 static uint64_t venc_now_us(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
-static void venc_stats_frame(const VENC_STREAM_S *stream, const VENC_CHN_STATUS_S *status, int type)
-{
-	uint64_t bytes = 0;
-	bool key = false;
-	for (CVI_U32 i = 0; i < stream->u32PackCount; i++) {
-		const VENC_PACK_S *pack = &stream->pstPack[i];
-		bytes += pack->u32Len - pack->u32Offset;
-		if (type == 1 ? (pack->DataType.enH265EType == H265E_NALU_IDRSLICE ||
-				pack->DataType.enH265EType == H265E_NALU_ISLICE)
-			: (pack->DataType.enH264EType == H264E_NALU_IDRSLICE ||
-				pack->DataType.enH264EType == H264E_NALU_ISLICE))
-			key = true;
-	}
-	venc_stats_t &s = venc_stats;
-	const uint64_t now = venc_now_us();
-	if (s.start_us == 0) s.start_us = now;
-	s.frames++;
-	s.bytes += bytes;
-	s.max_bytes = MAX(s.max_bytes, bytes);
-	s.qp_sum += status->stVencStrmInfo.u32MeanQp;
-	s.mse_sum += status->stVencStrmInfo.u32MseSum;
-	if (key) {
-		s.keyframes++;
-		s.key_bytes += bytes;
-		s.key_qp_sum += status->stVencStrmInfo.u32MeanQp;
-	}
-	if (now - s.start_us < 1000000) return;
-	FILE *f = fopen("/run/nanokvm-venc-stats.tmp", "w");
-	if (f) {
-		const unsigned deltas = s.frames - s.keyframes;
-		fprintf(f, "frames=%u keyframes=%u kbps=%llu key_kb=%llu max_kb=%llu "
-			"delta_kb=%.2f qp=%.2f delta_qp=%.2f key_qp=%.2f mse_sum=%llu\n",
-			s.frames, s.keyframes,
-			(unsigned long long)(s.bytes * 8 * 1000 / (now - s.start_us)),
-			(unsigned long long)(s.keyframes ? s.key_bytes / s.keyframes / 1024 : 0),
-			(unsigned long long)(s.max_bytes / 1024),
-			deltas ? (double)(s.bytes - s.key_bytes) / deltas / 1024 : 0.0,
-			(double)s.qp_sum / s.frames,
-			deltas ? (double)(s.qp_sum - s.key_qp_sum) / deltas : 0.0,
-			s.keyframes ? (double)s.key_qp_sum / s.keyframes : 0.0,
-			(unsigned long long)(s.mse_sum / s.frames));
-		fclose(f);
-		rename("/run/nanokvm-venc-stats.tmp", "/run/nanokvm-venc-stats");
-	}
-	s = venc_stats_t{};
 }
 
 /*
@@ -329,6 +258,9 @@ static int vi_jpeg_ch = -1; // the output whose JPEG lease is vi_jpeg_frame
 // A channel number may be recycled during the JPEG hold -> vi_mutex handoff.
 // Generations belong to their frame slots and never reset on capture restart.
 static uint64_t vi_frame_generation[MMF_VI_MAX_CHN];
+// The capture channel's pool holds a frame given up to an encoder core whose
+// reset did not complete (_mmf_strand_vi_frame): the pool is never destroyed.
+static bool vi_pool_stranded[MMF_VI_MAX_CHN];
 static thread_local uint64_t own_jpeg_generation;
 static thread_local int own_jpeg_channel = -1;
 
@@ -351,9 +283,234 @@ static bool vpss_rate_thins;   // the last known stream rate is below the input 
 // next to a video stream. It never counts as thinning the video stream.
 static int vpss_chn_max_fps[MMF_VI_MAX_CHN];
 
-// The setting: absent or anything but "0" is on.
+/*
+ * Watermark: up to MMF_WATERMARK_BLOCKS ARGB8888 pictures that the VPSS draws
+ * into every enabled output (one RGN overlay region per block and output).
+ * The region engine works on VPSS outputs only, so while a watermark is set no
+ * output takes frames straight from capture (_vi_direct_setting_on). Each
+ * block is given for a reference picture width and scaled to each output, so
+ * it covers the same share of every stream. Its place is a fraction of the
+ * free room inside the margin (0 left or top, 1000 right or bottom), which
+ * keeps a layout on any aspect ratio. Regions of one layer must not overlap;
+ * a block that overlaps one on layer 0 goes to layer 1.
+ */
+struct wm_block {
+	std::vector<uint32_t> argb;
+	int w, h, x_permille, y_permille;
+};
+static std::mutex wm_lock;
+static std::atomic<bool> wm_on;
+static std::vector<wm_block> wm_blocks;
+static int wm_ref_w, wm_margin;
+// Per output: its size when the blocks went on, which are on, and how many
+// times the missing ones were tried for this size (a failed block is tried
+// again on the next syncs, up to wm_attempts).
+static struct {
+	uint32_t chn_w, chn_h;
+	bool attached[MMF_WATERMARK_BLOCKS];
+	int attempts;
+} wm_out[MMF_VI_MAX_CHN + 1]; // the last is the channel of single pictures
+static const int wm_attempts = 3;
+// Blocks missing on enabled outputs after the last sync.
+static std::atomic<int> wm_missing;
+
+static RGN_HANDLE _wm_handle(int ch, int block)
+{
+	return 16 + ch * MMF_WATERMARK_BLOCKS + block;
+}
+
+// A block scaled to sw x sh: bilinear on premultiplied colour, so transparent
+// pixels do not darken the edges.
+static std::vector<uint32_t> _wm_scale(const wm_block &b, int sw, int sh)
+{
+	std::vector<uint32_t> out((size_t)sw * sh);
+	for (int y = 0; y < sh; ++y) {
+		const float fy = std::max(0.0f, (y + 0.5f) * b.h / sh - 0.5f);
+		const int y0 = std::min((int)fy, b.h - 1), y1 = std::min(y0 + 1, b.h - 1);
+		const float ty = fy - y0;
+		for (int x = 0; x < sw; ++x) {
+			const float fx = std::max(0.0f, (x + 0.5f) * b.w / sw - 0.5f);
+			const int x0 = std::min((int)fx, b.w - 1), x1 = std::min(x0 + 1, b.w - 1);
+			const float tx = fx - x0;
+			const uint32_t p[4] = { b.argb[(size_t)y0 * b.w + x0], b.argb[(size_t)y0 * b.w + x1],
+				b.argb[(size_t)y1 * b.w + x0], b.argb[(size_t)y1 * b.w + x1] };
+			const float k[4] = { (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
+			float a = 0, r = 0, g = 0, bl = 0;
+			for (int i = 0; i < 4; ++i) {
+				const float pa = (p[i] >> 24) / 255.0f;
+				a += k[i] * pa;
+				r += k[i] * pa * (p[i] >> 16 & 0xff);
+				g += k[i] * pa * (p[i] >> 8 & 0xff);
+				bl += k[i] * pa * (p[i] & 0xff);
+			}
+			const uint32_t A = (uint32_t)(a * 255 + 0.5f);
+			out[(size_t)y * sw + x] = a > 0 ? A << 24 | (uint32_t)(r / a + 0.5f) << 16
+				| (uint32_t)(g / a + 0.5f) << 8 | (uint32_t)(bl / a + 0.5f) : 0;
+		}
+	}
+	return out;
+}
+
+static void _wm_detach_locked(int ch)
+{
+	MMF_CHN_S chn = { CVI_ID_VPSS, 0, ch };
+	for (int i = 0; i < MMF_WATERMARK_BLOCKS; ++i) {
+		if (!wm_out[ch].attached[i]) continue;
+		CVI_RGN_DetachFromChn(_wm_handle(ch, i), &chn);
+		CVI_RGN_Destroy(_wm_handle(ch, i));
+		wm_out[ch].attached[i] = false;
+	}
+	wm_out[ch].attempts = 0;
+}
+
+// One block on an output of cw x ch_h, scaled and placed for that size.
+static int _wm_attach_block_locked(int ch, int i, uint32_t cw, uint32_t ch_h)
+{
+	const wm_block &b = wm_blocks[i];
+	const float s = (float)cw / wm_ref_w;
+	const int sw = std::min<int>(cw, std::max(2, (int)(b.w * s + 0.5f))) & ~1;
+	const int sh = std::min<int>(ch_h, std::max(2, (int)(b.h * s + 0.5f))) & ~1;
+	const int m = (int)(wm_margin * s + 0.5f);
+	const int room_x = std::max(0, (int)cw - sw - 2 * m), room_y = std::max(0, (int)ch_h - sh - 2 * m);
+	int x = m + (int)((int64_t)room_x * b.x_permille / 1000);
+	int y = m + (int)((int64_t)room_y * b.y_permille / 1000);
+	x = std::max(0, std::min(x, (int)cw - sw)) & ~1;
+	y = std::max(0, std::min(y, (int)ch_h - sh)) & ~1;
+	RGN_ATTR_S region = {};
+	region.enType = OVERLAY_RGN;
+	region.unAttr.stOverlay.enPixelFormat = PIXEL_FORMAT_ARGB_8888;
+	region.unAttr.stOverlay.stSize.u32Width = sw;
+	region.unAttr.stOverlay.stSize.u32Height = sh;
+	region.unAttr.stOverlay.u32CanvasNum = 1;
+	region.unAttr.stOverlay.stCompressInfo.enOSDCompressMode = OSD_COMPRESS_MODE_NONE;
+	const RGN_HANDLE handle = _wm_handle(ch, i);
+	int result = CVI_RGN_Create(handle, &region);
+	if (result != CVI_SUCCESS) return result;
+	MMF_CHN_S chn = { CVI_ID_VPSS, 0, ch };
+	RGN_CHN_ATTR_S at = {};
+	at.bShow = CVI_TRUE;
+	at.enType = OVERLAY_RGN;
+	at.unChnAttr.stOverlayChn.stPoint.s32X = x;
+	at.unChnAttr.stOverlayChn.stPoint.s32Y = y;
+	for (CVI_U32 layer = 0; layer < 2; ++layer) {
+		at.unChnAttr.stOverlayChn.u32Layer = layer;
+		result = CVI_RGN_AttachToChn(handle, &chn, &at);
+		if (result == CVI_SUCCESS) break;
+	}
+	if (result == CVI_SUCCESS) {
+		std::vector<uint32_t> pixels = _wm_scale(b, sw, sh);
+		BITMAP_S bitmap = { PIXEL_FORMAT_ARGB_8888, (CVI_U32)sw, (CVI_U32)sh, pixels.data() };
+		result = CVI_RGN_SetBitMap(handle, &bitmap);
+		if (result != CVI_SUCCESS) CVI_RGN_DetachFromChn(handle, &chn);
+	}
+	if (result != CVI_SUCCESS) {
+		CVI_RGN_Destroy(handle);
+		return result;
+	}
+	wm_out[ch].attached[i] = true;
+	return CVI_SUCCESS;
+}
+
+// Every output as the watermark and the outputs' state say: the blocks on
+// each enabled output at its current size, nowhere else. Called with the
+// capture lifecycle serialized (vi_mutex in libkvm). The regions shown, or
+// -EIO when a block is missing on an enabled output; a missing block is
+// tried again on the next syncs (once a second), wm_attempts times.
+static int _wm_sync(void)
+{
+	std::lock_guard<std::mutex> guard(wm_lock);
+	int shown = 0, missing = 0;
+	for (int ch = 0; ch < MMF_VI_MAX_CHN; ++ch) {
+		VPSS_CHN_ATTR_S attr;
+		const bool want = wm_on && priv.vpss_chn_enabled[ch] && CVI_VPSS_GetChnAttr(0, ch, &attr) == CVI_SUCCESS;
+		if (wm_out[ch].attempts && (!want || wm_out[ch].chn_w != attr.u32Width || wm_out[ch].chn_h != attr.u32Height))
+			_wm_detach_locked(ch);
+		if (!want) continue;
+		int absent = 0;
+		for (int i = 0; i < (int)wm_blocks.size(); ++i) absent += !wm_out[ch].attached[i];
+		if (absent && wm_out[ch].attempts < wm_attempts) {
+			++wm_out[ch].attempts;
+			wm_out[ch].chn_w = attr.u32Width;
+			wm_out[ch].chn_h = attr.u32Height;
+			for (int i = 0; i < (int)wm_blocks.size(); ++i) {
+				if (wm_out[ch].attached[i]) continue;
+				const int result = _wm_attach_block_locked(ch, i, attr.u32Width, attr.u32Height);
+				if (result != CVI_SUCCESS) {
+					fprintf(stderr, "[kvm_mmf] watermark block %d on output %d failed (try %d): %#x\n",
+						i, ch, wm_out[ch].attempts, result);
+					fflush(stderr);
+				}
+			}
+		}
+		for (int i = 0; i < (int)wm_blocks.size(); ++i) {
+			shown += wm_out[ch].attached[i];
+			missing += !wm_out[ch].attached[i];
+		}
+	}
+	wm_missing = missing;
+	return missing ? -EIO : shown;
+}
+
+// The blocks on the channel of a single picture of width x height, for the
+// one picture: false when one of them could not be put on. Without a
+// watermark there is nothing to put on.
+static bool _wm_attach_picture(int ch, int width, int height)
+{
+	std::lock_guard<std::mutex> guard(wm_lock);
+	if (!wm_on) return true;
+	for (int i = 0; i < (int)wm_blocks.size(); ++i) {
+		const int result = _wm_attach_block_locked(ch, i, width, height);
+		if (result == CVI_SUCCESS) continue;
+		printf("[mmf] watermark block %d on a picture: %#x\n", i, result);
+		_wm_detach_locked(ch);
+		return false;
+	}
+	return true;
+}
+
+int mmf_watermark_missing(void)
+{
+	return wm_missing;
+}
+
+static void _wm_detach(int ch)
+{
+	std::lock_guard<std::mutex> guard(wm_lock);
+	_wm_detach_locked(ch);
+}
+
+int mmf_watermark_set(const uint32_t *argb, const int *geometry, int count, int ref_width, int margin)
+{
+	{
+		std::lock_guard<std::mutex> guard(wm_lock);
+		if (!argb || count <= 0) {
+			wm_on = false;
+			wm_blocks.clear();
+		} else {
+			if (count > MMF_WATERMARK_BLOCKS || ref_width < 2 || margin < 0) return -EINVAL;
+			std::vector<wm_block> blocks;
+			for (int i = 0; i < count; ++i) {
+				const int *g = geometry + 4 * i;
+				if (g[0] < 2 || g[1] < 2 || g[0] > ref_width || g[2] < 0 || g[2] > 1000 || g[3] < 0 || g[3] > 1000)
+					return -EINVAL;
+				blocks.push_back({ std::vector<uint32_t>(argb, argb + (size_t)g[0] * g[1]), g[0], g[1], g[2], g[3] });
+				argb += (size_t)g[0] * g[1];
+			}
+			wm_blocks = std::move(blocks);
+			wm_ref_w = ref_width;
+			wm_margin = margin;
+			wm_on = true;
+		}
+		// New blocks go to every output again.
+		for (int ch = 0; ch < MMF_VI_MAX_CHN; ++ch) _wm_detach_locked(ch);
+	}
+	return _wm_sync();
+}
+
+// The setting: absent or anything but "0" is on. A watermark needs the VPSS.
 static bool _vi_direct_setting_on(void)
 {
+	if (wm_on) return false;
 	FILE *setting = fopen("/etc/kvm/hevc_vi_direct", "r");
 	if (!setting) return true;
 	const bool off = fgetc(setting) == '0';
@@ -420,6 +577,14 @@ static void _mmf_vi_yuv420_follow(const mmf_venc_cfg_t *cfg)
 		fflush(stderr);
 	}
 	vi_yuv420_wanted = want;
+}
+
+// The first start has no encoder to follow: the server states the mode its
+// own first stream will want (mmf_vi_yuv420_want_first), so that stream's
+// first client does not restart the capture. Later starts follow the encoder.
+void mmf_vi_yuv420_want_first(int want)
+{
+	vi_yuv420_wanted = want != 0;
 }
 
 // At every capture start, before the VI starts streaming: write the wanted
@@ -535,6 +700,25 @@ static int _mmf_release_vi_frame(int ch)
  return CVI_SUCCESS;
 }
 
+// The frame in capture slot ch went to an encoder core whose reset did not
+// complete: the core may still read it, so it is never given back. It leaves
+// the slot, which takes new frames for the other encoder and the pictures,
+// and its pool stays (the kernel would not destroy a pool with a block out).
+// The driver keeps every pool past this process as well: after such a core
+// it refuses the last VB exit until the system restarts (osdrv patch 0029).
+static void _mmf_strand_vi_frame(int ch)
+{
+ if (!priv.vi_frame_valid[ch]) return;
+ // A CPU mapping of the frame stays too: a reader may still hold its address.
+ if (!vi_frame_from_vi[ch] && priv.vi_chn_pool_id[ch] != (int)VB_INVALID_POOLID) vi_pool_stranded[ch] = true;
+ memset(&priv.vi_frame[ch], 0, sizeof(priv.vi_frame[ch]));
+ vi_frame_from_vi[ch] = false;
+ priv.vi_frame_valid[ch] = false;
+ priv.vi_frame_mapped[ch] = false;
+ priv.vi_frame_deferred[ch] = false;
+ _mmf_reclaim_disabled_pool(ch);
+}
+
 // A lower stream rate is VPSS frame-rate control on the output
 // (mmf_vpss_set_rate); the VI delivers every frame, so such an output stays
 // on VPSS.
@@ -575,6 +759,7 @@ static int _mmf_vpss_set_chn_enabled(int ch, bool enable)
 		if (!enable) _mmf_reclaim_disabled_pool(ch);
 		return CVI_SUCCESS;
 	}
+	if (!enable) _wm_detach(ch);
 	result = enable ? CVI_VPSS_EnableChn(0, ch) : CVI_VPSS_DisableChn(0, ch);
 	if (result != CVI_SUCCESS) {
 		// A failed rollback keeps the actual binding state for the next retry.
@@ -583,6 +768,7 @@ static int _mmf_vpss_set_chn_enabled(int ch, bool enable)
 	}
 	priv.vpss_chn_enabled[ch] = enable;
 	if (!enable) _mmf_reclaim_disabled_pool(ch);
+	else _wm_sync();
 	return CVI_SUCCESS;
 }
 
@@ -590,7 +776,7 @@ static int _mmf_vpss_set_chn_enabled(int ch, bool enable)
 // NV21 at the VI size without mirror or flip (VPSS would have applied them);
 // its VPSS channel is disabled so a full queue there cannot stall the group.
 // The VI channel attributes stay untouched: CVI_VI_SetChnAttr on a running VI
-// bound to VPSS stops its frames for good (stand, 2026-10-20). The startup
+// bound to VPSS stops its frames for good. The startup
 // policy keeps at most one latest frame; UHD still uses next-frame snap jobs.
 static int _mmf_vi_direct_set(int ch, bool on)
 {
@@ -685,6 +871,7 @@ static void _mmf_vi_direct_recheck(uint64_t now = venc_now_us())
 	static uint64_t last_us;
 	if (now - last_us < 1000000) return;
 	last_us = now;
+	_wm_sync();	// outputs resized meanwhile
 	// A late VPSS job may have kept a disabled pool busy on its first reclaim.
 	for (int ch = 0; ch < MMF_VI_MAX_CHN; ++ch) _mmf_reclaim_disabled_pool(ch);
 	for (int ch = 0; ch < MMF_VENC_MAX_CHN; ++ch) {
@@ -721,6 +908,7 @@ int mmf_video_path(void)
 		if (priv.venc[ch].is_inited && (priv.venc[ch].type == 1 || priv.venc[ch].type == 2)) cfg = &priv.venc[ch].cfg;
 	if (!cfg) return MMF_VIDEO_PATH_NONE;
 	if (vi_direct_venc >= 0) return MMF_VIDEO_PATH_DIRECT;
+	if (wm_on) return MMF_VIDEO_PATH_WATERMARK;
 	if (!_vi_direct_setting_on()) return MMF_VIDEO_PATH_SETTING;
 	if ((int)priv.vi_size.u32Width != cfg->w || (int)priv.vi_size.u32Height != cfg->h) return MMF_VIDEO_PATH_SIZE;
 	if (vpss_rate_thins) return MMF_VIDEO_PATH_RATE;
@@ -963,6 +1151,18 @@ static int _mmf_release_picture_pool(void)
 	return CVI_SUCCESS;
 }
 
+// Destroys capture channel ch's pool; one holding a stranded frame
+// (_mmf_strand_vi_frame) is left as it is instead, and the channel takes a
+// new pool when it needs one.
+static int _mmf_destroy_vi_pool(int ch)
+{
+    if (vi_pool_stranded[ch]) {
+        vi_pool_stranded[ch] = false;
+        return CVI_SUCCESS;
+    }
+    return _destroy_vb_pool(priv.vi_chn_pool_id[ch]);
+}
+
 // A disabled output has no VPSS producer. Return its private pool after the
 // last old VPSS lease, without touching the common pool used by VI/VENC.
 // Called on the capture lock; NV16 JPEG's independent release does not enter.
@@ -978,7 +1178,7 @@ static int _mmf_reclaim_disabled_pool(int ch)
         if (result != CVI_SUCCESS) return result;
         priv.vi_pool_detached[ch] = true;
     }
-    const int result = _destroy_vb_pool(pool);
+    const int result = _mmf_destroy_vi_pool(ch);
     if (result != CVI_SUCCESS) return result; // retain ownership for retry
     priv.vi_chn_pool_id[ch] = VB_INVALID_POOLID;
     priv.vi_pool_detached[ch] = false;
@@ -1059,6 +1259,8 @@ static void _mmf_sys_exit(void)
 		SAMPLE_COMM_VI_DestroyIsp(&g_stViConfig);
 		SAMPLE_COMM_VI_DestroyVi(&g_stViConfig);
 	}
+	// After a failed encoder core the driver refuses the last VB exit and
+	// keeps the pools (_mmf_vb_reset_stale).
 	SAMPLE_COMM_SYS_Exit();
 }
 
@@ -1099,6 +1301,8 @@ error:
 static CVI_S32 _mmf_vpss_deinit_new(VPSS_GRP VpssGrp)
 {
 	CVI_S32 s32Ret = CVI_SUCCESS;
+
+	for (int ch = 0; ch < MMF_VI_MAX_CHN; ++ch) _wm_detach(ch);
 
 	s32Ret = CVI_VPSS_StopGrp(VpssGrp);
 	if (s32Ret != CVI_SUCCESS) {
@@ -1256,6 +1460,11 @@ static int _vi_get_unused_ch() {
  * effect"), and a larger capture finds no pool for its frames (2560x1440
  * after a 1920x1080 start: "No valid pool for size(5529600)") until a
  * reboot. As the only media process, bring the count to zero before init.
+ *
+ * After an encoder core failed its reset (CVI_ERR_VENC_CORE_FAILED) the driver
+ * refuses the last exit until the system restarts (osdrv patch 0029): the
+ * core may still use blocks of those pools. The reset stops there, and this
+ * start runs on the pools and configuration of the first one.
  */
 extern "C" int get_base_fd(void);
 extern "C" int vb_ioctl_exit(int fd);
@@ -1263,9 +1472,18 @@ static void _mmf_vb_reset_stale(void)
 {
 	const int fd = get_base_fd();
 	int exits = 0;
-	while (fd >= 0 && exits < 16 && CVI_VB_IsInited() != CVI_FALSE && vb_ioctl_exit(fd) == 0) ++exits;
+	bool refused = false;
+	while (fd >= 0 && exits < 16 && CVI_VB_IsInited() != CVI_FALSE) {
+		refused = vb_ioctl_exit(fd) != 0;
+		if (refused) break;
+		++exits;
+	}
 	if (exits) {
 		fprintf(stderr, "[kvm_mmf] released %d stale VB reference%s\n", exits, exits == 1 ? "" : "s");
+		fflush(stderr);
+	}
+	if (refused) {
+		fprintf(stderr, "[kvm_mmf] video memory kept until restart: an encoder core did not reset\n");
 		fflush(stderr);
 	}
 }
@@ -1381,6 +1599,7 @@ static bool _mmf_vpss_bt709_supported(void)
 // Keeps the aspect ratio and crops the group input to the output's ratio.
 static CVI_S32 _mmf_vpss_chn_init(VPSS_GRP VpssGrp, VPSS_CHN VpssChn, int width, int height, PIXEL_FORMAT_E format, int fps, int depth, bool mirror, bool flip)
 {
+	_wm_detach(VpssChn);	// the output's size may change
 	VPSS_GRP_ATTR_S stGrpAttr;
 	VPSS_CROP_INFO_S   stChnCropInfo;
 	VPSS_CHN_ATTR_S chn_attr = {};
@@ -1451,13 +1670,6 @@ static CVI_S32 _mmf_vpss_chn_init(VPSS_GRP VpssGrp, VPSS_CHN VpssChn, int width,
 		}
 	}
 
-	s32Ret = CVI_VPSS_EnableChn(VpssGrp, VpssChn);
-	if (s32Ret != CVI_SUCCESS) {
-		SAMPLE_PRT("CVI_VPSS_EnableChn failed with %#x\n", s32Ret);
-		return CVI_FAILURE;
-	}
-
-	priv.vpss_chn_enabled[VpssChn] = true;
 	return s32Ret;
 }
 
@@ -1617,6 +1829,9 @@ static int _mmf_add_vi_channel(int ch, int width, int height, int format, int bu
 		return CVI_FAILURE;
 	}
 
+	// Set up disabled: an enabled channel without its pool asks VPSS for
+	// blocks of the pool it had before, which may be gone or, its id reused,
+	// another channel's. It is enabled below, once its own pool is attached.
 	s32Ret = _mmf_vpss_chn_init(0, ch, width_out, height_out, format_out, fps, depth, mirror, flip);
 	if (s32Ret != CVI_SUCCESS) {
 		SAMPLE_PRT("_mmf_vpss_chn_init failed with %#x!\n", s32Ret);
@@ -1654,11 +1869,21 @@ static int _mmf_add_vi_channel(int ch, int width, int height, int format, int bu
 	}
 
 	priv.vi_chn_pool_id[ch] = pool_id;
+	priv.vi_pool_detached[ch] = true; // created, not attached yet
 	s32Ret = CVI_VPSS_AttachVbPool(0, ch, pool_id);
 	if (s32Ret != CVI_SUCCESS) {
 		SAMPLE_PRT("CVI_VPSS_AttachVbPool failed. s32Ret: 0x%x !\n", s32Ret);
 		goto _need_deinit_vpss_chn;
 	}
+	priv.vi_pool_detached[ch] = false;
+
+	s32Ret = CVI_VPSS_EnableChn(0, ch);
+	if (s32Ret != CVI_SUCCESS) {
+		SAMPLE_PRT("CVI_VPSS_EnableChn failed with %#x\n", s32Ret);
+		goto _need_deinit_vpss_chn;
+	}
+	priv.vpss_chn_enabled[ch] = true;
+	_wm_sync();
 
  priv.vi_chn_stopping[ch] = false;
  return CVI_SUCCESS;
@@ -1692,8 +1917,22 @@ int mmf_del_vi_channel(int ch) {
   vi_direct_venc = -1;
  }
  vpss_chn_max_fps[ch] = 0; // a reopened channel may feed video
- result = _destroy_vb_pool(priv.vi_chn_pool_id[ch]);
- if (result != CVI_SUCCESS) return result;
+ // Detach first: a destroyed pool's id is reused by the next pool, and a
+ // channel still naming it would take that pool's blocks. A pool that cannot
+ // go yet (a reader still holds a block) is attached again: until the retry,
+ // the channel may be enabled again, and without a pool it would starve.
+ const bool attached = priv.vi_chn_pool_id[ch] != (int)VB_INVALID_POOLID && !priv.vi_pool_detached[ch];
+ if (attached) {
+  result = CVI_VPSS_DetachVbPool(0, ch);
+  if (result != CVI_SUCCESS) return result;
+  priv.vi_pool_detached[ch] = true;
+ }
+ result = _mmf_destroy_vi_pool(ch);
+ if (result != CVI_SUCCESS) {
+  if (attached && CVI_VPSS_AttachVbPool(0, ch, priv.vi_chn_pool_id[ch]) == CVI_SUCCESS)
+   priv.vi_pool_detached[ch] = false;
+  return result;
+ }
  priv.vi_chn_pool_id[ch] = VB_INVALID_POOLID;
  priv.vi_pool_detached[ch] = priv.vi_pool_reclaimed[ch] = false;
  priv.vi_chn_is_inited[ch] = false;
@@ -1895,7 +2134,7 @@ void mmf_vi_frame_release(int ch) {
  */
 static CVI_U32 jpeg_stream_buffer(int w, int h)
 {
-	const venc_tuning_t t = load_venc_tuning();
+	const venc_tuning_t &t = venc_tuning;
 	CVI_U32 bytes = t.jpeg_buf_kb > 0 ? (CVI_U32)t.jpeg_buf_kb << 10 : (CVI_U32)w * (CVI_U32)h / 2;
 	if (t.jpeg_buf_kb <= 0) bytes = MAX(bytes, 512u << 10);
 	return (bytes + 0x3ff) & ~0x3ffu; // the driver needs a multiple of 1 KiB
@@ -2111,16 +2350,6 @@ int mmf_enc_jpg_push_with_quality(int ch, uint8_t *data, int w, int h, int forma
     return _mmf_jpg_push_copy(ch, data, w, h, format, quality, NULL);
 }
 
-// Read once: called for every frame, and the environment does not change.
-static bool diagnostic_force_copy()
-{
-    static const bool force = [] {
-        const char *value = getenv("NANOKVM_DIAGNOSTIC_FORCE_COPY");
-        return value && strcmp(value, "1") == 0;
-    }();
-    return force;
-}
-
 /*
  * The copied-frame fallbacks (_mmf_venc_push_copy, _mmf_jpg_push_copy) take a
  * whole picture of the video pool: 5.3 MiB at 2560x1440, 11.9 MiB at
@@ -2196,7 +2425,7 @@ int mmf_enc_jpg_push_vi_with_quality(int ch, int vi_ch, int quality)
 
     const int updated = _mmf_jpg_update_quality(ch, quality);
     if (updated != CVI_SUCCESS) return updated;
-	CVI_S32 s32Ret = diagnostic_force_copy() ? CVI_FAILURE : CVI_VENC_SendFrame(ch, frame, 1000);
+	CVI_S32 s32Ret = CVI_VENC_SendFrame(ch, frame, 1000);
 	if (s32Ret != CVI_SUCCESS) {
         // The stride-aware copied fallback accepts NV21 only. Never treat
         // full-height NV16 chroma as subsampled VU; the caller reverts to NV21.
@@ -2575,7 +2804,7 @@ static int _mmf_tile_map_images(const VIDEO_FRAME_S &v)
 	const int uv_rows = (chroma_rows + 1) / 2 / 16; // whole block rows of the larger parity
 	// The kept planes keep the frame's row strides, so SAD and the copy see
 	// images of one layout. SAD by 16x16 blocks writes one value per block:
-	// its outputs have a block's size (checked on the stand).
+	// its outputs have a block's size.
 	// The marks are read by the CPU, byte by byte, after every SAD: they are
 	// cached (CVI_IVE_CreateImage maps uncached memory, where each byte read
 	// went to DRAM). The engine writes them and the CPU only reads them, after
@@ -2881,7 +3110,6 @@ int mmf_add_venc_channel_v2(int ch, mmf_venc_cfg_t *cfg) {
 	stVencChnAttr.stVencAttr.enType = cfg->type == 1 ? PT_H265 : PT_H264;
 	stVencChnAttr.stVencAttr.u32MaxPicWidth = cfg->w;
 	stVencChnAttr.stVencAttr.u32MaxPicHeight = cfg->h;
-	venc_tuning = load_venc_tuning();
 	stVencChnAttr.stVencAttr.u32BufSize = venc_stream_buffer(cfg);
 	stVencChnAttr.stVencAttr.bByFrame = CVI_TRUE;
 	stVencChnAttr.stVencAttr.u32PicWidth = cfg->w;
@@ -3006,9 +3234,13 @@ int mmf_del_venc_channel(int ch) {
 		int drained = CVI_SUCCESS;
 		if (!priv.venc_stream_acquired[ch]) {
 			drained = mmf_venc_pop(ch, &stream);
-			if (drained != CVI_SUCCESS && drained != CVI_ERR_VENC_BUSY) return drained;
+			// An aborted frame (now or by an earlier read) left nothing to
+			// drain: the channel goes as a wedged one does.
+			if (drained != CVI_SUCCESS && drained != CVI_ERR_VENC_BUSY
+				&& drained != CVI_ERR_VENC_FRAME_ABORTED && drained != CVI_ERR_VENC_CORE_FAILED) return drained;
 		}
-		if (drained == CVI_ERR_VENC_BUSY) {
+		if (drained == CVI_ERR_VENC_BUSY || drained == CVI_ERR_VENC_FRAME_ABORTED
+			|| drained == CVI_ERR_VENC_CORE_FAILED) {
 			fprintf(stderr, "[kvm_mmf] VENC channel %d is wedged; resetting it and releasing its input\n", ch);
 			fflush(stderr);
 			wedged = true;
@@ -3050,11 +3282,19 @@ int mmf_del_venc_channel(int ch) {
 		// and keep a wedged channel's input lease: it may still read it.
 		return destroyRet;
 	}
+	// A core that did not reset may still read the frame's input and write the
+	// channel's pool: the input, its copy and the pool stay taken, for good.
+	const bool core_failed = venc_frame_aborted[ch] == CVI_ERR_VENC_CORE_FAILED;
 	if (wedged) {
 		const int wedged_vi = priv.venc_input_vi_ch[ch];
 		info->is_running = 0;
 		priv.venc_input_vi_ch[ch] = -1;
-		if (wedged_vi >= 0) {
+		if (wedged_vi >= 0 && core_failed) {
+			_mmf_strand_vi_frame(wedged_vi);
+			fprintf(stderr, "[kvm_mmf] input %d of VENC channel %d kept for good: its core did not reset\n",
+				wedged_vi, ch);
+			fflush(stderr);
+		} else if (wedged_vi >= 0) {
 			const int released = _mmf_release_vi_frame(wedged_vi);
 			fprintf(stderr, "[kvm_mmf] released input %d of wedged VENC channel %d: %#x\n",
 				wedged_vi, ch, released);
@@ -3062,10 +3302,10 @@ int mmf_del_venc_channel(int ch) {
 		}
 	}
 
-	if (info->capture_frame) {
+	if (info->capture_frame && !core_failed) {
 		_mmf_free_frame(info->capture_frame);
-		info->capture_frame = NULL;
 	}
+	info->capture_frame = NULL;
 	/*
 	 * Do not release deferred VI frames here. Profile reconfiguration happens
 	 * after CameraCviMmf::read() has leased the next zero-copy frame, and that
@@ -3073,7 +3313,7 @@ int mmf_del_venc_channel(int ch) {
 	 * encoder. An outstanding frame owned by the old encoder is released by
 	 * mmf_venc_free() above when info->is_running is true.
 	 */
-	if (info->pool_id != VB_INVALID_POOLID && info->pool_id < VB_MAX_COMM_POOLS) {
+	if (info->pool_id != VB_INVALID_POOLID && info->pool_id < VB_MAX_COMM_POOLS && !core_failed) {
 		_destroy_vb_pool(info->pool_id);
 	}
 	free(venc_pack_storage[ch]);
@@ -3083,6 +3323,7 @@ int mmf_del_venc_channel(int ch) {
 	memset(info, 0, sizeof(venc_info_t));
 	priv.venc_stream_acquired[ch] = false;
 	priv.venc_input_vi_ch[ch] = -1;
+	venc_frame_aborted[ch] = 0;
 	if (vi_direct_venc == ch) _mmf_vi_direct_off_all();
 	fprintf(stderr, "[kvm_mmf] VENC channel %d destroyed\n", ch);
 	fflush(stderr);
@@ -3210,7 +3451,7 @@ int mmf_venc_push_vi(int ch, int vi_ch) {
 		return -1;
 	}
 
-	CVI_S32 ret = diagnostic_force_copy() ? CVI_FAILURE : CVI_VENC_SendFrame(ch, frame, 1000);
+	CVI_S32 ret = CVI_VENC_SendFrame(ch, frame, 1000);
 	if (ret == CVI_SUCCESS || ret == CVI_ERR_VENC_NOBUF) note_video_memory(ret != CVI_SUCCESS);
 	if (ret == CVI_ERR_VENC_NOBUF) {
 		// Without its buffers the channel cannot encode; a copy would not
@@ -3245,8 +3486,10 @@ int mmf_venc_push_vi(int ch, int vi_ch) {
  * up here, disabled as soon as it has delivered, and its pool destroyed.
  * Video read straight from the VI may have left the VI unbound from VPSS; it
  * is bound for the call and unbound again. The capture owner serializes calls.
+ * watermark: the picture is for people and carries the watermark, put on the
+ * channel for the call; -5 when it is set and could not be put on.
  */
-int mmf_read_bgr_planar(int width, int height, uint8_t *out, size_t size, int timeout_ms)
+int mmf_read_bgr_planar(int width, int height, uint8_t *out, size_t size, int timeout_ms, bool watermark)
 {
 	const int chn = MMF_PICTURE_CHN;
 	if (width < 16 || height < 16 || width > 1920 || height > 1920 || width % 2 || height % 2
@@ -3281,7 +3524,12 @@ int mmf_read_bgr_planar(int width, int height, uint8_t *out, size_t size, int ti
 	const bool was_bound = priv.vi_source_bound;
 	int result = -1;
 	picture_pool_attached = CVI_VPSS_AttachVbPool(0, chn, pool) == CVI_SUCCESS;
-	if (picture_pool_attached && _mmf_vi_bind_vpss(true) == CVI_SUCCESS
+	// A picture for people carries the watermark the streams carry, or there
+	// is no picture.
+	const bool marked = !watermark || _wm_attach_picture(chn, width, height);
+	if (!marked) {
+		result = -5;
+	} else if (picture_pool_attached && _mmf_vi_bind_vpss(true) == CVI_SUCCESS
 		&& CVI_VPSS_EnableChn(0, chn) == CVI_SUCCESS) {
 		VIDEO_FRAME_INFO_S frame = {};
 		result = CVI_VPSS_GetChnFrame(0, chn, &frame, timeout_ms) == CVI_SUCCESS ? 0 : -3;
@@ -3318,6 +3566,7 @@ int mmf_read_bgr_planar(int width, int height, uint8_t *out, size_t size, int ti
 	} else {
 		CVI_VPSS_DisableChn(0, chn);
 	}
+	if (watermark) _wm_detach(chn);
 	if (_mmf_release_picture_pool() != CVI_SUCCESS)
 		printf("[mmf] picture pool %d still busy; released by the next read\n", pool);
 	if (!was_bound) _mmf_vi_bind_vpss(false);
@@ -3417,6 +3666,9 @@ int mmf_venc_pop(int ch, mmf_stream_t *stream) {
 		fflush(stderr);
 		return -1;
 	}
+	// The driver gave up on the submitted frame: asking again would wait for
+	// a stream that never comes.
+	if (venc_frame_aborted[ch]) return venc_frame_aborted[ch];
 	// One frame was already submitted. GetStream waits for that frame itself;
 	// an extra 80 ms select deadline can abandon it while the codec lock is
 	// still held. StopRecvFrame/ResetChn do not cancel H.26x encoding in this SDK.
@@ -3480,14 +3732,18 @@ int mmf_venc_pop(int ch, mmf_stream_t *stream) {
 			}
 			usleep(1000);
 		} while (true);
+		if (s32Ret == CVI_ERR_VENC_FRAME_ABORTED || s32Ret == CVI_ERR_VENC_CORE_FAILED) {
+			venc_frame_aborted[ch] = s32Ret;
+			fprintf(stderr, "[kvm_mmf] VENC channel %d frame aborted by the encoder reset%s\n", ch,
+				s32Ret == CVI_ERR_VENC_CORE_FAILED ? ", which did not complete" : "");
+			fflush(stderr);
+			return s32Ret;
+		}
 		if (s32Ret != CVI_SUCCESS) {
 			printf("CVI_VENC_GetStream failed with %#x\n", s32Ret);
 			return s32Ret;
 		}
 		priv.venc_stream_acquired[ch] = true;
-		if (venc_tuning.stats && info->type != 0) {
-			venc_stats_frame(venc_stream, &stStatus, info->type);
-		}
 	} else {
 		printf("CVI_VENC_QueryStatus find not pack\r\n");
 		return -1;

@@ -22,7 +22,7 @@ parser.add_argument("--apk",type=Path,required=True,help="host apk-tools 3 with 
 parser.add_argument("--output",type=Path,required=True)
 parser.add_argument("--package-revision", type=int, help="package revision for this fresh source/build; defaults to the recipe for the same version, otherwise zero")
 source_group=parser.add_mutually_exclusive_group(required=True)
-source_group.add_argument("--source-url",help="immutable public URL for this package revision source archive")
+source_group.add_argument("--source-url",help="public URL of the Git tree this package revision is built from")
 source_group.add_argument("--local-only",action="store_true",help="local unpublished package with corresponding source beside the APK")
 args=parser.parse_args()
 root=Path(__file__).resolve().parents[1]
@@ -75,15 +75,35 @@ tomllib.loads((stage/".cargo/config.toml").read_text())
 target="riscv64gc-unknown-linux-musl"
 target_dir=root/"work"/"rust-target"
 rust_flags=tomllib.loads(cargo_config)["target"][target]["rustflags"]
-# No RUSTFLAGS: it would override the flags of .cargo/config.toml.
+# .cargo/config.toml links the linker's musl (1.2.6), not rustup's older
+# self-contained copy (link-self-contained=no). Of the self-contained files
+# only LLVM's libunwind.a is still needed; it does not depend on the C library.
+# It goes into a directory of its own, so rustup's libc.a stays out of the
+# search path.
+rust_sysroot=Path(subprocess.check_output(["rustc","--print","sysroot"],cwd=source,text=True).strip())
+unwind_dir=root/"work"/"rust-unwind"
+unwind_dir.mkdir(parents=True,exist_ok=True)
+shutil.copyfile(rust_sysroot/"lib/rustlib"/target/"lib/self-contained/libunwind.a",unwind_dir/"libunwind.a")
+build_flags=rust_flags+["-C",f"link-arg=-L{unwind_dir}"]
+# No RUSTFLAGS: it would override the flags of .cargo/config.toml. The
+# target-specific variable replaces them too, so it repeats them in full.
 env={k:v for k,v in os.environ.items() if k not in ("RUSTFLAGS","CARGO_ENCODED_RUSTFLAGS")}
-env.update(CARGO_TARGET_DIR=str(target_dir),CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=str(args.linker.absolute()))
+env.update(CARGO_TARGET_DIR=str(target_dir),CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=str(args.linker.absolute()),
+           CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_RUSTFLAGS=" ".join(build_flags))
 subprocess.run(["cargo","build","--locked","--release","--target",target],cwd=source,env=env,check=True)
 binary=target_dir/target/"release"/"nanokvm-rustdesk"
+# musl 1.2.6 rounds the new thread's stack down to 16 bytes before __clone stores
+# fn and arg: c.andi a1,-16 (c1 99) before c.addi a1,-16 (c1 15) and the stores
+# c.sd a0,0(a1); c.sd a3,8(a1) (88 e1 94 e5). Refuse a binary without it.
+image=binary.read_bytes()
+clone_sites=[m.start() for m in re.finditer(re.escape(bytes.fromhex("c11588e194e5")),image)]
+if not clone_sites or any(image[i-2:i]!=bytes.fromhex("c199") for i in clone_sites):
+    raise SystemExit(f"{binary}: __clone does not align the thread stack (musl older than 1.2.6 linked)")
 build_profile={
     "profile":"release",
     "target":target,
     "rustflags":rust_flags,
+    "libc":"the linker's musl (link-self-contained=no); __clone stack alignment checked",
     "cargo_profile":tomllib.loads((source/"Cargo.toml").read_text()).get("profile",{}).get("release",{}),
     "rustc":subprocess.check_output(["rustc","-vV"],cwd=source,text=True),
     "binary_sha256":hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -109,7 +129,7 @@ not a production download checksum (an archive cannot contain its own digest). T
 preserved as a record of the NanoKVM firmware repository's packaging script;
 it expects that repository's addons/rustdesk and firmware/alpine layout.
 The APK contains binary, lifecycle hooks, license, upstream metadata and a
-source URL/digest record. It does not contain this archive or vendored crates.
+source URL record. It does not contain this archive or vendored crates.
 """)
 # Export the new Go transport as a independently buildable component as well.
 # The integrated application is packaged separately; this records its exact IPC hook.
@@ -123,14 +143,14 @@ stream_integration=stage/"app-stream-integration"
 stream_integration.mkdir()
 vm_integration=stage/"app-usb-integration"
 vm_integration.mkdir()
-for name in ["usb-composition.go","usb-composition_test.go","virtual-device.go"]:
+for name in ["usb-composition.go","virtual-device.go"]:
     shutil.copyfile(root/"server/service/vm"/name,vm_integration/(name+".integration"))
 shutil.copyfile(root/"server/service/rustdesk/service.go",vm_integration/"rustdesk-service.go.integration")
 
-for name in ["encoder_config.go","video_source.go","video_source_test.go","state.go","state_test.go"]:
+for name in ["encoder_config.go","video_source.go","state.go","state_test.go"]:
     shutil.copyfile(root/"server/service/stream"/name,stream_integration/(name+".integration"))
 
-for name in ["audio.go","audio_test.go","bridge_test.go","pointer.go","pointer_test.go"]:
+for name in ["audio.go","control.go","pointer.go"]:
     shutil.copyfile(root/"server/service/rustdesk"/name,go_transport/(name+".integration"))
 hid_integration=stage/"app-hid-integration"
 hid_integration.mkdir()
@@ -140,8 +160,7 @@ for path in sorted((root/"server/service/hid").glob("*.go")):
 (go_transport/"go.mod").write_text((root/"server/go.mod").read_text())
 shared_audio=go_transport/"service/stream/audio"
 shared_audio.mkdir(parents=True)
-for name in ["audio.go","audio_test.go"]:
-    shutil.copyfile(root/"server/service/stream/audio"/name,shared_audio/name)
+shutil.copyfile(root/"server/service/stream/audio/audio.go",shared_audio/"audio.go")
 shutil.copyfile(root/"server/go.sum",go_transport/"go.sum")
 # Preserve all local Pion replacements: these are production C906 changes.
 for line in (root/"server/go.mod").read_text().splitlines():
@@ -155,7 +174,7 @@ subprocess.run(["go","mod","vendor"],cwd=go_transport,check=True)
 The application runs webrtc.go and audio.go in service/rustdesk. The standalone source here
 includes locked, vendored dependencies, shared-hub and real data-channel tests:
 go test -mod=vendor -race ./...
-bridge.go.integration and audio*.integration record application start/stop,
+bridge.go.integration, control.go.integration and audio*.integration record application start/stop,
 root-only sockets and integration tests; run those in the full app module. its common/authn/media dependencies belong to the NanoKVM app source.
 The Unix listener must use SO_PEERCRED to allow uid 0 only, directory 0700 and
 socket 0600. Offer/answer/candidate/attach JSON has a u32 little-endian length
@@ -181,11 +200,11 @@ shutil.copyfile(root/"scripts/nanokvm_cpu_profile.py",go_transport/"nanokvm_cpu_
 shutil.copyfile(root/"server/service/rustdesk/webrtc_socket_test.go",go_transport/"webrtc_socket_test.go.integration")
 archive=output/f"nanokvm-rustdesk-{version}-source.tar.gz"
 with tarfile.open(archive,"w:gz") as tar:tar.add(stage,arcname=stage.name)
-# Publish/commit this external production recipe after computing the archive.
+# The recipe for a native Alpine build: it takes the archive from beside it.
 checksum_block="sha512sums=\""+hashlib.sha512(archive.read_bytes()).hexdigest()+"  "+archive.name+"\n"+"\n".join(hashlib.sha512((pkg/name).read_bytes()).hexdigest()+"  "+name for name in ["nanokvm-rustdesk.initd","nanokvm-rustdesk-c906.toml"])+"\"\n"
 production_recipe_input=re.sub(
     r"(?m)^sourceurl=.*$",
-    lambda _: "sourceurl="+shlex.quote(archive.name if args.local_only else args.source_url),
+    lambda _: "sourceurl="+shlex.quote(archive.name),
     recipe,
 )
 production_recipe=re.sub(r"(?ms)^sha512sums=.*\Z", "",production_recipe_input).rstrip()+"\n\n"+checksum_block
@@ -201,13 +220,17 @@ install(pkg/"nanokvm-rustdesk.initd","etc/init.d/nanokvm-rustdesk",0o755)
 install(source/"LICENSE","usr/share/licenses/nanokvm-rustdesk/LICENSE")
 install(source/"NOTICE","usr/share/licenses/nanokvm-rustdesk/NOTICE")
 source_record=staging_root/"source.json"
-source_record.write_text(json.dumps({"url":args.source_url,"archive":archive.name,"publication":"local-unpublished" if args.local_only else "external-immutable-url","sha256":hashlib.sha256(archive.read_bytes()).hexdigest(),"package_version":package_version,"build_profile":"release"},indent=2)+"\n")
+# A published build links the Git tree of its tag; its archive is not published.
+record={"url":args.source_url,"publication":"git-tree","package_version":package_version,"build_profile":"release"}
+if args.local_only:
+    record.update(archive=archive.name,publication="local-unpublished",sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
+source_record.write_text(json.dumps(record,indent=2)+"\n")
 install(source_record,"usr/share/nanokvm-rustdesk/source.json")
 install(source/"upstream.json","usr/share/nanokvm-rustdesk/upstream.json")
 install(stage/"build-profile.json","usr/share/nanokvm-rustdesk/build-profile.json")
 apkfile=output/f"nanokvm-rustdesk-{package_version}.apk"
 command=[str(args.apk.resolve()),"mkpkg","--files",str(payload),"--output",str(apkfile)]
-for value in ["name:nanokvm-rustdesk",f"version:{package_version}","arch:riscv64","license:AGPL-3.0-only","description:RustDesk HDMI and USB HID endpoint for NanoKVM OS","depends:nanokvm-rustdesk-bridge=1 nanokvm-rustdesk-webrtc=1 nanokvm-rustdesk-audio=1 nanokvm-rustdesk-auto-codec=1 nanokvm-rustdesk-usb-defaults=1 openrc","url:https://github.com/dormancygrace/NanoKVM-OS/tree/main/addons/rustdesk"]:
+for value in ["name:nanokvm-rustdesk",f"version:{package_version}","arch:riscv64","license:AGPL-3.0-only","description:RustDesk HDMI and USB HID endpoint for NanoKVM OS","depends:nanokvm-os>=4.2.0 nanokvm-rustdesk-bridge=2 nanokvm-rustdesk-webrtc=1 nanokvm-rustdesk-audio=1 nanokvm-rustdesk-auto-codec=1 nanokvm-rustdesk-usb-defaults=1 openrc","url:https://github.com/dormancygrace/NanoKVM-OS/tree/main/addons/rustdesk"]:
     command+=["--info",value]
 for action in ["pre-upgrade","post-upgrade","pre-deinstall"]:
     command+=["--script",action+":"+str(pkg/("nanokvm-rustdesk."+action))]

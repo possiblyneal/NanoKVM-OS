@@ -1,12 +1,16 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
+
+	"NanoKVM-Server/internal/atomicfile"
 	"NanoKVM-Server/service/hid"
 )
 
@@ -32,15 +36,50 @@ func changeImage(path string, change func() error) error {
 	return change()
 }
 
+// CheckImageUnused checks the current USB state without reserving the path.
+func CheckImageUnused(path string) error {
+	h := hid.GetHid()
+	h.Lock()
+	defer h.Unlock()
+	return imageUnused(path)
+}
+
 // InstallImage publishes an upload/download only while its destination is not
 // referenced by any LUN or a boot marker that a composition apply can reattach.
-func InstallImage(tempPath, destPath string) error {
-	return changeImage(destPath, func() error { return os.Rename(tempPath, destPath) })
+// The caller has synced the bytes of tempPath. A transfer canceled before the
+// rename, also while it waited for the lock, publishes nothing: ctx is checked
+// under the lock, which is the commit point.
+func InstallImage(ctx context.Context, tempPath, destPath string) error {
+	if err := changeImage(destPath, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return os.Rename(tempPath, destPath)
+	}); err != nil {
+		return err
+	}
+	syncImageDir(destPath)
+	return nil
 }
 
 // RemoveImage also protects startup cleanup of incomplete image transfers.
 func RemoveImage(path string) error {
-	return changeImage(path, func() error { return os.Remove(path) })
+	if err := changeImage(path, func() error { return os.Remove(path) }); err != nil {
+		return err
+	}
+	syncImageDir(path)
+	return nil
+}
+
+// syncImageDir writes the directory entry of an installed or removed image
+// to the card. /data is exFAT, which has no journal: until the directory is
+// written back, a power cut undoes the rename or the unlink. It runs outside
+// the HID lock, a card flush must not hold up the keyboard. The change is
+// already done in the running system, so a failure is only logged.
+func syncImageDir(path string) {
+	if err := atomicfile.SyncDir(filepath.Dir(path)); err != nil {
+		log.Warnf("sync directory of %s: %v", filepath.Base(path), err)
+	}
 }
 
 func imageUnused(path string) error {

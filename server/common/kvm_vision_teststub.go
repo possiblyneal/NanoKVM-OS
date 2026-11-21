@@ -43,11 +43,19 @@ func (k *KvmVision) ReadBGRPlanar(int, int) ([]byte, error) {
 	return nil, ErrPlanarPictureUnavailable
 }
 
+func (k *KvmVision) ReadBGRScaled(int, int) ([]byte, error) {
+	return nil, ErrPlanarPictureUnavailable
+}
+
 func (k *KvmVision) HasHDMISignal() bool {
 	return false
 }
 
 func (k *KvmVision) SetFrameDetect(uint8) {}
+
+func (k *KvmVision) SetWatermark([]uint32, []int32, int) int { return 0 }
+
+func (k *KvmVision) WatermarkMissing() int { return 0 }
 
 func (k *KvmVision) Close() {}
 
@@ -67,6 +75,6 @@ func (k *KvmVision) SetMjpegChroma(chroma uint16) int {
 
 func (k *KvmVision) ReleaseMjpegTiles() {}
 
-func (k *KvmVision) ReadMjpegTiles(uint16, uint16, uint16, bool, uint16) ([]byte, int) {
-	return nil, MjpegTilesUnsupported
+func (k *KvmVision) ReadMjpegTiles(uint16, uint16, uint16, bool, uint16) ([]byte, []byte, int) {
+	return nil, nil, MjpegTilesUnsupported
 }

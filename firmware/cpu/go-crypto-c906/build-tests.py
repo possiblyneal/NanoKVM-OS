@@ -20,6 +20,7 @@ parser.add_argument('--gocache', type=Path)
 parser.add_argument('--package', action='append', choices=PACKAGES,
                     help='Build only selected packages (repeatable; default: all)')
 parser.add_argument('--poly1305-reference', action='store_true', help='compare the pinned upstream Poly1305 with existing fast unaligned loads')
+parser.add_argument('--tags', default='', help='go build tags, e.g. nanokvmqemu for binaries that run under QEMU (no XTheadVector)')
 args = parser.parse_args()
 here = Path(__file__).resolve().parent
 goroot = args.goroot.absolute()
@@ -50,10 +51,23 @@ if args.poly1305_reference:
     reference_path = args.output / 'poly1305-reference_riscv64.s'
     reference_path.write_text(reference)
     overlay[str(goroot / 'src/vendor/golang.org/x/crypto/internal/poly1305/sum_riscv64.s')] = str(reference_path.absolute())
-    # The reference has no CRYPTOGAMS blocks functions to declare.
+    # The reference has no CRYPTOGAMS blocks functions to declare, and its
+    # update is the upstream one: the vector kernel and its update go too.
     empty = args.output / 'poly1305-reference_c906.go'
     empty.write_text('package poly1305\n')
-    overlay[str(goroot / 'src/vendor/golang.org/x/crypto/internal/poly1305/sum_c906_riscv64.go')] = str(empty.absolute())
+    empty_s = args.output / 'poly1305-reference_vector.s'
+    empty_s.write_text('// The upstream reference has no vector kernel.\n')
+    for name, path in [('sum_c906_riscv64.go', empty), ('sum_vector_riscv64.go', empty), ('sum_vector_riscv64.s', empty_s)]:
+        overlay[str(goroot / 'src/vendor/golang.org/x/crypto/internal/poly1305' / name)] = str(path.absolute())
+    overlay.pop(str(goroot / 'src/vendor/golang.org/x/crypto/internal/poly1305/c906_vector_test.go'), None)
+    # The upstream assembly update needs sum_asm.go's declaration on riscv64.
+    poly_dir = goroot / 'src/vendor/golang.org/x/crypto/internal/poly1305'
+    asm = (poly_dir / 'sum_asm.go').read_text()
+    tag = '//go:build gc && !purego && (amd64 || loong64 || ppc64 || ppc64le)\n'
+    assert asm.count(tag) == 1
+    asm_riscv64 = args.output / 'poly1305-reference_asm.go'
+    asm_riscv64.write_text(asm.replace(tag, '//go:build gc && !purego\n'))
+    overlay[str(poly_dir / 'sum_asm_riscv64.go')] = str(asm_riscv64.absolute())
 STD = {}
 sha3 = goroot / 'src/crypto/internal/fips140/sha3'
 if (sha3 / 'keccak_c906_riscv64.s').exists():
@@ -69,12 +83,12 @@ with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
 try:
     for pkg in args.package or PACKAGES:
         out = args.output / (Path(pkg).name + '.test')
-        subprocess.run([str(goroot / 'bin/go'), 'test', '-c', '-trimpath', '-overlay', f.name, '-o', str(out),
+        subprocess.run([str(goroot / 'bin/go'), 'test', '-c', '-trimpath', '-tags', args.tags, '-overlay', f.name, '-o', str(out),
                         'vendor/golang.org/x/crypto/' + pkg], env=env, check=True)
         print(out)
     for pkg, name in STD.items():
         out = args.output / (name + '.test')
-        subprocess.run([str(goroot / 'bin/go'), 'test', '-c', '-trimpath', '-overlay', f.name, '-o', str(out), pkg],
+        subprocess.run([str(goroot / 'bin/go'), 'test', '-c', '-trimpath', '-tags', args.tags, '-overlay', f.name, '-o', str(out), pkg],
                        env=env, check=True)
         print(out)
 finally:

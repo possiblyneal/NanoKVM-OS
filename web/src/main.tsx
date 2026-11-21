@@ -7,10 +7,16 @@ import { RouterProvider } from 'react-router-dom';
 
 import { AppTheme } from './components/app-theme.tsx';
 import { MainError } from './components/main-error.tsx';
+import { RecheckDialog } from './components/recheck-dialog.tsx';
 import { i18nReady } from './i18n';
+import { applyTheme, storedTheme } from './lib/theme.ts';
 import { router } from './router';
 
+import '@fontsource-variable/inter';
 import './assets/styles/index.css';
+
+// before the first paint, the loading spinner included
+applyTheme(storedTheme());
 
 const renderApp = () => {
   return ReactDOM.createRoot(document.getElementById('root')!).render(
@@ -26,6 +32,7 @@ const renderApp = () => {
           <StyleProvider layer>
             <AppTheme>
               <RouterProvider router={router} />
+              <RecheckDialog />
             </AppTheme>
           </StyleProvider>
         </ErrorBoundary>

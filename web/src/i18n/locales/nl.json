@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "Aan/uit",
-    "showConfirm": "Bevestiging",
-    "showConfirmTip": "Stroombedieningen vereisen een extra bevestiging",
     "reset": "Resetten",
     "powerShort": "Aan/uit (kort indrukken)",
     "powerLong": "Aan/uit (lang indrukken)",
@@ -350,12 +348,13 @@
         "modeAlways": "Altijd zichtbaar",
         "keyboardLedStatus": "Toetsvergrendelingsindicatoren",
         "keyboardLedStatusDesc": "Caps Lock, Num Lock en Scroll Lock van de externe computer in de menubalk tonen.",
+        "hostLedStatus": "Voedings- en schijfindicatoren",
+        "hostLedStatusDesc": "Toon de voedings- en HDD-led van de externe computer in de menubalk.",
         "icons": "Knoppen van de menubalk",
         "iconsDesc": "Submenupictogrammen weergeven in de menubalk",
         "hiddenCount": "{{count}} verborgen",
         "showAll": "Alles tonen"
       },
-      "buttonColor": {},
       "browser": "In deze browser",
       "browserDesc": "Alleen in deze browser bewaard; andere browsers en gebruikers hebben hun eigen.",
       "device": "Voor iedereen op dit apparaat",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Uploaden"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "Voedings- en schijfled van de externe computer",
+      "powerLed": "Voedingsled",
+      "powerLedShort": "Pwr",
+      "hddLed": "HDD-led",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Toetsvergrendelingsstatus van extern toetsenbord",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "Opslaan"
       },
-      "addons": {
-        "title": "Uitbreidingspakketten",
-        "packages": "Pakketten",
-        "install": "Installeren"
-      },
       "title": "Software",
+      "packages": "Pakketten",
       "available": "Beschikbare pakketten",
       "updatesTab": "Updates",
       "search": "Zoeken",
@@ -744,10 +746,7 @@
       }
     },
     "rustdesk": {
-      "absent": "Niet geïnstalleerd",
       "stopped": "Gestopt",
-      "install": "Installeren",
-      "remove": "Verwijderen",
       "save": "Instellingen opslaan",
       "server": "Server",
       "passwordMode": "Wachtwoord",
@@ -801,8 +800,7 @@
       "eventHint": {
         "power": "de host is in- of uitgeschakeld; vereist ATX-besturing met aangesloten voedings-LED.",
         "hdmi": "het beeld viel weg of kwam terug, ook als de host zijn scherm uitzet; wordt gezien terwijl videoopname loopt.",
-        "security": "een adres geblokkeerd na mislukte aanmeldingen, een aanmelding vanaf een nieuw adres.",
-        "screen": "een blauw scherm of een kernel panic, herkend door de TPU-add-on; de tekst wordt gelezen als niemand naar de video kijkt, en er wordt een screenshot bij gestuurd."
+        "security": "een adres geblokkeerd na mislukte aanmeldingen, te veel IPMI-aanmeldpogingen, een aanmelding vanaf een nieuw adres."
       },
       "field": {
         "token": "Token",
@@ -883,6 +881,7 @@
         "hdmi_lost": "HDMI-signaal verloren",
         "hdmi_restored": "HDMI-signaal hersteld",
         "security_lockout": "Aanmeldingen geblokkeerd",
+        "security_attempt-limit": "Aanmeldpogingen beperkt",
         "security_new-address": "Aanmelding vanaf een nieuw adres",
         "screen_bsod": "Blauw scherm",
         "screen_panic": "Kernel panic",
@@ -928,16 +927,6 @@
         "authError": "De aanmelding werkt niet meer: {{error}}",
         "changed": "De dienst, client-ID of tenant is tijdens het aanmelden gewijzigd. Meld u opnieuw aan."
       }
-    },
-    "addonPage": {
-      "failed": "Kan de waarden van de add-on niet lezen",
-      "notRunning": "De dienst van de add-on draait niet",
-      "refused": "De add-on heeft het geweigerd",
-      "saved": "Opgeslagen",
-      "save": "Opslaan",
-      "status": "Status",
-      "yes": "Ja",
-      "no": "Nee"
     }
   },
   "picoclaw": {

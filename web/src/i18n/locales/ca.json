@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "Alimentació",
-    "showConfirm": "Confirmació",
-    "showConfirmTip": "Les operacions d'alimentació requereixen confirmació",
     "reset": "Reinicia",
     "powerShort": "Clic curt",
     "powerLong": "Clic llarg",
@@ -350,12 +348,13 @@
         "modeAlways": "Sempre visible",
         "keyboardLedStatus": "Indicadors de bloqueig del teclat",
         "keyboardLedStatusDesc": "Mostra Bloq Maj, Bloq Núm i Bloq Despl de l'ordinador remot a la barra de menú.",
+        "hostLedStatus": "Indicadors d'alimentació i disc",
+        "hostLedStatusDesc": "Mostra els LED d'alimentació i de disc de l'ordinador remot a la barra de menú.",
         "icons": "Botons de la barra de menú",
         "iconsDesc": "Mostra les icones del submenú a la barra de menús",
         "hiddenCount": "{{count}} amagats",
         "showAll": "Mostra-ho tot"
       },
-      "buttonColor": {},
       "browser": "En aquest navegador",
       "browserDesc": "Es desa només en aquest navegador; altres navegadors i usuaris tenen els seus.",
       "device": "Per a tothom en aquest dispositiu",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Puja"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "LED d'alimentació i de disc de l'ordinador remot",
+      "powerLed": "LED d'alimentació",
+      "powerLedShort": "Pwr",
+      "hddLed": "LED de disc",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Estat de bloqueig del teclat remot",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "Desa"
       },
-      "addons": {
-        "title": "Complements",
-        "packages": "Paquets",
-        "install": "Instal·la"
-      },
       "title": "Programari",
+      "packages": "Paquets",
       "available": "Paquets disponibles",
       "updatesTab": "Actualitzacions",
       "search": "Cerca",
@@ -742,10 +744,7 @@
       }
     },
     "rustdesk": {
-      "absent": "No instal·lat",
       "stopped": "Aturat",
-      "install": "Instal·la",
-      "remove": "Elimina",
       "save": "Desa la configuració",
       "server": "Servidor",
       "passwordMode": "Contrasenya",
@@ -799,8 +798,7 @@
       "eventHint": {
         "power": "l'amfitrió s'ha encès o apagat; requereix control ATX amb el LED d'alimentació connectat.",
         "hdmi": "s'ha perdut la imatge o ha tornat, també quan l'amfitrió apaga la pantalla; es detecta mentre la captura de vídeo està activa.",
-        "security": "una adreça bloquejada després d'inicis de sessió fallits, un inici de sessió des d'una adreça nova.",
-        "screen": "una pantalla blava o un kernel panic, reconeguts pel complement TPU; el text es llegeix quan ningú mira el vídeo i s'envia amb una captura de pantalla."
+        "security": "una adreça bloquejada després d'inicis de sessió fallits, massa intents d'inici de sessió IPMI, un inici de sessió des d'una adreça nova."
       },
       "field": {
         "token": "Token",
@@ -881,6 +879,7 @@
         "hdmi_lost": "Senyal HDMI perdut",
         "hdmi_restored": "Senyal HDMI restablert",
         "security_lockout": "Inicis de sessió bloquejats",
+        "security_attempt-limit": "Intents d'inici de sessió limitats",
         "security_new-address": "Inici de sessió des d'una adreça nova",
         "screen_bsod": "Pantalla blava",
         "screen_panic": "Kernel panic",
@@ -926,16 +925,6 @@
         "authError": "L'inici de sessió ja no funciona: {{error}}",
         "changed": "El servei, l'ID de client o el tenant han canviat durant l'inici de sessió. Torneu a iniciar la sessió."
       }
-    },
-    "addonPage": {
-      "failed": "No s'han pogut llegir els valors del complement",
-      "notRunning": "El servei del complement no s'està executant",
-      "refused": "El complement ho ha rebutjat",
-      "saved": "Desat",
-      "save": "Desa",
-      "status": "Estat",
-      "yes": "Sí",
-      "no": "No"
     }
   },
   "picoclaw": {

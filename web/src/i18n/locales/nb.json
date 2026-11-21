@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "På-knapp",
-    "showConfirm": "Bekreftelse",
-    "showConfirmTip": "Strømdrift krever en ekstra bekreftelse",
     "reset": "Reset-knapp",
     "powerShort": "På-knapp (kort trykk)",
     "powerLong": "På-knapp (langt trykk)",
@@ -350,12 +348,13 @@
         "modeAlways": "Alltid synlig",
         "keyboardLedStatus": "Indikatorer for tastaturlås",
         "keyboardLedStatusDesc": "Vis Caps Lock, Num Lock og Scroll Lock for den eksterne datamaskinen i menylinjen.",
+        "hostLedStatus": "Strøm- og diskindikatorer",
+        "hostLedStatusDesc": "Vis strøm- og HDD-lysdiodene til den eksterne datamaskinen i menylinjen.",
         "icons": "Knapper i menylinjen",
         "iconsDesc": "Vis undermenyikoner i menylinjen",
         "hiddenCount": "{{count}} skjult",
         "showAll": "Vis alle"
       },
-      "buttonColor": {},
       "browser": "I denne nettleseren",
       "browserDesc": "Lagres bare i denne nettleseren; andre nettlesere og brukere har sine egne.",
       "device": "For alle på denne enheten",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "Last opp"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "Strøm- og disklysdioder for den eksterne datamaskinen",
+      "powerLed": "Strømlysdiode",
+      "powerLedShort": "Pwr",
+      "hddLed": "HDD-lysdiode",
+      "hddLedShort": "HDD"
     },
     "keyboardLedStatus": {
       "groupLabel": "Status for låser på eksternt tastatur",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "Lagre"
       },
-      "addons": {
-        "title": "Tillegg",
-        "packages": "Pakker",
-        "install": "Installer"
-      },
       "title": "Programvare",
+      "packages": "Pakker",
       "available": "Tilgjengelige pakker",
       "updatesTab": "Oppdateringer",
       "search": "Søk",
@@ -743,10 +745,7 @@
       }
     },
     "rustdesk": {
-      "absent": "Ikke installert",
       "stopped": "Stoppet",
-      "install": "Installer",
-      "remove": "Fjern",
       "save": "Lagre innstillinger",
       "server": "Server",
       "passwordMode": "Passord",
@@ -800,8 +799,7 @@
       "eventHint": {
         "power": "verten ble slått på eller av; krever ATX-kontroll med strøm-LED tilkoblet.",
         "hdmi": "bildet ble borte eller kom tilbake, også når verten slår av skjermen; oppdages mens videoopptaket kjører.",
-        "security": "en adresse blokkert etter mislykkede innlogginger, en innlogging fra en ny adresse.",
-        "screen": "en blåskjerm eller en kernel panic, gjenkjent av TPU-tillegget; teksten leses når ingen ser på videoen, og et skjermbilde sendes med."
+        "security": "en adresse blokkert etter mislykkede innlogginger, for mange IPMI-påloggingsforsøk, en innlogging fra en ny adresse."
       },
       "field": {
         "token": "Token",
@@ -882,6 +880,7 @@
         "hdmi_lost": "HDMI-signal tapt",
         "hdmi_restored": "HDMI-signal gjenopprettet",
         "security_lockout": "Innlogginger blokkert",
+        "security_attempt-limit": "Påloggingsforsøk begrenset",
         "security_new-address": "Innlogging fra en ny adresse",
         "screen_bsod": "Blåskjerm",
         "screen_panic": "Kernel panic",
@@ -927,16 +926,6 @@
         "authError": "Innloggingen fungerer ikke lenger: {{error}}",
         "changed": "Tjenesten, klient-ID-en eller tenant ble endret under innloggingen. Logg inn på nytt."
       }
-    },
-    "addonPage": {
-      "failed": "Kunne ikke lese verdiene til tillegget",
-      "notRunning": "Tilleggets tjeneste kjører ikke",
-      "refused": "Tillegget avviste det",
-      "saved": "Lagret",
-      "save": "Lagre",
-      "status": "Status",
-      "yes": "Ja",
-      "no": "Nei"
     }
   },
   "picoclaw": {

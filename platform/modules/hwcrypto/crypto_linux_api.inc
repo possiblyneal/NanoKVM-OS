@@ -1,18 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Linux Crypto API frontend. One shared DMA owner; atomic callers are queued. */
+/* Linux Crypto API frontend. Callers that may sleep, and AES callers in
+ * atomic context, run the engine themselves (sg2_own()); other atomic callers
+ * are queued. */
 #include <crypto/internal/skcipher.h>
 #include <crypto/internal/hash.h>
-#include <crypto/internal/des.h>
 #include <linux/workqueue.h>
 #include <linux/scatterlist.h>
 #include <linux/unaligned.h>
 
 static struct workqueue_struct *crypto_api_wq;
 
-/* Requests from atomic context wait on one ordered workqueue. Bound them: a
- * flood (ovpn decrypts every received packet in softirq) must not queue
- * without end. A caller that allows a backlog waits for its completion and
- * is not refused; the others get -ENOSPC and drop the request.
+/* Hash requests from atomic context, and any request with
+ * interrupts off, wait on one ordered workqueue. Bound them: a flood must not
+ * queue without end. A caller that allows a backlog waits for its completion
+ * and is not refused; the others get -ENOSPC and drop the request.
  */
 #define SG2_ASYNC_MAX 64
 static atomic_t sg2_async_queued = ATOMIC_INIT(0);
@@ -26,14 +27,44 @@ static int sg2_async_enter(u32 flags)
 }
 static void sg2_async_leave(void) { atomic_dec(&sg2_async_queued); }
 
-/* After the poison latch (crypto_finish_locked) the engine is never used
- * again. Requests then go to the synchronous software implementation of the
- * same algorithm, where one is built (not DES, 3DES or SM4): new and queued
+/* Completion callbacks of async requests expect softirq context: ovpn sends
+ * the encrypted packet from its callback, and with TCP that takes the socket
+ * the TCP timers also use under bh_lock_sock(). From the workqueue a timer
+ * could interrupt the send (kernel oops in tcp_event_new_data_sent). Complete
+ * with bottom halves disabled, as crypto/cryptd.c does. */
+#define sg2_complete(fn, req, err) do { local_bh_disable(); fn(req, err); local_bh_enable(); } while (0)
+
+/* After the poison latch (sg2_poison()) the engine is never used again.
+ * Requests then go to the synchronous software implementation of the same
+ * algorithm, where one is built, which also serves the
+ * AES requests too short for the engine: new and queued
  * requests work again; only the request that met the failure fails. The
  * algorithms here are marked NEED_FALLBACK, so that a fallback never finds
  * them, nor a template built for one (gcm over ctr(aes)).
  */
 static bool sg2_use_fallback(const void *fallback) { return fallback && READ_ONCE(poisoned); }
+
+/* An AES request from softirq, or from a task with bottom halves or preemption
+ * off, runs on the engine at once: for a 1400-byte packet the ordered
+ * workqueue cost more than the encryption (queued, the engine was slower than
+ * the software gcm). spin_lock_bh() needs interrupts on. */
+static bool sg2_inline(void) { return !in_hardirq() && !irqs_disabled(); }
+
+/* A request costs the engine about 4.5 us before the first byte (SG2002); the
+ * kernel's AES block code for the C906 takes 0.6 us per block with a 128-bit
+ * key and 0.82 us with a 256-bit key. Up to these lengths the software
+ * version is faster (the crossover measured per mode and key). The kernel has
+ * no software cbc(aes), so CBC requests have no fallback and use the engine
+ * at any length. */
+static unsigned int sg2_aes_soft_max(u32 mode, u32 keylen)
+{
+ if (mode == HWCRYPTO_MODE_CTR) return keylen == 16 ? 144 : keylen == 24 ? 128 : 112;
+ return keylen == 16 ? 112 : 96;
+}
+/* GCM text. The engine's time for a short GCM request differed by 2 us
+ * between two loads of this module (128 bytes: 10.5 or 12.7 us to encrypt),
+ * so these are the lengths up to which the software version won in both. */
+static unsigned int sg2_gcm_soft_max(u32 keylen) { return keylen == 16 ? 96 : keylen == 24 ? 80 : 64; }
 
 struct sg2_cipher_alg {
  struct skcipher_alg alg;
@@ -55,6 +86,7 @@ static void sg2_inc_counter(u8 *v, unsigned int bytes, unsigned int blocks)
 {
  while (blocks--) { unsigned int i = bytes; while (i && !++v[--i]); }
 }
+#include "crypto_direct.inc"
 static int sg2_cipher_process(struct skcipher_request *req, bool encrypt)
 {
  struct sg2_cipher_ctx *ctx = crypto_skcipher_ctx(crypto_skcipher_reqtfm(req));
@@ -63,29 +95,30 @@ static int sg2_cipher_process(struct skcipher_request *req, bool encrypt)
   .mode = a->mode, .encrypt = encrypt, .key_length = ctx->keylen };
  u8 next_iv[16]; unsigned int pos = 0; int err = 0, in_nents, out_nents;
  if (!req->cryptlen) return 0;
+ if (sg2_direct_ok(req, a, encrypt)) return sg2_cipher_direct(req, encrypt);
  in_nents = sg_nents_for_len(req->src, req->cryptlen);
  out_nents = sg_nents_for_len(req->dst, req->cryptlen);
  if (in_nents < 0 || out_nents < 0) return -EINVAL;
  memcpy(r.key, ctx->key, ctx->keylen);
  if (a->mode) memcpy(r.iv, req->iv, a->block);
  while (pos < req->cryptlen) {
-  r.length = min_t(unsigned int, HWCRYPTO_MAX, req->cryptlen - pos);
+  r.length = min_t(unsigned int, sg2_room(), req->cryptlen - pos);
   r.output_length = r.length;
-  mutex_lock(&lock);
-  if (poisoned) { err = -EIO; mutex_unlock(&lock); break; }
-  if (sg_pcopy_to_buffer(req->src, in_nents, buffer, r.length, pos) != r.length) { err = -EINVAL; goto chunk_done; }
-  if (a->mode == HWCRYPTO_MODE_CBC && !encrypt) memcpy(next_iv, buffer + r.length - a->block, a->block);
+  sg2_own();
+  if (poisoned) { err = -EIO; sg2_disown(); break; }
+  if (sg_pcopy_to_buffer(req->src, in_nents, cur->in, r.length, pos) != r.length) { err = -EINVAL; goto chunk_done; }
+  if (a->mode == HWCRYPTO_MODE_CBC && !encrypt) memcpy(next_iv, cur->in + r.length - a->block, a->block);
   err = crypto_run_locked(&r);
   if (err) goto chunk_done;
-  if (sg_pcopy_from_buffer(req->dst, out_nents, crypto_output, r.length, pos) != r.length) { err = -EINVAL; goto chunk_done; }
-  if (a->mode == HWCRYPTO_MODE_CBC) memcpy(r.iv, encrypt ? crypto_output + r.length - a->block : next_iv, a->block);
+  if (sg_pcopy_from_buffer(req->dst, out_nents, cur->out, r.length, pos) != r.length) { err = -EINVAL; goto chunk_done; }
+  if (a->mode == HWCRYPTO_MODE_CBC) memcpy(r.iv, encrypt ? cur->out + r.length - a->block : next_iv, a->block);
   if (a->mode == HWCRYPTO_MODE_CTR) sg2_inc_counter(r.iv, a->block, DIV_ROUND_UP(r.length, a->block));
 chunk_done:
   crypto_clean_locked(&r);
-  mutex_unlock(&lock);
+  sg2_disown();
   if (err) break;
   pos += r.length;
-  cond_resched();
+  sg2_resched();
  }
  if (!err && a->mode) memcpy(req->iv, r.iv, a->block);
  memzero_explicit(next_iv, sizeof(next_iv)); memzero_explicit(&r, sizeof(r));
@@ -99,7 +132,7 @@ static void sg2_cipher_work(struct work_struct *work)
  int err = sg2_use_fallback(ctx->fallback) ? sg2_cipher_fallback(req, r->encrypt) :
   sg2_cipher_process(req, r->encrypt);
  sg2_async_leave();
- skcipher_request_complete(req, err);
+ sg2_complete(skcipher_request_complete, req, err);
 }
 static int sg2_cipher_submit(struct skcipher_request *req, bool encrypt)
 {
@@ -109,7 +142,9 @@ static int sg2_cipher_submit(struct skcipher_request *req, bool encrypt)
  if (!ctx->keylen || (ctx->alg->mode != HWCRYPTO_MODE_CTR && req->cryptlen % ctx->alg->block)) return -EINVAL;
  if (!req->cryptlen) return 0;
  if (sg2_use_fallback(ctx->fallback)) return sg2_cipher_fallback(req, encrypt);
- if (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) return sg2_cipher_process(req, encrypt);
+ if (ctx->fallback && req->cryptlen <= sg2_aes_soft_max(ctx->alg->mode, ctx->keylen))
+  return sg2_cipher_fallback(req, encrypt);
+ if ((req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) || sg2_inline()) return sg2_cipher_process(req, encrypt);
  err = sg2_async_enter(req->base.flags);
  if (err) return err;
  r->req = req; r->encrypt = encrypt; INIT_WORK(&r->work, sg2_cipher_work);
@@ -118,33 +153,12 @@ static int sg2_cipher_submit(struct skcipher_request *req, bool encrypt)
 }
 static int sg2_cipher_encrypt(struct skcipher_request *req) { return sg2_cipher_submit(req, true); }
 static int sg2_cipher_decrypt(struct skcipher_request *req) { return sg2_cipher_submit(req, false); }
-/* The 4 weak + 12 semi-weak DES keys, compared without parity bits.
- * Avoid depending on the disabled software DES implementation solely for
- * validating hardware keys. The list is defined by the DES key schedule.
- */
-static int sg2_verify_des_key(struct crypto_skcipher *tfm, const u8 *key)
-{
- static const u64 weak[] = {
-  0x0101010101010101ULL, 0xfefefefefefefefeULL, 0x1f1f1f1f0e0e0e0eULL, 0xe0e0e0e0f1f1f1f1ULL,
-  0x01fe01fe01fe01feULL, 0xfe01fe01fe01fe01ULL, 0x1fe01fe00ef10ef1ULL, 0xe01fe01ff10ef10eULL,
-  0x01e001e001f101f1ULL, 0xe001e001f101f101ULL, 0x1ffe1ffe0efe0efeULL, 0xfe1ffe1ffe0efe0eULL,
-  0x011f011f010e010eULL, 0x1f011f010e010e01ULL, 0xe0fee0fef1fef1feULL, 0xfee0fee0fef1fef1ULL };
- u64 value = get_unaligned_be64(key) & 0xfefefefefefefefeULL;
- unsigned int i, match = 0;
- if (!(crypto_skcipher_get_flags(tfm) & CRYPTO_TFM_REQ_FORBID_WEAK_KEYS)) return 0;
- for (i = 0; i < ARRAY_SIZE(weak); i++) match |= value == (weak[i] & 0xfefefefefefefefeULL);
- return match ? -EINVAL : 0;
-}
 static int sg2_cipher_setkey(struct crypto_skcipher *tfm, const u8 *key, unsigned int len)
 {
  struct sg2_cipher_ctx *ctx = crypto_skcipher_ctx(tfm);
- bool valid = ctx->alg->hardware == HWCRYPTO_ALG_AES ? (len == 16 || len == 24 || len == 32) :
-  ctx->alg->hardware == HWCRYPTO_ALG_DES ? len == 8 : ctx->alg->hardware == HWCRYPTO_ALG_TDES ? len == 24 : len == 16;
  int err;
  memzero_explicit(ctx->key, sizeof(ctx->key)); ctx->keylen = 0;
- if (!valid) return -EINVAL;
- if (ctx->alg->hardware == HWCRYPTO_ALG_DES && sg2_verify_des_key(tfm, key)) return -EINVAL;
- if (ctx->alg->hardware == HWCRYPTO_ALG_TDES && verify_skcipher_des3_key(tfm, key)) return -EINVAL;
+ if (len != 16 && len != 24 && len != 32) return -EINVAL;
  if (ctx->fallback) {
   crypto_skcipher_clear_flags(ctx->fallback, CRYPTO_TFM_REQ_MASK);
   crypto_skcipher_set_flags(ctx->fallback, crypto_skcipher_get_flags(tfm) & CRYPTO_TFM_REQ_MASK);
@@ -183,9 +197,6 @@ static void sg2_cipher_exit(struct crypto_skcipher *tfm)
  SG2_CIPHER("ctr", name, id, 2, bs, min_key, max_key)
 static struct sg2_cipher_alg sg2_ciphers[] = {
  SG2_MODES("aes", HWCRYPTO_ALG_AES, 16, 16, 32),
- SG2_MODES("des", HWCRYPTO_ALG_DES, 8, 8, 8),
- SG2_MODES("des3_ede", HWCRYPTO_ALG_TDES, 8, 24, 24),
- SG2_MODES("sm4", HWCRYPTO_ALG_SM4, 16, 16, 16),
 };
 
 #define SG2_HASH_MAGIC 0x53473248
@@ -213,14 +224,14 @@ static int sg2_hash_blocks(struct ahash_request *req, int nents, unsigned int of
   .algorithm = crypto_ahash_digestsize(crypto_ahash_reqtfm(req)) == 32 ? HWCRYPTO_ALG_SHA256 : HWCRYPTO_ALG_SHA1, .length = len };
  int err;
  memcpy(r.state, ctx->hash.state, sizeof(r.state));
- mutex_lock(&lock);
+ sg2_own();
  if (poisoned) { err = -EIO; goto unlock; }
- if (tail) { memcpy(buffer, tail, len); err = 0; } else err = sg2_hash_read(req, nents, offset, buffer, len);
+ if (tail) { memcpy(cur->in, tail, len); err = 0; } else err = sg2_hash_read(req, nents, offset, cur->in, len);
  if (!err) err = crypto_run_locked(&r);
  if (!err) memcpy(ctx->hash.state, r.state, sizeof(r.state));
  crypto_clean_locked(&r);
 unlock:
- mutex_unlock(&lock); memzero_explicit(&r, sizeof(r)); return err;
+ sg2_disown(); memzero_explicit(&r, sizeof(r)); return err;
 }
 static int sg2_hash_process(struct ahash_request *req, bool final, bool consume)
 {
@@ -247,11 +258,11 @@ static int sg2_hash_process(struct ahash_request *req, bool final, bool consume)
     s->used = 0; memzero_explicit(s->tail, sizeof(s->tail));
    }
   } else {
-   n = min_t(unsigned int, HWCRYPTO_MAX, remaining & ~63U);
+   n = min_t(unsigned int, sg2_room(), remaining & ~63U);
    err = sg2_hash_blocks(req, nents, pos, NULL, n); if (err) goto failed;
    pos += n; remaining -= n;
   }
-  cond_resched();
+  sg2_resched();
  }
  if (!final) return 0;
  if (!req->result) { err = -EINVAL; goto failed; }
@@ -274,7 +285,7 @@ static void sg2_hash_work(struct work_struct *work)
  bool consume = ctx->final != 2;
  int err = sg2_hash_process(req, ctx->final, consume);
  sg2_async_leave();
- ahash_request_complete(req, err);
+ sg2_complete(ahash_request_complete, req, err);
 }
 static int sg2_hash_submit(struct ahash_request *req, unsigned int operation)
 {

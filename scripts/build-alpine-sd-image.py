@@ -59,6 +59,9 @@ assert (root/'etc/kvm/ssh_stop').is_file()
 # mDNS off on a new root comes with the rootfs archive (platform/build.sh).
 assert (root/'etc/kvm/mdns_disabled').is_file()
 assert not (root/'etc/runlevels/default/nanokvm-mdns').is_symlink()
+# IPMI is off on a new root: its daemon is in no runlevel until the BMC
+# settings switch it on (server/service/bmc).
+assert not list(root.glob('etc/runlevels/*/nanokvm-ipmi'))
 udev_trigger = root/'etc/conf.d/udev-trigger'
 assert udev_trigger.is_file() and ': "${rc_coldplug:=${RC_COLDPLUG:-NO}}"' in udev_trigger.read_text(), 'udev coldplug not limited'
 assert not list((root/'root').glob('.ssh/*'))
@@ -95,7 +98,9 @@ run('sh',bootset/'compose-fit',bootset,'detect',files/'boot.sd');shutil.copy2(a.
 # Keep the metadata keys understood by existing clients. Both versions now
 # derive from the OS release; the debug profile is only a build qualifier.
 # Origin metadata belongs to the SD image, never to an upgradable APK.
-image_metadata={'image_version':image_name_version,'bundled_application_version':a.version}
+# start_page: a device installed from this image opens the overview after the
+# sign-in; one installed from an earlier image keeps the remote screen.
+image_metadata={'image_version':image_name_version,'bundled_application_version':a.version,'start_page':'overview'}
 (files/'image.json').write_text(json.dumps(image_metadata,indent=2)+'\n')
 (files/'ver').write_text('NanoKVM OS '+image_name_version+'\n')
 # The fresh-install USB flags come with the rootfs (etc/kvm/usb).

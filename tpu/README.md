@@ -5,7 +5,8 @@ reads the text on the remote screen (the web UI's Read text on the screen,
 the MCP tool `screen_text`, PicoClaw's `kvm_screen_text`), and
 `nanokvm-screen` says what the screen shows, for the screen-crash
 notification. They are part of the system; the models they run are
-add-ons, so that a model can be updated or added without a release.
+packages released on their own, so that a model can be updated or added
+without an OS release.
 
 ## In the system
 
@@ -23,17 +24,17 @@ they need only the C library, about 1.4 MB each. The runtime's tools
 (the `cv181x_tpu` driver, loaded on demand, and the CMA dma-buf heap) is part
 of the kernel.
 
-The package provides `nanokvm-tpu-abi=1`. Model add-ons depend on it: the
-models carry command buffers in the layout of this runtime (see Build), and
-the programs take them as arguments of a fixed form. A change of either is
-a new ABI number and new model add-ons.
+The package provides `nanokvm-tpu-abi=1`. The model packages depend on it:
+the models carry command buffers in the layout of this runtime (see Build),
+and the programs take them as arguments of a fixed form. A change of either
+is a new ABI number and new model packages.
 
-## Model add-ons
+## Model packages
 
 They install `/usr/lib/nanokvm-tpu/models`. Each depends on
 `nanokvm-tpu-abi=1`:
 
-| Add-on | Models |
+| Package | Models |
 |---|---|
 | `nanokvm-model-ocr` | `ocr-det.cvimodel`, the text detector every language uses |
 | `nanokvm-model-ocr-latin` | `latin/`: `ocr-rec.cvimodel`, `ocr-sure.cvimodel`, `ocr-dict.txt` |
@@ -41,9 +42,13 @@ They install `/usr/lib/nanokvm-tpu/models`. Each depends on
 | `nanokvm-model-ocr-chinese` | `chinese/`: `ocr-rec.cvimodel`, `ocr-sure.cvimodel`, `ocr-dict.txt` |
 | `nanokvm-model-screen` | `screen.cvimodel`, the screen-state classifier |
 
-A language depends on `nanokvm-model-ocr`, so installing one installs the
-detector too. Without a language nothing offers to read the screen; without
-the classifier the crash event has nothing to classify with.
+`nanokvm-model-screen` is part of every NanoKVM OS (`nanokvm-release`
+depends on it); the screen watch uses it only while the screen-crash
+notification is on and text recognition is installed and on. The OCR models
+are downloaded on request: AI > Text recognition installs or removes a
+language. A language depends on `nanokvm-model-ocr`, so installing one
+installs the detector too, and removing the last one removes it. Without a
+language nothing offers to read the screen.
 
 The add-on workflow (`.github/workflows/addon.yml`) builds them: `convert.sh`
 converts the parts the recipe needs (`build-addon.py --parts-only`),
@@ -52,9 +57,9 @@ package records the converter (image and tpu-mlir) and the SHA-256 of every
 model in `/usr/share/NAME/source.json`.
 
 Pull requests build the affected recipes and retain checked APKs for 14 days.
-Changes to shared conversion inputs build all five model add-ons; a language
+Changes to shared conversion inputs build all five model packages; a language
 recipe or calibration change builds that language only. Changes to the pinned
-TPU runtime also rebuild every model. IPMI keeps its own build target.
+TPU runtime also rebuild every model.
 
 For a release, run **Add-on release** from `main`, selecting one add-on or
 `models` for all five. With **Build and check only** enabled, any branch can
@@ -63,7 +68,7 @@ be checked without publishing. Otherwise each selected package gets its own
 all selected releases have been published. The existing repository signing and
 deployment approval still applies; no OS release is created or made latest.
 If publication stops after some releases exist, release only the remaining
-add-ons, then rerun the repository workflow if needed.
+packages, then rerun the repository workflow if needed.
 
 The first model packages are version `1.0.0` and require NanoKVM OS 4.0.0 or
 newer, which includes the TPU runtime. Their versions and APK revisions are
@@ -122,15 +127,6 @@ Measured on a NanoKVM, whole 1080p screen, with a viewer watching the video:
 On photos of real screens (a GitHub page, a BIOS setup, a kernel panic)
 `latin` with the second reading leaves 1.6–2.1 % of characters wrong.
 
-Tried and dropped:
-- PP-OCRv6 tiny: about as accurate on clean pages, 8.5 % wrong on a photo.
-- Keeping the models loaded: one language takes 89–119 MiB, which does not
-  fit beside the video.
-- Copying the model files into memory: the copies pushed the page cache out,
-  and the next read loaded more from the SD card.
-- Korean (PP-OCRv5): needs 33 layers in BF16 to stay accurate; left for
-  later.
-
 ## Screen classifier
 
 `models/screen/`, ours (GPL-3.0-or-later): a small CNN (0.4 M weights, input
@@ -158,8 +154,9 @@ by `screen/train.sh`, which writes `screen.onnx` and
 The programs: `platform/build.sh tpu`. The runtime's source is the
 `tpu-runtime` entry of `platform/sources.lock` (cviruntime, cvikernel, the
 model schema and flatbuffers, pinned by Git tree ids); `patches/` holds two
-fixes for musl, makes the tools optional and takes the runtime version from
-the pin instead of Git and the build date.
+fixes for musl, makes the tools optional, takes the runtime version from
+the pin instead of Git and the build date, and fixes the compiler warnings
+(the build has none).
 
 The models:
 

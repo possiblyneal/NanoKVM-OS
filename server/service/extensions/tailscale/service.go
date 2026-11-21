@@ -2,11 +2,14 @@ package tailscale
 
 import (
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"NanoKVM-Server/proto"
 	"NanoKVM-Server/service/extensions/apkpkg"
+	"NanoKVM-Server/service/extensions/vpn"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 )
@@ -51,22 +54,38 @@ func (s *Service) Install(c *gin.Context) {
 			return
 		}
 	}
-	if err := NewCli().Start(); err != nil {
-		rsp.ErrRsp(c, -1, "Tailscale was installed but could not start: "+err.Error())
-		return
-	}
+	// Installed, not started: the page offers to start it, and starting
+	// is what adds it to the boot runlevel.
 	rsp.OkRsp(c)
 }
 
 func (s *Service) Uninstall(c *gin.Context) {
+	purge := vpn.Purge(c)
 	var rsp proto.Response
 	if !beginOperation(c, &rsp) {
 		return
 	}
 	defer endOperation()
 	if !isInstalled() {
+		if purge {
+			if err := vpn.RemoveState(tailscaleState...); err != nil {
+				rsp.ErrRsp(c, -1, "Tailscale login and settings could not be deleted: "+err.Error())
+				return
+			}
+		}
 		rsp.OkRsp(c)
 		return
+	}
+	if purge {
+		// Sign out first: the node key expires and the device leaves the
+		// tailnet. tailscaled must run for it; without it, or if the
+		// coordination server is out of reach, the state is deleted anyway
+		// and the device stays in the admin console until removed there.
+		if running, _ := tailscaledRunning(); running {
+			if err := NewCli().Logout(); err != nil {
+				log.Warnf("Tailscale: sign-out before uninstall failed: %v", err)
+			}
+		}
 	}
 	if err := NewCli().Stop(); err != nil {
 		rsp.ErrRsp(c, -1, "Tailscale could not be stopped; package was kept: "+err.Error())
@@ -80,8 +99,18 @@ func (s *Service) Uninstall(c *gin.Context) {
 		rsp.ErrRsp(c, -1, "Tailscale removal failed: "+err.Error())
 		return
 	}
+	if purge {
+		if err := vpn.RemoveState(tailscaleState...); err != nil {
+			rsp.ErrRsp(c, -1, "Tailscale was removed, but its login and settings could not be deleted: "+err.Error())
+			return
+		}
+	}
 	rsp.OkRsp(c)
 }
+
+// tailscaleState: the node key, login and preferences (the state directory
+// of Alpine's tailscale init script) and the daemon's log.
+var tailscaleState = []string{"/var/lib/tailscale", "/var/log/tailscaled.log"}
 
 func (s *Service) Start(c *gin.Context) {
 	var rsp proto.Response
@@ -206,5 +235,26 @@ func (s *Service) GetStatus(c *gin.Context) {
 			ipv4 = ip.String()
 		}
 	}
-	rsp.OkRspWithData(c, &proto.GetTailscaleStatusRsp{State: state, Busy: busy, IP: ipv4, Name: status.Self.HostName, Account: status.CurrentTailnet.Name})
+	rsp.OkRspWithData(c, &proto.GetTailscaleStatusRsp{State: state, Busy: busy, IP: ipv4, Name: status.Self.HostName, Account: status.CurrentTailnet.Name,
+		ThisConnection: requestToAddress(c, status.Self.TailscaleIPs)})
+}
+
+// requestToAddress reports whether the connection of this request ends at
+// one of addresses, so the page can warn before Tailscale goes down.
+func requestToAddress(c *gin.Context, addresses []string) bool {
+	local, ok := c.Request.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if !ok {
+		return false
+	}
+	host, _, err := net.SplitHostPort(local.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(strings.Split(host, "%")[0])
+	for _, address := range addresses {
+		if ip != nil && ip.Equal(net.ParseIP(address)) {
+			return true
+		}
+	}
+	return false
 }

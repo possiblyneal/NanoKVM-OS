@@ -1,6 +1,14 @@
 // Video settings model: device capabilities, the draft a user edits, video
 // modes, validation with reasons, and what applying a draft changes.
-// Pure functions without imports, so tests can run them directly.
+// Pure functions without hardware or page imports, so tests can run them
+// directly.
+
+import {
+  identityFromKey,
+  identityIssue,
+  identityRequest,
+  type MonitorIdentity
+} from './monitor-identity';
 
 // 'video-memory': the booted video memory cannot capture it, on a device that
 // has not restarted since the update to the shared video memory.
@@ -13,15 +21,16 @@ export type Reason =
   | 'portrait'
   | 'range'
   | 'mjpeg-4k'
-  | 'h264-4k';
+  | 'h264-4k'
+  | 'identity';
 
 export type MonitorMode = {
   // The value of the monitor setting: the height of a 16:9 or 16:10 profile,
-  // the width of a 21:9 one; absent on older servers (then the height).
+  // the width of a 21:9 or 8:9 one; absent on older servers (then the height).
   id?: number;
   height: number;
   width: number;
-  // 16:9, 16:10 or 21:9; absent on older servers (16:9).
+  // 16:9, 16:10, 21:9 or 8:9; absent on older servers (16:9).
   aspect?: string;
   // Auto (height 0): the size it stands for, 0 when it is the stock profile.
   effectiveWidth?: number;
@@ -76,6 +85,12 @@ export type VideoCapabilities = {
     followsStreamRate: boolean;
     selected: number;
     refreshHz: number;
+    // A Cube or Lite without a recorded receiver profile. Its EDID is unknown,
+    // including unrecorded writes by older software. Absent on older servers.
+    stockProfile?: boolean;
+    // The identity the profiles carry instead of NanoKVM's own; null for
+    // NanoKVM's, absent on older servers (which cannot change it).
+    identity?: MonitorIdentity | null;
     modes: MonitorMode[];
     // Absent on older servers, which offer 16:9 only.
     aspects?: string[];
@@ -122,13 +137,15 @@ export type VideoDraft = {
   hevcDirect: boolean | null;
   directPlayback: DirectPlayback;
   frameDetect: boolean;
+  // The monitor identity as identityKey: '' is NanoKVM's own.
+  identity: string;
 };
 
-export const FPS_CHOICES = [120, 75, 60, 50, 40, 30];
+const FPS_CHOICES = [120, 75, 60, 50, 40, 30];
 export const BITRATE_CHOICES = [20000, 15000, 12000, 10000, 8000, 5000, 3000, 2000, 1000];
 
 // The size a monitor setting stands for (Auto included).
-export function monitorSize(mode: MonitorMode | undefined) {
+function monitorSize(mode: MonitorMode | undefined) {
   if (!mode) return { width: 0, height: 0 };
   return mode.height
     ? { width: mode.width, height: mode.height }
@@ -137,7 +154,7 @@ export function monitorSize(mode: MonitorMode | undefined) {
 export const QUALITY_CHOICES = [100, 80, 60, 50];
 
 // Server stream type: what the device encodes for this draft.
-export function streamType(draft: Pick<VideoDraft, 'transport' | 'codec'>) {
+function streamType(draft: Pick<VideoDraft, 'transport' | 'codec'>) {
   return draft.transport === 'mjpeg' ? 0 : draft.codec === 'h265' ? 2 : 1;
 }
 
@@ -164,7 +181,8 @@ const VIDEO_PATH_REASONS: Record<number, string> = {
   4: 'size',
   5: 'shared',
   6: 'unsupported',
-  7: 'other'
+  7: 'other',
+  8: 'watermark'
 };
 export function videoPath(path: number | undefined): string | undefined {
   if (!path) return undefined;
@@ -188,18 +206,18 @@ export function rateLimit(tiers: RateTier[], width: number, height: number) {
   return tiers[0]?.fps ?? 120;
 }
 
-export function portraitProfile(caps: VideoCapabilities, resolution: number) {
+function portraitProfile(caps: VideoCapabilities, resolution: number) {
   return caps.monitor.portrait.profiles.find((p) => p.resolution === resolution);
 }
 
 export const DEFAULT_ASPECT = '16:9';
 
 // The monitor setting of a mode (see MonitorMode.id).
-export function modeId(mode: MonitorMode) {
+function modeId(mode: MonitorMode) {
   return mode.id ?? mode.height;
 }
 
-export function monitorMode(caps: VideoCapabilities, id: number) {
+function monitorMode(caps: VideoCapabilities, id: number) {
   return caps.monitor.modes.find((m) => modeId(m) === id);
 }
 
@@ -208,14 +226,19 @@ export function monitorAspects(caps: VideoCapabilities) {
   return caps.monitor.aspects?.length ? caps.monitor.aspects : [DEFAULT_ASPECT];
 }
 
+// The portrait profile inputs, for which the stream limit box stands upright
+// (native stream_size, server/common/h264_policy.go). Any other input, a tall
+// 8:9 monitor too, is fitted into the landscape box.
+const PORTRAIT_INPUTS = ['720x1280', '1080x1920', '1088x1920', '1440x2560'];
+
 // The size the encoder produces: the input fitted into the stream limit (a
-// landscape box, upright for a portrait input), never enlarged.
+// landscape box, upright for a portrait profile), never enlarged.
 export function streamSize(draft: VideoDraft, caps: VideoCapabilities) {
   const { width, height } = caps.input;
   const limit = caps.stream.limits.find((l) => l.height === draft.height);
   if (!width || !height) return { width: limit?.width ?? 0, height: draft.height };
   if (!draft.height || !limit) return { width, height };
-  const portrait = height > width;
+  const portrait = PORTRAIT_INPUTS.includes(`${width}x${height}`);
   const [boxWidth, boxHeight] = portrait
     ? [draft.height, limit.width]
     : [limit.width, draft.height];
@@ -258,22 +281,20 @@ export function monitorTarget(draft: VideoDraft, caps: VideoCapabilities) {
     : { width: mode?.width ?? 0, height: mode?.height || draft.monitor, refresh };
 }
 
-// Whether MJPEG cannot run for a draft: its input (the monitor the draft
-// writes, else the current one) is longer than the server allows, whatever the
-// stream limit is. Mirrors the server, which refuses it.
+// Whether MJPEG cannot run for a draft: the input it leads to (draftInput) is
+// longer than the server allows, whatever the stream limit is. Mirrors the
+// server, which refuses it.
 export function mjpegBlocked(draft: VideoDraft, caps: VideoCapabilities) {
   const maxSide = caps.stream.mjpeg?.maxSide;
   if (!maxSide) return false;
-  const changesMonitor =
-    !draft.portrait && caps.monitor.programmable && draft.monitor !== caps.monitor.selected;
-  const input =
-    changesMonitor && draft.monitor ? monitorSize(monitorMode(caps, draft.monitor)) : caps.input;
+  const input = draftInput(draft, caps);
+  if (!input.width || !input.height) return false;
   return Math.max(input.width, input.height) > maxSide;
 }
 
-// The input H.264 would encode for a draft: the portrait profile or monitor
-// the draft writes, else the current input.
-function h264Input(draft: VideoDraft, caps: VideoCapabilities) {
+// The input a draft leads to: the portrait profile or monitor it writes, the
+// saved monitor when it turns portrait off, else the current input.
+function draftInput(draft: VideoDraft, caps: VideoCapabilities) {
   const { monitor } = caps;
   if (!monitor.programmable) return caps.input;
   if (draft.portrait) {
@@ -295,7 +316,7 @@ function h264Input(draft: VideoDraft, caps: VideoCapabilities) {
 export function h264BlockReason(draft: VideoDraft, caps: VideoCapabilities): Reason | undefined {
   const h264 = caps.stream.h264;
   if (!h264?.maxLongSide || !h264.maxHeight) return undefined;
-  const input = h264Input(draft, caps);
+  const input = draftInput(draft, caps);
   if (!input.width || !input.height) return undefined;
   const out = streamSize(draft, { ...caps, input: { ...caps.input, ...input } });
   if (Math.max(out.width, out.height) <= h264.maxLongSide && out.height <= h264.maxHeight)
@@ -320,18 +341,18 @@ function portraitCodecAllowed(
   );
 }
 
-export function codecPlayable(browser: BrowserSupport, transport: Transport, codec: Codec) {
+function codecPlayable(browser: BrowserSupport, transport: Transport, codec: Codec) {
   if (transport === 'mjpeg' || codec === 'h264') return true;
   return transport === 'direct' ? browser.directH265 : browser.webrtcH265;
 }
 
-export function transportPlayable(browser: BrowserSupport, transport: Transport) {
+function transportPlayable(browser: BrowserSupport, transport: Transport) {
   return transport === 'mjpeg' || (transport === 'direct' ? browser.direct : browser.webrtc);
 }
 
 // Why a choice is unavailable for a draft; undefined when it is fine.
-export type DraftIssues = Partial<
-  Record<'monitor' | 'portrait' | 'height' | 'fps' | 'transport' | 'codec', Reason>
+type DraftIssues = Partial<
+  Record<'monitor' | 'portrait' | 'height' | 'fps' | 'transport' | 'codec' | 'identity', Reason>
 >;
 
 export function draftIssues(
@@ -371,6 +392,8 @@ export function draftIssues(
       issues.codec = h264BlockReason(draft, caps);
     else if (!codecPlayable(browser, draft.transport, draft.codec)) issues.codec = 'browser';
   }
+  const identity = identityFromKey(draft.identity);
+  if (identity && identityIssue(identity)) issues.identity = 'identity';
   return issues;
 }
 
@@ -406,7 +429,7 @@ export function transportChoice(
 // profiles, portrait ones from the portrait profiles; with a fixed receiver the
 // choice is the current input at the stream rates. The monitor refresh follows
 // the chosen rate (monitorTarget), so a resolution and a rate are two choices.
-export type ResolutionChoice = {
+type ResolutionChoice = {
   key: string;
   monitor: number; // the draft's monitor setting; ignored for portrait choices
   portrait: number;
@@ -419,7 +442,7 @@ export type ResolutionChoice = {
   reason?: Reason;
 };
 
-export function resolutionKey(kind: 'm' | 'p' | 'i', height: number) {
+function resolutionKey(kind: 'm' | 'p' | 'i', height: number) {
   return `${kind}${height}`;
 }
 
@@ -521,7 +544,7 @@ export function draftSize(draft: VideoDraft, caps: VideoCapabilities) {
   return streamSize(draft, prospectiveCaps(draft, caps));
 }
 
-export type DraftChange = {
+type DraftChange = {
   keys: (keyof VideoDraft)[];
   // The source re-detects the monitor (a short HDMI blackout).
   monitorRewrite: boolean;
@@ -541,6 +564,7 @@ export function draftChanges(
     caps.monitor.programmable &&
     (draft.monitor !== saved.monitor ||
       draft.portrait !== saved.portrait ||
+      draft.identity !== saved.identity ||
       (caps.monitor.followsStreamRate && before.refresh !== after.refresh));
   const reconnect =
     draft.transport !== saved.transport ||
@@ -549,10 +573,15 @@ export function draftChanges(
   return { keys, monitorRewrite, reconnect };
 }
 
+export type VideoSettingsBody = Record<
+  string,
+  number | boolean | string | ReturnType<typeof identityRequest>
+>;
+
 // The shared part of a draft as a POST /api/vm/video body: changed fields only.
 // An administrator's transport choice is also the device transport.
 export function settingsRequest(saved: VideoDraft, draft: VideoDraft) {
-  const body: Record<string, number | boolean | string> = {};
+  const body: VideoSettingsBody = {};
   if (draft.transport !== saved.transport) body.transport = draft.transport;
   if (streamType(draft) !== streamType(saved)) body.type = streamType(draft);
   if (draft.bitRate !== saved.bitRate) body.bitRate = draft.bitRate;
@@ -567,5 +596,6 @@ export function settingsRequest(saved: VideoDraft, draft: VideoDraft) {
   if (draft.portrait && draft.portrait !== saved.portrait) body.portraitResolution = draft.portrait;
   if ((draft.portrait !== 0) !== (saved.portrait !== 0)) body.portrait = draft.portrait !== 0;
   if (draft.monitor !== saved.monitor) body.monitor = draft.monitor;
+  if (draft.identity !== saved.identity) body.monitorIdentity = identityRequest(draft.identity);
   return body;
 }

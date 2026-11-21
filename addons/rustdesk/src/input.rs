@@ -1,5 +1,7 @@
 // NanoKVM OS adaptation, 2026-10-03. SPDX-License-Identifier: AGPL-3.0-only
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
+
+use tokio::time::Instant;
 
 use crate::{
     nanokvm::HidClient,
@@ -14,6 +16,22 @@ const MOUSE_TYPE_WHEEL: i32 = 3;
 const MOUSE_TYPE_TRACKPAD: i32 = 4;
 const MOUSE_TYPE_MOVE_RELATIVE: i32 = 5;
 
+// A viewer that reconnects is admitted while its old session may still hold
+// the one HID lease: until that session's reader gives up on the old
+// connection (PEER_IDLE_TIMEOUT) and its release reports and close went out
+// (up to 3 s each, with margin). Input waits that long for the lease instead
+// of being given up at once.
+const LEASE_WAIT: Duration = Duration::from_secs(crate::server::PEER_IDLE_TIMEOUT.as_secs() + 15);
+const LEASE_RETRY: Duration = Duration::from_millis(500);
+const LEASE_RETRY_MAX: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Copy)]
+struct LeaseWait {
+    until: Instant,
+    retry_at: Instant,
+    delay: Duration,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PointerMode {
     Absolute,
@@ -27,6 +45,8 @@ enum HidKey {
 }
 
 pub struct InputState {
+    // The last letter typed from a text sequence was Russian.
+    russian_text: bool,
     hid: HidClient,
     width: u16,
     height: u16,
@@ -37,6 +57,7 @@ pub struct InputState {
     y: u16,
     pointer_mode: PointerMode,
     pointer_mode_announced: bool,
+    lease_wait: Option<LeaseWait>,
 }
 
 impl InputState {
@@ -52,10 +73,96 @@ impl InputState {
             y: 0,
             pointer_mode: PointerMode::Absolute,
             pointer_mode_announced: false,
+            lease_wait: None,
+            russian_text: false,
         }
     }
 
+    // While another session holds the HID lease, events are dropped and the
+    // lease is asked for again when due.
     pub async fn handle_mouse(&mut self, event: MouseEvent) -> std::io::Result<()> {
+        if !self.lease_ready().await? {
+            return Ok(());
+        }
+        let result = self.mouse(event).await;
+        self.wait_if_lease_held(result)
+    }
+
+    /// One relative movement in steps of a signed byte, sent together.
+    pub async fn handle_relative_moves(&mut self, moves: &[(i8, i8)]) -> std::io::Result<()> {
+        if !self.lease_ready().await? {
+            return Ok(());
+        }
+        let result = self.relative_moves(moves).await;
+        self.wait_if_lease_held(result)
+    }
+
+    pub async fn handle_key(&mut self, event: KeyEvent) -> std::io::Result<()> {
+        if !self.lease_ready().await? {
+            return Ok(());
+        }
+        let result = self.key(event).await;
+        self.wait_if_lease_held(result)
+    }
+
+    // Waiting for another session to release HID: the controller is told its
+    // keyboard is off meanwhile, so it does not type into nothing.
+    pub fn waiting_for_lease(&self) -> bool {
+        self.lease_wait.is_some()
+    }
+
+    pub async fn heartbeat(&mut self) -> std::io::Result<()> {
+        if self.lease_wait.is_some() {
+            return self.lease_ready().await.map(|_| ());
+        }
+        self.hid.heartbeat().await
+    }
+
+    async fn lease_ready(&mut self) -> std::io::Result<bool> {
+        let Some(mut wait) = self.lease_wait else {
+            return Ok(true);
+        };
+        let now = Instant::now();
+        if now < wait.retry_at {
+            return Ok(false);
+        }
+        // An empty keyboard report takes the lease and presses nothing.
+        match self.hid.keyboard(0, [0; 6]).await {
+            Ok(()) => {
+                // Nothing tracked as held since the refusal reached the target.
+                self.modifiers = 0;
+                self.keys.clear();
+                self.buttons = 0;
+                self.lease_wait = None;
+                Ok(true)
+            }
+            Err(error) if is_lease_held(&error) && now < wait.until => {
+                wait.retry_at = now + wait.delay;
+                wait.delay = (wait.delay * 2).min(LEASE_RETRY_MAX);
+                self.lease_wait = Some(wait);
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn wait_if_lease_held(&mut self, result: std::io::Result<()>) -> std::io::Result<()> {
+        match result {
+            Err(error) if is_lease_held(&error) => {
+                eprintln!("RustDesk input waits for another session to release HID");
+                let now = Instant::now();
+                self.lease_wait = Some(LeaseWait {
+                    until: now + LEASE_WAIT,
+                    retry_at: now + LEASE_RETRY,
+                    delay: LEASE_RETRY * 2,
+                });
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    async fn mouse(&mut self, event: MouseEvent) -> std::io::Result<()> {
         let event_type = event.mask & MOUSE_TYPE_MASK;
         let button = (event.mask >> 3) as u16;
         match event_type {
@@ -66,10 +173,8 @@ impl InputState {
                 self.hid.absolute_mouse(self.buttons, self.x, self.y).await
             }
             MOUSE_TYPE_MOVE_RELATIVE => {
-                self.switch_pointer_mode(PointerMode::Relative).await?;
-                let x = clamp_i8(event.x);
-                let y = clamp_i8(event.y);
-                self.hid.mouse(self.buttons as u8, x, y, 0).await
+                self.relative_moves(&[(clamp_i8(event.x), clamp_i8(event.y))])
+                    .await
             }
             MOUSE_TYPE_DOWN => {
                 self.buttons |= button;
@@ -92,6 +197,11 @@ impl InputState {
             }
             _ => Ok(()),
         }
+    }
+
+    async fn relative_moves(&mut self, moves: &[(i8, i8)]) -> std::io::Result<()> {
+        self.switch_pointer_mode(PointerMode::Relative).await?;
+        self.hid.relative_moves(self.buttons as u8, moves).await
     }
 
     async fn switch_pointer_mode(&mut self, mode: PointerMode) -> std::io::Result<()> {
@@ -121,14 +231,14 @@ impl InputState {
         self.pointer_mode_announced = true;
     }
 
-    async fn send_pointer_buttons(&self) -> std::io::Result<()> {
+    async fn send_pointer_buttons(&mut self) -> std::io::Result<()> {
         match self.pointer_mode {
             PointerMode::Absolute => self.hid.absolute_mouse(self.buttons, self.x, self.y).await,
             PointerMode::Relative => self.hid.mouse(self.buttons as u8, 0, 0, 0).await,
         }
     }
 
-    pub async fn handle_key(&mut self, event: KeyEvent) -> std::io::Result<()> {
+    async fn key(&mut self, event: KeyEvent) -> std::io::Result<()> {
         let mode = KeyboardMode::try_from(event.mode).unwrap_or(KeyboardMode::Legacy);
         // Map events, and Chr fallbacks in Translate mode, carry Linux physical
         // keycodes. Their modifier list only describes lock state, so preserve
@@ -176,10 +286,20 @@ impl InputState {
                     HidKey::Usage(usage) => (Some(usage), 0),
                 }
             }
-            Some(key_event::Union::Chr(value)) => char_to_hid(char::from_u32(value)),
-            Some(key_event::Union::Unicode(value)) => char_to_hid(char::from_u32(value)),
-            Some(key_event::Union::Seq(sequence)) if sequence.chars().count() == 1 => {
-                char_to_hid(sequence.chars().next())
+            Some(key_event::Union::Chr(value)) => self.text_key(char::from_u32(value)),
+            Some(key_event::Union::Unicode(value)) => self.text_key(char::from_u32(value)),
+            // Text, as the keyboard of a phone sends it, in one event: a
+            // press of the key each character is on. Which keys those are
+            // depends on the layout the target has switched on, which is not
+            // known here, as with a real keyboard: Latin text comes out right
+            // under a Latin layout, Russian text under the Russian one.
+            Some(key_event::Union::Seq(sequence)) => {
+                for character in sequence.chars() {
+                    if let (Some(usage), modifier) = self.text_key(Some(character)) {
+                        self.apply_usage(usage, false, true, modifier).await?;
+                    }
+                }
+                return Ok(());
             }
             _ => (None, 0),
         };
@@ -190,8 +310,24 @@ impl InputState {
         Ok(())
     }
 
-    pub async fn heartbeat(&self) -> std::io::Result<()> {
-        self.hid.heartbeat().await
+    // The key of a character of text, however the client sent it.
+    fn text_key(&mut self, character: Option<char>) -> (Option<u8>, u8) {
+        let Some(character) = character else {
+            return (None, 0);
+        };
+        // The character is what the client's keyboard produced, Shift and
+        // all: a phone marks every letter of a word begun with a capital as
+        // typed with Shift, the small ones too. The key's own Shift decides.
+        self.modifiers &= !0x22;
+        let key = match russian_to_hid(character, self.russian_text) {
+            Some((0, _)) => (None, 0),
+            Some((usage, modifier)) => (Some(usage), modifier),
+            None => char_to_hid(Some(character)),
+        };
+        if key.0.is_some() && character.is_alphabetic() {
+            self.russian_text = !character.is_ascii();
+        }
+        key
     }
 
     pub async fn release_all(&mut self) {
@@ -235,9 +371,12 @@ impl InputState {
         }
     }
 
-    async fn send_keyboard(&self) -> std::io::Result<()> {
-        let keys: Vec<u8> = self.keys.iter().copied().take(6).collect();
-        self.hid.keyboard(self.modifiers, &keys).await
+    async fn send_keyboard(&mut self) -> std::io::Result<()> {
+        let mut keys = [0; 6];
+        for (slot, key) in keys.iter_mut().zip(&self.keys) {
+            *slot = *key;
+        }
+        self.hid.keyboard(self.modifiers, keys).await
     }
 
     async fn ctrl_alt_delete(&mut self) -> std::io::Result<()> {
@@ -249,6 +388,10 @@ impl InputState {
         self.modifiers = previous_modifiers;
         self.send_keyboard().await
     }
+}
+
+fn is_lease_held(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ResourceBusy
 }
 
 fn clamp_i8(value: i32) -> i8 {
@@ -394,6 +537,39 @@ fn char_to_hid(value: Option<char>) -> (Option<u8>, u8) {
     (Some(usage), if shift { 0x02 } else { 0 })
 }
 
+// The key of a Russian letter in the Russian layout (the letter rows of the
+// US layout in the same order), and, after Russian text, of the punctuation
+// that the Russian layout has elsewhere.
+fn russian_to_hid(character: char, after_russian: bool) -> Option<(u8, u8)> {
+    const LETTERS: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+    const KEYS: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+    let lower = character.to_lowercase().next()?;
+    if let Some(index) = LETTERS.chars().position(|letter| letter == lower) {
+        let (usage, _) = char_to_hid(KEYS.chars().nth(index));
+        return Some((usage?, if character.is_uppercase() { 0x02 } else { 0 }));
+    }
+    if !after_russian {
+        return None;
+    }
+    Some(match character {
+        '.' => (0x38, 0),
+        ',' => (0x38, 0x02),
+        '?' => (0x24, 0x02),
+        ';' => (0x21, 0x02),
+        ':' => (0x23, 0x02),
+        '"' => (0x1f, 0x02),
+        '№' => (0x20, 0x02),
+        '/' => (0x31, 0x02),
+        // Right Alt and 8.
+        '₽' => (0x25, 0x40),
+        // Not on the Russian layout: their US keys would type something
+        // else, so nothing is typed.
+        '#' | '&' | '@' | '$' | '^' | '[' | ']' | '{' | '}' | '<' | '>' | '`' | '~' | '|'
+        | '\'' => (0, 0),
+        _ => return None,
+    })
+}
+
 fn linux_xorg_keycode_to_hid(value: u32) -> Option<HidKey> {
     let evdev = value.checked_sub(8)?;
     let modifier = match evdev {
@@ -417,11 +593,12 @@ fn linux_xorg_keycode_to_hid(value: u32) -> Option<HidKey> {
         13 => 0x2e,
         14 => 0x2a,
         15 => 0x2b,
-        16..=25 => 0x14 + (evdev - 16) as u8,
+        // The letter rows by position; USB usages follow the alphabet.
+        16..=25 => b"\x14\x1a\x08\x15\x17\x1c\x18\x0c\x12\x13"[(evdev - 16) as usize],
         26 => 0x2f,
         27 => 0x30,
         28 => 0x28,
-        30..=38 => 0x04 + (evdev - 30) as u8,
+        30..=38 => b"\x04\x16\x07\x09\x0a\x0b\x0d\x0e\x0f"[(evdev - 30) as usize],
         39 => 0x33,
         40 => 0x34,
         41 => 0x35,
@@ -436,6 +613,7 @@ fn linux_xorg_keycode_to_hid(value: u32) -> Option<HidKey> {
         51 => 0x36,
         52 => 0x37,
         53 => 0x38,
+        55 => 0x55,
         57 => 0x2c,
         58 => 0x39,
         59..=68 => 0x3a + (evdev - 59) as u8,
@@ -489,6 +667,18 @@ mod tests {
         assert_eq!(linux_xorg_keycode_to_hid(38), Some(HidKey::Usage(0x04)));
         assert_eq!(linux_xorg_keycode_to_hid(36), Some(HidKey::Usage(0x28)));
         assert_eq!(linux_xorg_keycode_to_hid(94), Some(HidKey::Usage(0x64)));
+        // The three letter rows, left to right, give their letters.
+        let usages = |codes: std::ops::RangeInclusive<u32>| -> String {
+            codes
+                .map(|code| match linux_xorg_keycode_to_hid(code) {
+                    Some(HidKey::Usage(usage)) => char::from(b'a' + usage - 0x04),
+                    _ => '?',
+                })
+                .collect()
+        };
+        assert_eq!(usages(24..=33), "qwertyuiop");
+        assert_eq!(usages(38..=46), "asdfghjkl");
+        assert_eq!(usages(52..=58), "zxcvbnm");
     }
 
     #[test]
@@ -497,6 +687,17 @@ mod tests {
         assert_eq!(linux_xorg_keycode_to_hid(50), Some(HidKey::Modifier(0x02)));
         assert_eq!(linux_xorg_keycode_to_hid(108), Some(HidKey::Modifier(0x40)));
         assert_eq!(linux_xorg_keycode_to_hid(134), Some(HidKey::Modifier(0x80)));
+    }
+
+    #[test]
+    fn russian_text_takes_the_keys_of_the_russian_layout() {
+        use super::russian_to_hid;
+        // п and Ф are on G and A; the full stop is on the slash key there.
+        assert_eq!(russian_to_hid('п', false), Some((0x0a, 0)));
+        assert_eq!(russian_to_hid('Ф', false), Some((0x04, 0x02)));
+        assert_eq!(russian_to_hid('.', true), Some((0x38, 0)));
+        assert_eq!(russian_to_hid('.', false), None);
+        assert_eq!(russian_to_hid('a', true), None);
     }
 
     #[test]

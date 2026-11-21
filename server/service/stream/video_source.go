@@ -100,6 +100,12 @@ func newVideoSource(captureFrame func(EncoderConfig) ([]byte, []byte, int)) *Vid
 	}
 }
 
+// SelectedEncoderConfig is the device codec as streams will use it: a
+// selected H.264 that cannot encode the current input reads as H.265.
+func SelectedEncoderConfig() (EncoderConfig, bool) {
+	return defaultVideoSource.selectedConfig()
+}
+
 // ActiveEncoderConfig reports only a session with live transport subscriptions.
 // A draining native read must not force a new viewer to adopt a stale codec.
 func ActiveEncoderConfig() (EncoderConfig, bool) {
@@ -411,7 +417,7 @@ func (s *VideoSource) publish(session *videoSession, storage, data []byte, resul
 			return
 		}
 		if result == keyFrameResult {
-			storage, data = fixParameterSets(session.config.Codec, videoColourRewrite, storage, data, videoHeadroom)
+			storage, data = fixParameterSets(session.config.Codec, true, storage, data, videoHeadroom)
 		}
 		frame.Storage = storage
 		frame.Data = data

@@ -5,6 +5,7 @@ import (
 	"NanoKVM-Server/middleware"
 	"NanoKVM-Server/service/extensions/acme"
 	"NanoKVM-Server/service/extensions/netbird"
+	"NanoKVM-Server/service/extensions/netsvc"
 	"NanoKVM-Server/service/extensions/openvpn"
 	"NanoKVM-Server/service/extensions/tailscale"
 	"NanoKVM-Server/service/extensions/vpn"
@@ -21,8 +22,6 @@ func extensionsRouter(r *gin.Engine) {
 
 	api.GET("/vpn/versions", vpn.Versions)
 	ovpn := openvpn.NewService()
-	api.POST("/openvpn/install", ovpn.Install)
-	api.POST("/openvpn/uninstall", ovpn.Uninstall)
 	api.GET("/openvpn/status", ovpn.GetStatus)
 	api.POST("/openvpn/import", ovpn.Import)
 	api.POST("/openvpn/profile", ovpn.Change)
@@ -30,6 +29,18 @@ func extensionsRouter(r *gin.Engine) {
 	api.GET("/wireguard/status", wg.GetStatus)
 	api.POST("/wireguard/import", wg.Import)
 	api.POST("/wireguard/profile", wg.Change)
+
+	// Settings > Services: LLDP, SNMP and UPS, each off until it is switched on.
+	for name, handlers := range map[string][4]gin.HandlerFunc{
+		"lldp": {netsvc.LLDPStatus, netsvc.LLDPEnabled, netsvc.LLDPSettings, netsvc.LLDPReset},
+		"snmp": {netsvc.SNMPStatus, netsvc.SNMPEnabled, netsvc.SNMPSettings, netsvc.SNMPReset},
+		"ups":  {netsvc.UPSStatus, netsvc.UPSEnabled, netsvc.UPSSettings, netsvc.UPSReset},
+	} {
+		api.GET("/"+name+"/status", handlers[0])
+		api.PUT("/"+name+"/enabled", handlers[1])
+		api.PUT("/"+name+"/settings", handlers[2])
+		api.POST("/"+name+"/reset", handlers[3])
+	}
 
 	ts := tailscale.NewService()
 

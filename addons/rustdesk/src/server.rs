@@ -1,9 +1,13 @@
 // NanoKVM OS adaptation, 2026-10-03. SPDX-License-Identifier: AGPL-3.0-only
+use std::os::fd::{AsRawFd, RawFd};
 use std::{
     collections::HashMap,
     io,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -29,11 +33,10 @@ use crate::{
     },
     identity::RustDeskIdentity,
     input::InputState,
-    nanokvm::{self, Codec, HidClient, Identity, MediaFrame, MediaSubscriber, VideoInfo},
+    nanokvm::{self, Codec, HidClient, MediaFrame, MediaPayload, MediaSubscriber, VideoInfo},
     protocol::{
-        login_response, message, video_frame, DisplayInfo, EncodedVideoFrame, EncodedVideoFrames,
-        Features, Hash, IdPk, KeyEvent, LoginRequest, LoginResponse, Message, MouseEvent, PeerInfo,
-        SignedId, SupportedEncoding, VideoFrame,
+        login_response, message, DisplayInfo, Features, Hash, IdPk, KeyEvent, LoginRequest,
+        LoginResponse, Message, MouseEvent, PeerInfo, SignedId, SupportedEncoding,
     },
     rendezvous,
 };
@@ -49,6 +52,8 @@ const MAX_PASSWORD_ATTEMPTS: usize = 5;
 const MAX_EMPTY_PROBES: usize = 3;
 const EMPTY_PROBE_DELAY: Duration = Duration::from_millis(300);
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(5);
+// A peer that sends nothing this long is taken as gone (see input.rs).
+pub(crate) const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 // A connected viewer keeps its temporary-password reconnect grace alive;
 // refreshing it once a second is plenty for a 30 s grace.
@@ -83,7 +88,52 @@ pub(crate) struct ClientLimits {
     pub(crate) audio_allowed: bool,
     sessions: Arc<Mutex<SessionRegistry>>,
     pending: Arc<Semaphore>,
+    requested: Arc<Semaphore>,
+    requested_sources: Arc<Mutex<HashMap<IpAddr, usize>>>,
     credentials: Arc<Mutex<Option<crate::auth::Credentials>>>,
+}
+
+// Held by a handshake until its login is accepted or it ends.
+pub(crate) struct PendingPermit {
+    _source: Option<RequestedSource>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct RequestedSource {
+    sources: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    source: IpAddr,
+}
+
+impl Drop for RequestedSource {
+    fn drop(&mut self) {
+        let mut sources = self
+            .sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(held) = sources.get_mut(&self.source) {
+            *held -= 1;
+            if *held == 0 {
+                sources.remove(&self.source);
+            }
+        }
+    }
+}
+
+// One viewer's attempts overlap in at most two handshakes: a punch or
+// WebRTC attempt and a relay it requested meanwhile. A fallback relay
+// starts only after its punch attempt gave up its permit.
+const MAX_REQUESTED_PER_SOURCE: usize = 2;
+
+// The controller address a cap applies to; an IPv6 host usually has a
+// whole /64 to pick addresses from.
+fn requested_source(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => IpAddr::V4(ip),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & !u128::from(u64::MAX))),
+        },
+        ip => ip,
+    }
 }
 
 struct SessionRegistry {
@@ -113,6 +163,11 @@ impl Drop for SessionPermit {
 
 impl ClientLimits {
     pub(crate) fn new(max_clients: usize) -> Self {
+        // RustDesk races direct, hole-punch, and relay candidates for one
+        // logical connection. Keep those short-lived handshakes separate
+        // from the configured limit, which applies to authenticated
+        // sessions. The pending cap still bounds unauthenticated work.
+        let pending = max_clients.saturating_mul(2).max(4);
         Self {
             input_allowed: true,
             audio_allowed: true,
@@ -120,25 +175,55 @@ impl ClientLimits {
                 max_clients,
                 clients: HashMap::new(),
             })),
-            // RustDesk races direct, hole-punch, and relay candidates for one
-            // logical connection. Keep those short-lived handshakes separate
-            // from the configured limit, which applies to authenticated
-            // sessions. The pending cap still bounds unauthenticated work.
-            pending: Arc::new(Semaphore::new(max_clients.saturating_mul(2).max(4))),
+            pending: Arc::new(Semaphore::new(pending)),
+            // Anyone who knows the device ID can have the ID server ask for
+            // handshakes and hold each for over a minute. Those come from a
+            // pool of their own, so they cannot use up the one of viewers
+            // that connect directly, and each controller address gets only
+            // a share of it: filling it takes several addresses.
+            requested: Arc::new(Semaphore::new(pending)),
+            requested_sources: Arc::new(Mutex::new(HashMap::new())),
             credentials: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub(crate) fn try_pending(&self) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.pending).try_acquire_owned().ok()
+    // A handshake with a viewer that connected to the listener.
+    pub(crate) fn try_pending(&self) -> Option<PendingPermit> {
+        Some(PendingPermit {
+            _source: None,
+            _permit: Arc::clone(&self.pending).try_acquire_owned().ok()?,
+        })
+    }
+
+    // A handshake the ID server asked for on behalf of the controller at
+    // `peer`, as the ID server saw it.
+    pub(crate) fn try_requested(&self, peer: IpAddr) -> Option<PendingPermit> {
+        let source = requested_source(peer);
+        let mut sources = self
+            .requested_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let held = sources.get(&source).copied().unwrap_or(0);
+        if held >= MAX_REQUESTED_PER_SOURCE {
+            return None;
+        }
+        let permit = Arc::clone(&self.requested).try_acquire_owned().ok()?;
+        sources.insert(source, held + 1);
+        Some(PendingPermit {
+            _source: Some(RequestedSource {
+                sources: Arc::clone(&self.requested_sources),
+                source,
+            }),
+            _permit: permit,
+        })
     }
     pub(crate) fn with_permissions(
         &self,
         permissions: Option<&crate::protocol::ControlPermissions>,
     ) -> Self {
         let mut limits = self.clone();
-        limits.input_allowed = self.input_allowed && permissions.map_or(true, |p| p.allows(0));
-        limits.audio_allowed = self.audio_allowed && permissions.map_or(true, |p| p.allows(4));
+        limits.input_allowed = self.input_allowed && permissions.is_none_or(|p| p.allows(0));
+        limits.audio_allowed = self.audio_allowed && permissions.is_none_or(|p| p.allows(4));
         limits
     }
 
@@ -210,24 +295,20 @@ impl PendingPointerMove {
     async fn flush(self, input: &mut InputState) -> io::Result<()> {
         match self {
             Self::Absolute(event) => input.handle_mouse(event).await,
-            Self::Relative {
-                mut x,
-                mut y,
-                mut template,
-            } => {
+            Self::Relative { mut x, mut y, .. } => {
                 // Match the web client limiter: preserve the complete relative
-                // displacement and split it into HID-safe signed-byte chunks.
-                // A zero movement is still sent so InputState can learn that
-                // the RustDesk client switched to relative pointer mode.
-                let mut first = true;
-                while first || x != 0 || y != 0 {
-                    first = false;
+                // displacement and split it into HID-safe signed-byte chunks,
+                // which go to the bridge together. A zero movement is still
+                // sent so InputState can learn that the RustDesk client
+                // switched to relative pointer mode.
+                let mut moves = [(0, 0); (MAX_RELATIVE_MOVE as usize).div_ceil(127)];
+                let mut count = 0;
+                while count < moves.len() && (count == 0 || x != 0 || y != 0) {
                     let (chunk_x, chunk_y) = take_relative_chunk(&mut x, &mut y);
-                    template.x = chunk_x;
-                    template.y = chunk_y;
-                    input.handle_mouse(template.clone()).await?;
+                    moves[count] = (chunk_x as i8, chunk_y as i8);
+                    count += 1;
                 }
-                Ok(())
+                input.handle_relative_moves(&moves[..count]).await
             }
         }
     }
@@ -263,11 +344,7 @@ fn take_relative_chunk(x: &mut i64, y: &mut i64) -> (i32, i32) {
     (chunk_x, chunk_y)
 }
 
-pub async fn run(
-    config: Config,
-    identity: Identity,
-    rustdesk_identity: RustDeskIdentity,
-) -> io::Result<()> {
+pub async fn run(config: Config, rustdesk_identity: RustDeskIdentity) -> io::Result<()> {
     let address = SocketAddr::new(
         config
             .listen_address
@@ -278,21 +355,18 @@ pub async fn run(
     let listener = TcpListener::bind(address).await?;
     let limits = ClientLimits::new(config.max_clients);
     let config = Arc::new(config);
-    let identity = Arc::new(identity);
     let rustdesk_identity = Arc::new(rustdesk_identity);
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let mut sessions = JoinSet::new();
 
     if !config.rendezvous_server.trim().is_empty() {
         let rendezvous_config = Arc::clone(&config);
-        let rendezvous_app = Arc::clone(&identity);
         let rendezvous_identity = Arc::clone(&rustdesk_identity);
         let rendezvous_shutdown = shutdown_receiver.clone();
         let rendezvous_limits = limits.clone();
         sessions.spawn(async move {
             rendezvous::run(
                 rendezvous_config,
-                rendezvous_app,
                 rendezvous_identity,
                 rendezvous_shutdown,
                 rendezvous_limits,
@@ -346,12 +420,11 @@ pub async fn run(
                     continue;
                 };
                 let config = Arc::clone(&config);
-                let identity = Arc::clone(&identity);
                 let rustdesk_identity = Arc::clone(&rustdesk_identity);
                 let shutdown = shutdown_receiver.clone();
                 let limits = limits.clone();
                 sessions.spawn(async move {
-                    if let Err(error) = serve(stream, peer, config, identity, rustdesk_identity, false, shutdown, limits, pending_permit).await {
+                    if let Err(error) = serve(stream, peer, config, rustdesk_identity, false, shutdown, limits, pending_permit).await {
                         if !is_peer_disconnect(&error) {
                             crate::connlog::connection_log!("RustDesk client {peer}: {error}");
                         }
@@ -388,24 +461,24 @@ pub(crate) async fn serve(
     stream: TcpStream,
     peer: SocketAddr,
     config: Arc<Config>,
-    identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     secure: bool,
     shutdown: watch::Receiver<bool>,
     limits: ClientLimits,
-    pending_permit: OwnedSemaphorePermit,
+    pending_permit: PendingPermit,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
+    let backlog_fd = Some(stream.as_raw_fd());
     serve_io(
         stream,
         peer,
         config,
-        identity,
         rustdesk_identity,
         secure.then_some(String::new()),
         shutdown,
         limits,
         pending_permit,
+        backlog_fd,
     )
     .await
 }
@@ -416,11 +489,10 @@ pub(crate) async fn serve_webrtc(
     fingerprint: String,
     peer: SocketAddr,
     config: Arc<Config>,
-    identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     shutdown: watch::Receiver<bool>,
     limits: ClientLimits,
-    pending_permit: OwnedSemaphorePermit,
+    pending_permit: PendingPermit,
 ) -> io::Result<()> {
     if fingerprint.is_empty() {
         return Err(io::Error::new(
@@ -432,12 +504,12 @@ pub(crate) async fn serve_webrtc(
         stream,
         peer,
         config,
-        identity,
         rustdesk_identity,
         Some(fingerprint),
         shutdown,
         limits,
         pending_permit,
+        None,
     )
     .await
 }
@@ -447,12 +519,13 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     peer: SocketAddr,
     config: Arc<Config>,
-    identity: Arc<Identity>,
     rustdesk_identity: Arc<RustDeskIdentity>,
     secure: Option<String>,
     mut shutdown: watch::Receiver<bool>,
     limits: ClientLimits,
-    pending_permit: OwnedSemaphorePermit,
+    pending_permit: PendingPermit,
+    // The TCP socket of the session, whose send queue forward_media watches.
+    backlog_fd: Option<RawFd>,
 ) -> io::Result<()> {
     let is_relay = secure.is_some();
     let session_key = match secure {
@@ -488,7 +561,9 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
         };
         let Some(message::Union::LoginRequest(login)) = login.union else {
-            crate::connlog::connection_log!("rejecting RustDesk client {peer}: expected LoginRequest");
+            crate::connlog::connection_log!(
+                "rejecting RustDesk client {peer}: expected LoginRequest"
+            );
             send_error(&mut writer, "Expected LoginRequest").await?;
             return Ok(());
         };
@@ -584,14 +659,17 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             return Ok(());
         }
     };
-    // A controller sends only input, options and pings; nothing it sends
-    // comes near the login limit. A larger packet of repeated empty fields
-    // would decode into far more memory than its size.
+    // A controller sends only input, options and pings; nothing this endpoint
+    // uses comes near the login limit. A larger packet of repeated empty
+    // fields would decode into far more memory than its size. A larger
+    // packet, such as a clipboard a controller syncs anyway, is dropped
+    // unread instead of ending the session.
     reader.set_max_length(MAX_LOGIN_PACKET_LENGTH);
+    reader.skip_oversized();
 
     let video_info = time::timeout(
         MEDIA_TIMEOUT,
-        nanokvm::query_video_info(&config.media_socket, &identity),
+        nanokvm::query_video_info(&config.media_socket),
     )
     .await
     .unwrap_or_else(|_| {
@@ -632,7 +710,7 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     write_union(
         &mut writer,
         message::Union::LoginResponse(LoginResponse {
-            union: Some(login_response::Union::PeerInfo(peer_info(&video_info))),
+            union: Some(login_response::Union::PeerInfo(peer_info(&video_info, config.local_pointer))),
             enable_trusted_devices: false,
         }),
     )
@@ -640,18 +718,22 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     // Re-establish negotiated input permission on every login. Mobile clients
     // can retain the denial sent after an earlier HID failure across reconnects.
-    write_union(
-        &mut writer,
-        message::Union::Misc(crate::protocol::Misc {
-            union: Some(crate::protocol::misc::Union::PermissionInfo(
-                crate::protocol::PermissionInfo {
-                    permission: 0,
-                    enabled: limits.input_allowed,
-                },
-            )),
-        }),
-    )
-    .await?;
+    // The clipboard (2) is not supported; a controller told so does not sync
+    // its clipboard, which can be far over the packet limit.
+    for (permission, enabled) in [(0, limits.input_allowed), (2, false)] {
+        write_union(
+            &mut writer,
+            message::Union::Misc(crate::protocol::Misc {
+                union: Some(crate::protocol::misc::Union::PermissionInfo(
+                    crate::protocol::PermissionInfo {
+                        permission,
+                        enabled,
+                    },
+                )),
+            }),
+        )
+        .await?;
+    }
 
     drop(pending_permit);
     eprintln!(
@@ -660,20 +742,15 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     );
     let media = time::timeout(
         MEDIA_TIMEOUT,
-        MediaSubscriber::connect(
-            &config.media_socket,
-            &identity,
-            "encoded",
-            Some(&video_profile),
-        ),
+        MediaSubscriber::connect(&config.media_socket, "encoded", Some(&video_profile)),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "video subscription timed out"))??;
-    let hid = HidClient::new(config.admin_socket.clone(), (*identity).clone());
+    let hid = HidClient::new(config.admin_socket.clone());
     let mut input = InputState::new(hid, video_info.width, video_info.height);
-    // HID requests use a separate Unix HTTP exchange for every event. Process
-    // them serially in their own task so a slow HID response cannot stall the
-    // video writer. Pointer movement follows the web UI limiter: at most one
+    // Each HID frame waits for the bridge's answer. Process them serially in
+    // their own task so a slow HID response cannot stall the video writer.
+    // Pointer movement follows the web UI limiter: at most one
     // flush starts per 16 ms window, absolute moves keep the newest position,
     // and relative moves accumulate without losing displacement. Keyboard,
     // button, and wheel events flush pending movement before being handled.
@@ -687,6 +764,8 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (input_sender, mut input_receiver) = mpsc::channel(64);
     let (input_result_sender, mut input_result_receiver) = mpsc::channel(1);
     let (input_shutdown_sender, mut input_shutdown) = watch::channel(false);
+    // true while input waits for another session to release HID.
+    let (lease_wait_sender, mut lease_wait) = watch::channel(false);
     let input_task = tokio::spawn(async move {
         let mut enabled = input_allowed;
         let mut active = false;
@@ -703,6 +782,12 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         tokio::pin!(flush_timer);
         let mut flush_armed = false;
         let result = loop {
+            let waiting = input.waiting_for_lease();
+            lease_wait_sender.send_if_modified(|current| {
+                let changed = *current != waiting;
+                *current = waiting;
+                changed
+            });
             arm_pending_flush(
                 flush_timer.as_mut(),
                 flush_grid,
@@ -817,14 +902,31 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // header whenever a client input message won the race. Keep the media read
     // in its own task and pass only complete frames to the session loop.
     let (media_sender, mut media_receiver) = mpsc::channel(1);
-    let media_task = tokio::spawn(forward_media(media, media_sender));
+    // Sent frame buffers return to the reader for reuse.
+    let (spare_sender, spare_receiver) = mpsc::channel(2);
+    let refresh_wanted = Arc::new(AtomicBool::new(false));
+    // The frame rate the client asked for and the encoder was not told yet.
+    // A client that gets more frames than it decodes fills its queue, asks
+    // to refresh and discards the queue, again and again.
+    let fps_wanted = Arc::new(AtomicU32::new(
+        login.option.as_ref().map_or(0, |option| option.custom_fps.max(0) as u32),
+    ));
+    let backlog = backlog_fd.map(|fd| Arc::new(Backlog::new(fd, writer.written())));
+    let media_task = tokio::spawn(forward_media(
+        media,
+        media_sender,
+        spare_receiver,
+        Arc::clone(&refresh_wanted),
+        Arc::clone(&fps_wanted),
+        backlog.clone(),
+    ));
     // FrameReader::read also uses read_exact internally and has the same
     // cancellation constraint. Keep it alive across media sends so a partial
     // RustDesk packet cannot be mistaken for the next packet.
     let (incoming_sender, mut incoming_receiver) = mpsc::channel(16);
     let can_audio = limits.audio_allowed && config.audio_enabled;
     let (audio_desired, audio_setting) =
-        watch::channel(can_audio && login.option.as_ref().map_or(true, |o| o.disable_audio != 2));
+        watch::channel(can_audio && login.option.as_ref().is_none_or(|o| o.disable_audio != 2));
     let audio_current = audio_setting.clone();
     let (audio_task, mut audio_state) =
         crate::audio::start(config.audio_socket.clone(), can_audio, audio_setting);
@@ -834,14 +936,21 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let mut enabled = input_allowed;
         // Admission has just refreshed the reconnect grace.
         let mut last_touch = time::Instant::now();
+        let mut skip_logged = false;
         loop {
             // A stalled/half-open peer releases HID and its viewer slot. The
             // whole stream ends on timeout, so partial reads are never reused.
-            let message = time::timeout(Duration::from_secs(30), reader.read::<Message>())
+            let message = time::timeout(PEER_IDLE_TIMEOUT, reader.read::<Message>())
                 .await
                 .unwrap_or_else(|_| {
                     Err(io::Error::new(io::ErrorKind::TimedOut, "peer idle timeout"))
                 });
+            if !skip_logged && reader.skipped() > 0 {
+                skip_logged = true;
+                crate::connlog::connection_log!(
+                    "RustDesk client {peer}: dropping packets over the size limit"
+                );
+            }
             if let Some(session) = incoming_session.as_ref() {
                 if message.is_ok() && last_touch.elapsed() >= SESSION_TOUCH_INTERVAL {
                     last_touch = time::Instant::now();
@@ -862,6 +971,9 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             union: Some(crate::protocol::misc::Union::Option(option)),
                         })),
                 }) => {
+                    if option.custom_fps > 0 {
+                        fps_wanted.store(option.custom_fps as u32, Ordering::Relaxed);
+                    }
                     if matches!(option.disable_audio, 1 | 2) {
                         let next = can_audio && option.disable_audio == 1;
                         audio_desired.send_if_modified(|value| {
@@ -890,6 +1002,16 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             union: Some(crate::protocol::misc::Union::CloseReason(_)),
                         })),
                 }) => break,
+                Ok(Message {
+                    union:
+                        Some(message::Union::Misc(crate::protocol::Misc {
+                            union:
+                                Some(
+                                    crate::protocol::misc::Union::RefreshVideo(_)
+                                    | crate::protocol::misc::Union::RefreshVideoDisplay(_),
+                                ),
+                        })),
+                }) => refresh_wanted.store(true, Ordering::Relaxed),
                 Ok(Message {
                     union: Some(message::Union::MouseEvent(event)),
                 }) => {
@@ -922,41 +1044,35 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     );
 
     let mut first_video_frame = true;
-    let mut peer_tick = time::interval(Duration::from_secs(10));
+    // The client's quality monitor shows what the probes carry: the round
+    // trip of the last one it answered and the video rate since the one
+    // before, every second as the RustDesk host sends them.
+    let mut peer_tick = time::interval(Duration::from_secs(1));
     peer_tick.tick().await;
+    let mut last_delay = 0u32;
+    let mut video_bytes = 0u64;
+    let mut video_since = time::Instant::now();
     let mut audio_updates_open = true;
-    let mut audio_permission = None;
-    let mut audio_generation = 0;
+    let mut audio_sent = AudioSent::default();
     let mut input_updates_open = true;
+    // Input may be enabled by the controller after login.
+    let mut lease_updates_open = can_control;
     let result = loop {
         tokio::select! {
             changed=audio_state.changed(), if audio_updates_open => {
                 if changed.is_err(){audio_updates_open=false;continue;}
                 let state=audio_state.borrow_and_update().clone();
-                if let Some(available)=state.available {
-                    if audio_permission!=Some(available) {
-                        let permission=crate::protocol::PermissionInfo{permission:3,enabled:available};
-                        if let Err(error)=write_union(&mut writer,message::Union::Misc(crate::protocol::Misc{union:Some(crate::protocol::misc::Union::PermissionInfo(permission))})).await{break Err(error);}
-                        audio_permission=Some(available);
-                    }
-                }
-                if state.available==Some(true) && *audio_current.borrow() && state.generation!=0 {
-                    if audio_generation!=state.generation {
-                        let format=crate::protocol::AudioFormat{sample_rate:crate::audio::SAMPLE_RATE,channels:crate::audio::CHANNELS};
-                        if let Err(error)=write_union(&mut writer,message::Union::Misc(crate::protocol::Misc{union:Some(crate::protocol::misc::Union::AudioFormat(format))})).await{break Err(error);}
-                        audio_generation=state.generation;
-                    }
-                    if let Some((received,data))=state.packet {
-                        if received.elapsed()<=crate::audio::MAX_AGE {
-                            if let Err(error)=write_union(&mut writer,message::Union::AudioFrame(crate::protocol::AudioFrame{data})).await{break Err(error);}
-                        }
-                    }
-                }
+                let wanted=*audio_current.borrow();
+                if let Err(error)=write_audio(&mut writer,state,wanted,&mut audio_sent).await{break Err(error);}
             }
             _ = peer_tick.tick() => {
-                let delay = crate::protocol::TestDelay { time: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
-                    from_client: false, ..Default::default() };
+                // kbit/s: bytes * 8 / ms.
+                let elapsed = video_since.elapsed().as_millis().max(1) as u64;
+                let target_bitrate = (video_bytes * 8 / elapsed) as u32;
+                video_bytes = 0;
+                video_since = time::Instant::now();
+                let delay = crate::protocol::TestDelay { time: unix_millis(),
+                    from_client: false, last_delay, target_bitrate };
                 if let Err(error) = write_union(&mut writer, message::Union::TestDelay(delay)).await {
                     break Err(error);
                 }
@@ -969,6 +1085,9 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             if let Err(error) = write_union(&mut writer, message::Union::TestDelay(delay)).await {
                                 break Err(error);
                             }
+                        } else {
+                            // Our probe, back from the client.
+                            last_delay = unix_millis().saturating_sub(delay.time).clamp(0, 60_000) as u32;
                         }
                     }
                     Some(Ok(_)) => {}
@@ -977,8 +1096,18 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     None => break Ok(()),
                 }
             }
+            changed = lease_wait.changed(), if lease_updates_open => {
+                if changed.is_err() { lease_updates_open = false; continue; }
+                // Keyboard off while another session holds HID, on again once
+                // this one has it.
+                let enabled = !*lease_wait.borrow_and_update();
+                let permission=crate::protocol::PermissionInfo{permission:0,enabled};
+                if let Err(error)=write_union(&mut writer,message::Union::Misc(crate::protocol::Misc{union:Some(crate::protocol::misc::Union::PermissionInfo(permission))})).await{break Err(error);}
+            }
             input = input_result_receiver.recv(), if input_updates_open => {
                 input_updates_open = false;
+                // A queued lease recovery must not re-enable a failed worker.
+                lease_updates_open = false;
                 if let Some(Err(error)) = input {
                     eprintln!("RustDesk input unavailable for {peer}; continuing video: {error}");
                     let permission=crate::protocol::PermissionInfo{permission:0,enabled:false};
@@ -993,7 +1122,8 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 };
                 let frame_codec = frame.codec;
                 let frame_length = frame.payload.len();
-                let Some(video) = rustdesk_video_frame(frame) else {
+                video_bytes += frame_length as u64;
+                let Some((mut video, start)) = rustdesk_video_frame(frame) else {
                     continue;
                 };
                 if first_video_frame {
@@ -1002,9 +1132,21 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         codec_name(frame_codec)
                     );
                 }
-                if let Err(error) = write_union(&mut writer, message::Union::VideoFrame(video)).await {
+                // Sound first: a frame can take longer to write than several of its packets last.
+                if audio_updates_open && audio_state.has_changed().unwrap_or(false) {
+                    let state = audio_state.borrow_and_update().clone();
+                    let wanted = *audio_current.borrow();
+                    if let Err(error) = write_audio(&mut writer, state, wanted, &mut audio_sent).await {
+                        break Err(error);
+                    }
+                }
+                if let Err(error) = writer.write_encoded(&mut video, start).await {
                     break Err(error);
                 }
+                if let Some(backlog) = &backlog {
+                    backlog.video(time::Instant::now());
+                }
+                let _ = spare_sender.try_send(MediaPayload::spare(video));
                 if first_video_frame {
                     eprintln!("RustDesk client {peer} sent first video frame");
                     first_video_frame = false;
@@ -1027,6 +1169,13 @@ async fn serve_io<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     result
 }
 
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 // The session, and with it its viewer slot, ends only once the input task
 // has: that task releases held keys and buttons and closes the HID lease
 // last, and a viewer admitted before would find the lease still held and
@@ -1043,38 +1192,201 @@ async fn retire_input(input_task: tokio::task::JoinHandle<()>, permit: SessionPe
 // session of any viewer slower than the encoder. A frame the session writer
 // is not ready for within MEDIA_GRACE is dropped here instead, and so are
 // the frames after it until a keyframe, so the bridge socket keeps being
-// drained. A keyframe is requested when that starts, and again every
-// second while it lasts, in case the requested one was dropped too.
+// drained. A keyframe is requested when that starts, and again while it
+// lasts, in case the requested one was dropped too.
 const MEDIA_GRACE: Duration = Duration::from_millis(250);
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+const KEYFRAME_REQUEST_MAX_INTERVAL: Duration = Duration::from_secs(8);
 
+// The encoder is shared, so a keyframe one viewer asks for costs every
+// viewer an IDR. As in the WebRTC peer writer, the first request goes at
+// once and one that keeps recurring waits 1, 2, 4 and then 8 s. The wait
+// starts over only once a repair held: its keyframe went out and frames
+// still went out a second after it.
+// The session writer is not ready for a frame only when the socket's send
+// buffer is full, and the kernel lets that buffer grow to megabytes: seconds
+// of video at a desktop's bitrate. So the age of the video that waits in the
+// socket is watched as well. Positions are positions in the whole byte stream
+// the session writes (the writer counts every byte: length prefixes, tags,
+// sound, control messages), which is the stream the socket's queue length
+// counts: the session marks each video frame with the position it ends at,
+// and the queue length says which marks have left. A frame that still waits
+// for the writer has no mark; the forwarder's own wait covers it.
+const MAX_BACKLOG: Duration = Duration::from_millis(400);
+
+struct Backlog {
+    fd: RawFd,
+    written: Arc<std::sync::atomic::AtomicU64>,
+    marks: std::sync::Mutex<std::collections::VecDeque<(u64, time::Instant)>>,
+}
+
+impl Backlog {
+    fn new(fd: RawFd, written: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            fd,
+            written,
+            marks: Default::default(),
+        }
+    }
+
+    // The session has written a video frame: the stream ends with it now.
+    fn video(&self, now: time::Instant) {
+        let end = self.written.load(Ordering::Relaxed);
+        self.marks.lock().unwrap().push_back((end, now));
+    }
+
+    // How long the oldest video still in the socket has waited.
+    fn age(&self, now: time::Instant) -> Duration {
+        // Before the queue length: bytes written in between count as queued,
+        // never as gone.
+        let written = self.written.load(Ordering::Relaxed);
+        let mut queued: libc::c_int = 0;
+        // SAFETY: the session owns the socket for longer than this task
+        // runs, and TIOCOUTQ writes one int.
+        if unsafe { libc::ioctl(self.fd, libc::TIOCOUTQ as _, &mut queued) } != 0 {
+            self.marks.lock().unwrap().clear();
+            return Duration::ZERO;
+        }
+        self.age_of(now, written, queued.max(0) as u64)
+    }
+
+    fn age_of(&self, now: time::Instant, written: u64, queued: u64) -> Duration {
+        let left = written.saturating_sub(queued);
+        let mut marks = self.marks.lock().unwrap();
+        while marks.front().is_some_and(|&(end, _)| end <= left) {
+            marks.pop_front();
+        }
+        marks.front().map_or(Duration::ZERO, |&(_, at)| now - at)
+    }
+}
+
+#[derive(Default)]
+struct KeyframeRequests {
+    last: Option<time::Instant>,
+    wait: Duration,
+    repaired: Option<time::Instant>,
+}
+
+impl KeyframeRequests {
+    // A frame was dropped; whether to ask for a keyframe now.
+    fn dropped(&mut self, now: time::Instant) -> bool {
+        self.repaired = None;
+        if self.last.is_some_and(|last| now - last < self.wait) {
+            return false;
+        }
+        self.last = Some(now);
+        self.wait = if self.wait.is_zero() {
+            KEYFRAME_REQUEST_INTERVAL
+        } else {
+            (self.wait * 2).min(KEYFRAME_REQUEST_MAX_INTERVAL)
+        };
+        true
+    }
+
+    fn sent(&mut self, now: time::Instant, keyframe: bool, repairing: bool) {
+        if repairing && keyframe {
+            self.repaired = Some(now);
+        } else if self
+            .repaired
+            .is_some_and(|at| now - at >= KEYFRAME_REQUEST_INTERVAL)
+        {
+            self.repaired = None;
+            self.wait = Duration::ZERO;
+        }
+    }
+}
+
+// The client's refresh, at most this often: the encoder is shared, and a
+// client whose queue is full asks with every frame it receives. One that
+// keeps asking is on a link that cannot take the keyframes, each as much as
+// a second of video there, so the wait doubles up to the longer one.
+const CLIENT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const CLIENT_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(8);
+
+// Each frame is read into the buffer of an earlier one, of a dropped frame or
+// from spares, where the session returns the buffers of the frames it sent.
 async fn forward_media(
     mut media: MediaSubscriber,
     sender: mpsc::Sender<io::Result<MediaFrame>>,
+    mut spares: mpsc::Receiver<Vec<u8>>,
+    refresh_wanted: Arc<AtomicBool>,
+    fps_wanted: Arc<AtomicU32>,
+    backlog: Option<Arc<Backlog>>,
 ) {
     let mut dropping = false;
-    let mut requested: Option<time::Instant> = None;
+    let mut requests = KeyframeRequests::default();
+    let mut spare = Vec::new();
+    let mut refreshed: Option<time::Instant> = None;
+    let mut refresh_wait = CLIENT_REFRESH_INTERVAL;
     loop {
-        let frame = match media.read_frame().await {
+        if spare.capacity() == 0 {
+            spare = spares.try_recv().unwrap_or_default();
+        }
+        let frame = match media.read_frame(std::mem::take(&mut spare)).await {
             Ok(frame) => frame,
             Err(error) => {
                 let _ = sender.send(Err(error)).await;
                 return;
             }
         };
-        if !dropping || frame.keyframe {
-            match sender.send_timeout(Ok(frame), MEDIA_GRACE).await {
-                Ok(()) => {
-                    dropping = false;
-                    requested = None;
-                    continue;
-                }
-                Err(mpsc::error::SendTimeoutError::Timeout(_)) => dropping = true,
-                Err(mpsc::error::SendTimeoutError::Closed(_)) => return,
+        let fps = fps_wanted.swap(0, Ordering::Relaxed);
+        if fps != 0 {
+            if let Err(error) = media.request_fps(fps).await {
+                let _ = sender.send(Err(error)).await;
+                return;
             }
         }
-        if requested.is_none_or(|at| at.elapsed() >= KEYFRAME_REQUEST_INTERVAL) {
-            requested = Some(time::Instant::now());
+        // A client that asked to refresh discards frames until a keyframe.
+        // The request is seen with the next frame, 17 ms later at most while
+        // the encoder runs.
+        let now = time::Instant::now();
+        if dropping {
+            // The session asks for its own keyframes already.
+            refresh_wanted.store(false, Ordering::Relaxed);
+        } else if refresh_wanted.load(Ordering::Relaxed)
+            && refreshed.is_none_or(|at| now - at >= refresh_wait)
+        {
+            refresh_wanted.store(false, Ordering::Relaxed);
+            refresh_wait = match refreshed {
+                Some(at) if now - at < refresh_wait * 2 => {
+                    (refresh_wait * 2).min(CLIENT_REFRESH_MAX_INTERVAL)
+                }
+                _ => CLIENT_REFRESH_INTERVAL,
+            };
+            refreshed = Some(now);
+            if let Err(error) = media.request_key_frame().await {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+        }
+        // Video the peer has not taken for MAX_BACKLOG is late already: add
+        // nothing to it and go on from a keyframe once it is gone.
+        let stale = backlog
+            .as_ref()
+            .is_some_and(|backlog| backlog.age(time::Instant::now()) > MAX_BACKLOG);
+        if stale {
+            dropping = true;
+        }
+        if !stale && (!dropping || frame.keyframe) {
+            let keyframe = frame.keyframe;
+            match sender.send_timeout(Ok(frame), MEDIA_GRACE).await {
+                Ok(()) => {
+                    requests.sent(time::Instant::now(), keyframe, dropping);
+                    dropping = false;
+                    continue;
+                }
+                Err(mpsc::error::SendTimeoutError::Timeout(frame)) => {
+                    dropping = true;
+                    if let Ok(frame) = frame {
+                        spare = MediaPayload::spare(frame.payload.into_buffer());
+                    }
+                }
+                Err(mpsc::error::SendTimeoutError::Closed(_)) => return,
+            }
+        } else {
+            spare = MediaPayload::spare(frame.payload.into_buffer());
+        }
+        if requests.dropped(time::Instant::now()) {
             if let Err(error) = media.request_key_frame().await {
                 let _ = sender.send(Err(error)).await;
                 return;
@@ -1094,7 +1406,7 @@ fn viewer_key(peer: std::net::SocketAddr, secure: bool, client_id: &str) -> Stri
     }
 }
 
-fn peer_info(video: &VideoInfo) -> PeerInfo {
+fn peer_info(video: &VideoInfo, local_pointer: bool) -> PeerInfo {
     PeerInfo {
         username: "NanoKVM".to_owned(),
         hostname: "NanoKVM".to_owned(),
@@ -1109,11 +1421,12 @@ fn peer_info(video: &VideoInfo) -> PeerInfo {
             height: i32::from(video.height),
             name: "KVM capture".to_owned(),
             online: true,
-            // The HDMI capture contains the target cursor, but it arrives with
-            // the video pipeline latency. Advertising it as the only cursor
-            // makes RustDesk hide the immediate local pointer. Keep the local
-            // pointer visible for responsive KVM control.
-            cursor_embedded: false,
+            // The HDMI capture contains the target's cursor, which arrives
+            // with the delay of the video. A client told so draws none of its
+            // own. Told otherwise it draws a pointer that moves at once, a
+            // blue dot as it gets no cursor shape, and the target's cursor
+            // follows it: the local_pointer setting.
+            cursor_embedded: !local_pointer,
             scale: 1.0,
         }],
         current_display: 0,
@@ -1142,7 +1455,7 @@ fn client_supports_codec(login: &LoginRequest, codec: Codec) -> bool {
     match codec {
         // Older RustDesk clients predate SupportedDecoding but can decode
         // H.264, so preserve the existing compatibility fallback.
-        Codec::H264 => supported.map_or(true, |ability| ability.ability_h264 > 0),
+        Codec::H264 => supported.is_none_or(|ability| ability.ability_h264 > 0),
         // H.265 is optional and must be explicitly advertised by the client.
         Codec::H265 => supported.is_some_and(|ability| ability.ability_h265 > 0),
         Codec::Mjpeg => false,
@@ -1157,26 +1470,50 @@ fn codec_name(codec: Codec) -> &'static str {
     }
 }
 
-fn rustdesk_video_frame(frame: MediaFrame) -> Option<VideoFrame> {
-    if frame.payload.is_empty() {
-        return None;
-    }
-    let frames = EncodedVideoFrames {
-        frames: vec![EncodedVideoFrame {
-            data: frame.payload,
-            key: frame.keyframe,
-            pts: frame.pts_usec / 1_000,
-        }],
-    };
-    let union = match frame.codec {
-        Codec::H264 => video_frame::Union::H264s(frames),
-        Codec::H265 => video_frame::Union::H265s(frames),
+// The RustDesk message of a video frame, encoded around the payload in the
+// frame's own buffer: the buffer and where the message starts in it. The
+// bytes are what prost writes for
+// Message { VideoFrame { H264s or H265s { frames: [{ data, key, pts }] } } }
+// (fields in tag order, false and zero left out), without copying the
+// payload into a second buffer.
+fn rustdesk_video_frame(frame: MediaFrame) -> Option<(Vec<u8>, usize)> {
+    use bytes::BufMut;
+    use prost::encoding::{encode_varint, encoded_len_varint};
+    const BYTES: u8 = 2; // wire type: length-delimited
+    let codec_field = match frame.codec {
+        Codec::H264 => 10,
+        Codec::H265 => 11,
         Codec::Mjpeg => return None,
     };
-    Some(VideoFrame {
-        union: Some(union),
-        display: 0,
-    })
+    let payload = frame.payload.len();
+    if payload == 0 {
+        return None;
+    }
+    let pts = frame.pts_usec / 1_000;
+    let mut buffer = frame.payload.into_buffer();
+    // EncodedVideoFrame: key = 2 and pts = 3 follow data = 1.
+    if frame.keyframe {
+        buffer.extend_from_slice(&[2 << 3, 1]);
+    }
+    if pts != 0 {
+        buffer.push(3 << 3);
+        encode_varint(pts as u64, &mut buffer);
+    }
+    // The headers, innermost first; each length covers all that follows it.
+    let mut length = buffer.len() - MediaPayload::FRONT;
+    let mut start = MediaPayload::FRONT;
+    for (field, length_of) in [(1, payload), (1, 0), (codec_field, 0), (6, 0)] {
+        // data's length is the payload's; the three messages' lengths are
+        // everything encoded so far.
+        let value = if length_of != 0 { length_of } else { length } as u64;
+        let size = 1 + encoded_len_varint(value);
+        start -= size;
+        let mut header = &mut buffer[start..start + size];
+        header.put_u8(field << 3 | BYTES);
+        encode_varint(value, &mut header);
+        length += size;
+    }
+    Some((buffer, start))
 }
 
 pub(crate) fn verify_password(password: &str, hash: &Hash, login: &LoginRequest) -> bool {
@@ -1218,6 +1555,52 @@ async fn send_error<W: AsyncWrite + Unpin>(
         }),
     )
     .await
+}
+
+/// What of the audio a session has told its client.
+#[derive(Default)]
+struct AudioSent {
+    permission: Option<bool>,
+    generation: u64,
+    number: u64,
+}
+
+/// Sends what the audio state holds and the client has not been sent: the permission, the format of a new
+/// capture, and the packets after the last one sent that are not older than MAX_AGE.
+async fn write_audio<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    state: crate::audio::State,
+    wanted: bool,
+    sent: &mut AudioSent,
+) -> io::Result<()> {
+    if let Some(available) = state.available {
+        if sent.permission != Some(available) {
+            let permission = crate::protocol::PermissionInfo { permission: 3, enabled: available };
+            write_union(writer, message::Union::Misc(crate::protocol::Misc {
+                union: Some(crate::protocol::misc::Union::PermissionInfo(permission)),
+            })).await?;
+            sent.permission = Some(available);
+        }
+    }
+    if state.available == Some(true) && wanted && state.generation != 0 {
+        if sent.generation != state.generation {
+            let format = crate::protocol::AudioFormat {
+                sample_rate: crate::audio::SAMPLE_RATE,
+                channels: crate::audio::CHANNELS,
+            };
+            write_union(writer, message::Union::Misc(crate::protocol::Misc {
+                union: Some(crate::protocol::misc::Union::AudioFormat(format)),
+            })).await?;
+            sent.generation = state.generation;
+        }
+        for (number, received, data) in state.packets {
+            if number > sent.number && received.elapsed() <= crate::audio::MAX_AGE {
+                write_union(writer, message::Union::AudioFrame(crate::protocol::AudioFrame { data })).await?;
+            }
+            sent.number = sent.number.max(number);
+        }
+    }
+    Ok(())
 }
 
 async fn write_union<W: AsyncWrite + Unpin>(
@@ -1267,8 +1650,8 @@ async fn identity_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         HANDSHAKE_TIMEOUT,
         read_message_within(stream, MAX_LOGIN_PACKET_LENGTH),
     )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "secure handshake timed out"))??;
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "secure handshake timed out"))??;
     let Some(message::Union::PublicKey(public_key)) = response.union else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1347,7 +1730,7 @@ mod tests {
         config::Config,
         framing::{read_message, write_message, FrameReader, FrameWriter},
         identity::RustDeskIdentity,
-        nanokvm::{Codec, Identity, MediaFrame, VideoInfo},
+        nanokvm::{Codec, MediaFrame, VideoInfo},
         protocol::{
             login_response, message, Hash, LoginRequest, LoginResponse, Message, MouseEvent,
             OptionMessage, SupportedDecoding, TestDelay,
@@ -1520,6 +1903,23 @@ mod tests {
         assert!(limits.try_session("id:client-b".to_owned()).is_some());
     }
 
+    #[test]
+    fn requested_handshakes_cannot_crowd_out_other_viewers() {
+        let limits = ClientLimits::new(1);
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().unwrap();
+        // One address, even spread over its IPv6 /64, holds two at most.
+        let first = limits.try_requested(ip("2001:db8::1")).unwrap();
+        let _second = limits.try_requested(ip("2001:db8::2")).unwrap();
+        assert!(limits.try_requested(ip("2001:db8::3")).is_none());
+        let _other = limits.try_requested(ip("192.0.2.1")).unwrap();
+        let _another = limits.try_requested(ip("::ffff:192.0.2.2")).unwrap();
+        assert!(limits.try_requested(ip("192.0.2.3")).is_none());
+        // Direct viewers have a pool of their own.
+        assert!(limits.try_pending().is_some());
+        drop(first);
+        assert!(limits.try_requested(ip("2001:db8::3")).is_some());
+    }
+
     #[tokio::test]
     async fn the_viewer_slot_waits_for_the_input_cleanup() {
         let limits = ClientLimits::new(1);
@@ -1546,7 +1946,10 @@ mod tests {
             }
             time::sleep(Duration::from_millis(10)).await;
         };
-        assert!(admitted.is_some(), "the slot was not freed after the cleanup");
+        assert!(
+            admitted.is_some(),
+            "the slot was not freed after the cleanup"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1581,6 +1984,26 @@ mod tests {
             time::advance(delay).await;
             timer.as_mut().await;
         }
+    }
+
+    #[test]
+    fn keyframe_requests_back_off_until_a_repair_holds() {
+        let start = time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut requests = super::KeyframeRequests::default();
+        let asked: Vec<u64> = (0..=23_000)
+            .step_by(250)
+            .filter(|&ms| requests.dropped(at(ms)))
+            .collect();
+        assert_eq!(asked, [0, 1_000, 3_000, 7_000, 15_000, 23_000]);
+        // A repair that fails again within a second keeps the wait...
+        requests.sent(at(23_100), true, true);
+        requests.sent(at(23_500), false, false);
+        assert!(!requests.dropped(at(23_600)));
+        // ...one that holds starts it over.
+        requests.sent(at(24_000), true, true);
+        requests.sent(at(25_100), false, false);
+        assert!(requests.dropped(at(25_200)));
     }
 
     #[test]
@@ -1664,7 +2087,10 @@ mod tests {
         let PendingPointerMove::Relative { mut x, mut y, .. } = pending else {
             panic!("relative movement changed pointer mode");
         };
-        assert_eq!((x, y), (super::MAX_RELATIVE_MOVE, -super::MAX_RELATIVE_MOVE));
+        assert_eq!(
+            (x, y),
+            (super::MAX_RELATIVE_MOVE, -super::MAX_RELATIVE_MOVE)
+        );
         let mut chunks = 0;
         while x != 0 || y != 0 {
             take_relative_chunk(&mut x, &mut y);
@@ -1730,41 +2156,59 @@ mod tests {
         assert!(client_supports_codec(&modern_login, Codec::H265));
 
         for codec in [Codec::H264, Codec::H265] {
-            let info = peer_info(&VideoInfo {
+            let info = peer_info(
+                &VideoInfo {
                 codec,
                 width: 1920,
                 height: 1080,
                 fps: 60,
-            });
+            },
+                false,
+            );
             let encoding = info.encoding.unwrap();
             assert_eq!(encoding.h264, codec == Codec::H264);
             assert_eq!(encoding.h265, codec == Codec::H265);
 
-            let video = rustdesk_video_frame(MediaFrame {
-                sequence: 1,
-                pts_usec: 1_234_000,
-                duration_usec: 16_667,
-                width: 1920,
-                height: 1080,
-                codec,
-                keyframe: true,
-                payload: vec![0, 0, 0, 1, 0x26].into(),
-            })
-            .unwrap();
-            match (codec, video.union) {
-                (Codec::H264, Some(message)) => {
-                    assert!(matches!(
-                        message,
-                        crate::protocol::video_frame::Union::H264s(_)
-                    ))
-                }
-                (Codec::H265, Some(message)) => {
-                    assert!(matches!(
-                        message,
-                        crate::protocol::video_frame::Union::H265s(_)
-                    ))
-                }
-                _ => panic!("video frame used the wrong RustDesk codec variant"),
+            // The message encoded around the payload is byte for byte what
+            // prost encodes, for every header length.
+            for (size, keyframe, pts_usec) in [
+                (5, true, 1_234_000),
+                (1, false, 0),
+                (100, false, 999),
+                (127, true, -5_000),
+                (16_383, false, 1_000),
+                (300_000, true, i64::MAX),
+            ] {
+                let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
+                let (buffer, start) = rustdesk_video_frame(MediaFrame {
+                    sequence: 1,
+                    pts_usec,
+                    duration_usec: 16_667,
+                    width: 1920,
+                    height: 1080,
+                    codec,
+                    keyframe,
+                    payload: payload.clone().into(),
+                })
+                .unwrap();
+                assert!(start >= 40, "room for the length prefix and the tag");
+                let frames = crate::protocol::EncodedVideoFrames {
+                    frames: vec![crate::protocol::EncodedVideoFrame {
+                        data: payload.into(),
+                        key: keyframe,
+                        pts: pts_usec / 1_000,
+                    }],
+                };
+                let expected = Message {
+                    union: Some(message::Union::VideoFrame(crate::protocol::VideoFrame {
+                        union: Some(match codec {
+                            Codec::H264 => crate::protocol::video_frame::Union::H264s(frames),
+                            _ => crate::protocol::video_frame::Union::H265s(frames),
+                        }),
+                        display: 0,
+                    })),
+                };
+                assert_eq!(buffer[start..], expected.encode_to_vec(), "{size} {keyframe}");
             }
         }
     }
@@ -1856,10 +2300,6 @@ mod tests {
                 audio_socket: audio_path.to_string_lossy().into_owned(),
                 ..Config::default()
             });
-            let identity = Arc::new(Identity {
-                extension_id: "rustdesk".into(),
-                token: "a".repeat(64),
-            });
             let rustdesk_identity =
                 Arc::new(RustDeskIdentity::load_from(&directory.join("identity")).unwrap());
             let (_shutdown, shutdown) = watch::channel(false);
@@ -1870,7 +2310,6 @@ mod tests {
                 stream,
                 peer,
                 config,
-                identity,
                 rustdesk_identity,
                 false,
                 shutdown,
@@ -2043,7 +2482,8 @@ mod tests {
     }
     #[tokio::test]
     async fn hid_rejection_disables_input_without_ending_video_or_peer_messages() {
-        for status in [409, 504] {
+        // The bridge's statuses for a revoked session and a timed-out report.
+        for status in [2, 4] {
             bridge_mock_with_hid_failure(true, false, false, Some(status)).await;
         }
     }
@@ -2054,7 +2494,7 @@ mod tests {
         can_control: bool,
         initially_disabled: bool,
         toggle: bool,
-        failure_status: Option<u16>,
+        failure_status: Option<u8>,
     ) {
         let input_allowed = can_control && (!initially_disabled || toggle);
         let directory = temporary_directory();
@@ -2096,20 +2536,23 @@ mod tests {
         let (hid_sender, mut hid_receiver) = mpsc::channel(6);
         let hid_task = tokio::spawn(async move {
             let mut hid_response_receiver = Some(hid_response_receiver);
+            // All frames of the session come on its one connection.
+            let (mut stream, _) = hid_listener.accept().await.unwrap();
+            crate::nanokvm::read_test_control_hello(&mut stream).await;
             for request_index in 0..6 {
-                let (mut stream, _) = hid_listener.accept().await.unwrap();
-                let request = crate::nanokvm::read_test_http_request(&mut stream).await;
+                let request = crate::nanokvm::read_test_control_frame(&mut stream)
+                    .await
+                    .unwrap();
                 hid_sender.send(request).await.unwrap();
                 if request_index == 0 {
                     let _ = hid_response_receiver.take().unwrap().await;
                 }
                 let status = if request_index == 0 {
-                    failure_status.unwrap_or(204)
+                    failure_status.unwrap_or(0)
                 } else {
-                    204
+                    0
                 };
-                let response = format!("HTTP/1.1 {status} Test\r\nConnection: close\r\n\r\n");
-                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(&[status]).await.unwrap();
             }
         });
 
@@ -2130,10 +2573,6 @@ mod tests {
             admin_socket: hid_path.to_string_lossy().into_owned(),
             ..Config::default()
         });
-        let identity = Arc::new(Identity {
-            extension_id: "rustdesk".to_owned(),
-            token: "a".repeat(64),
-        });
         let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
         let mut limits = ClientLimits::new(1);
         limits.input_allowed = can_control;
@@ -2144,7 +2583,6 @@ mod tests {
             server_stream,
             peer,
             config,
-            identity,
             rustdesk_identity,
             false,
             shutdown_receiver,
@@ -2231,7 +2669,7 @@ mod tests {
             panic!("server did not send peer info");
         };
         assert_eq!(peer_info.platform, "NanoKVM");
-        assert!(!peer_info.displays[0].cursor_embedded);
+        assert!(peer_info.displays[0].cursor_embedded);
         let keyboard_permission: Message = read_message(&mut client).await.unwrap();
         assert!(matches!(
             keyboard_permission.union,
@@ -2240,6 +2678,18 @@ mod tests {
                     crate::protocol::PermissionInfo { permission: 0, enabled }
                 ))
             })) if enabled == can_control
+        ));
+        let clipboard_permission: Message = read_message(&mut client).await.unwrap();
+        assert!(matches!(
+            clipboard_permission.union,
+            Some(message::Union::Misc(crate::protocol::Misc {
+                union: Some(crate::protocol::misc::Union::PermissionInfo(
+                    crate::protocol::PermissionInfo {
+                        permission: 2,
+                        enabled: false
+                    }
+                ))
+            }))
         ));
         let permission: Message = read_message(&mut client).await.unwrap();
         assert!(matches!(
@@ -2360,7 +2810,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(request.starts_with(b"POST /api/hid/mouse/absolute HTTP/1.1\r\n"));
+            assert_eq!(request[0], 3, "an absolute pointer report");
         }
         for (x, y) in [(200, 100), (300, 150)] {
             write_message(
@@ -2491,32 +2941,20 @@ mod tests {
         }
 
         if input_allowed && failure_status.is_none() {
-            let request = time::timeout(Duration::from_secs(2), hid_receiver.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            let body_offset = request
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .unwrap()
-                + 4;
-            let body: serde_json::Value = serde_json::from_slice(&request[body_offset..]).unwrap();
-            assert_eq!(body["x"], (300_u32 * 32767) / 1919);
-            assert_eq!(body["y"], (150_u32 * 32767) / 1079);
-            assert_eq!(body["buttons"], 0);
-            let request = time::timeout(Duration::from_secs(2), hid_receiver.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            let body_offset = request
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .unwrap()
-                + 4;
-            let body: serde_json::Value = serde_json::from_slice(&request[body_offset..]).unwrap();
-            assert_eq!(body["x"], (300_u32 * 32767) / 1919);
-            assert_eq!(body["y"], (150_u32 * 32767) / 1079);
-            assert_eq!(body["buttons"], 1);
+            // The coalesced position, then the same one with the button.
+            let [x0, x1] = ((300_u32 * 32767) / 1919).to_le_bytes()[..2] else {
+                unreachable!()
+            };
+            let [y0, y1] = ((150_u32 * 32767) / 1079).to_le_bytes()[..2] else {
+                unreachable!()
+            };
+            for buttons in [0, 1] {
+                let request = time::timeout(Duration::from_secs(2), hid_receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request, [3, buttons, x0, x1, y0, y1, 0, 0]);
+            }
         }
         if toggle {
             write_message(
@@ -2680,7 +3118,11 @@ mod tests {
         limits: &ClientLimits,
         rustdesk_identity: &Arc<RustDeskIdentity>,
         shutdown: watch::Receiver<bool>,
-    ) -> (TcpStream, Hash, tokio::task::JoinHandle<std::io::Result<()>>) {
+    ) -> (
+        TcpStream,
+        Hash,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = tokio::spawn(TcpStream::connect(listener.local_addr().unwrap()));
         let (server_stream, peer) = listener.accept().await.unwrap();
@@ -2690,10 +3132,6 @@ mod tests {
             server_stream,
             peer,
             Arc::clone(config),
-            Arc::new(Identity {
-                extension_id: "rustdesk".to_owned(),
-                token: "a".repeat(64),
-            }),
             Arc::clone(rustdesk_identity),
             false,
             shutdown,
@@ -2752,11 +3190,16 @@ mod tests {
         let (mut client, hash, server) =
             login_connection(&config, &limits, &rustdesk_identity, shutdown.clone()).await;
         send_login(&mut client, password_hash("rustdesk-test", &hash)).await;
-        let response = time::timeout(Duration::from_secs(5), read_message::<_, Message>(&mut client))
-            .await
-            .expect("a correct password must not wait")
-            .unwrap();
-        assert!(login_error(response).unwrap().starts_with("NanoKVM video unavailable"));
+        let response = time::timeout(
+            Duration::from_secs(5),
+            read_message::<_, Message>(&mut client),
+        )
+        .await
+        .expect("a correct password must not wait")
+        .unwrap();
+        assert!(login_error(response)
+            .unwrap()
+            .starts_with("NanoKVM video unavailable"));
         server.await.unwrap().unwrap();
 
         // A wrong one waits, holding its pending permit, until shutdown.
@@ -2764,11 +3207,12 @@ mod tests {
         let (mut client, _, server) =
             login_connection(&config, &limits, &rustdesk_identity, shutdown.clone()).await;
         send_login(&mut client, vec![0; 32]).await;
-        assert!(
-            time::timeout(Duration::from_secs(1), read_message::<_, Message>(&mut client))
-                .await
-                .is_err()
-        );
+        assert!(time::timeout(
+            Duration::from_secs(1),
+            read_message::<_, Message>(&mut client)
+        )
+        .await
+        .is_err());
         assert_eq!(limits.pending.available_permits(), 3);
         shutdown_sender.send(true).unwrap();
         time::timeout(Duration::from_secs(5), server)
@@ -2804,15 +3248,12 @@ mod tests {
             server_stream,
             "127.0.0.1:1".parse().unwrap(),
             Arc::clone(&config),
-            Arc::new(Identity {
-                extension_id: "rustdesk".to_owned(),
-                token: "a".repeat(64),
-            }),
             Arc::clone(&rustdesk_identity),
             None,
             shutdown,
             limits.clone(),
             pending,
+            None,
         ));
         let challenge: Message = read_message(&mut client).await.unwrap();
         assert!(matches!(challenge.union, Some(message::Union::Hash(_))));
@@ -2832,11 +3273,14 @@ mod tests {
         )
         .await
         .unwrap();
-        time::timeout_at(started + super::LOGIN_TIMEOUT + Duration::from_millis(100), server)
-            .await
-            .expect("the wait outlived the login deadline")
-            .unwrap()
-            .unwrap();
+        time::timeout_at(
+            started + super::LOGIN_TIMEOUT + Duration::from_millis(100),
+            server,
+        )
+        .await
+        .expect("the wait outlived the login deadline")
+        .unwrap()
+        .unwrap();
         assert_eq!(limits.pending.available_permits(), 4);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -2867,6 +3311,29 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn the_backlog_is_as_old_as_the_first_video_still_queued_whatever_else_is() {
+        let start = time::Instant::now();
+        use std::sync::atomic::Ordering;
+        let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backlog = super::Backlog::new(-1, Arc::clone(&written));
+        // Ten frames of 1000 bytes, 100 bytes of sound after each.
+        for frame in 0..10 {
+            written.fetch_add(1000, Ordering::Relaxed);
+            backlog.video(start + Duration::from_millis(frame * 100));
+            written.fetch_add(100, Ordering::Relaxed);
+        }
+        let now = start + Duration::from_secs(1);
+        assert_eq!(backlog.age_of(now, 11_000, 11_000), Duration::from_secs(1));
+        assert_eq!(backlog.age_of(now, 11_000, 2750), Duration::from_millis(300));
+        // The video has left; sound written since is still queued, for a minute.
+        written.fetch_add(1000, Ordering::Relaxed);
+        for later in [1, 10, 60] {
+            let now = start + Duration::from_secs(later);
+            assert_eq!(backlog.age_of(now, 12_000, 1100), Duration::ZERO);
+        }
+    }
+
     fn password_hash(password: &str, hash: &Hash) -> Vec<u8> {
         let mut first = Sha256::new();
         first.update(password.as_bytes());
@@ -2883,19 +3350,29 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("media.sock");
         let listener = UnixListener::bind(&path).unwrap();
-        let identity = Identity {
-            extension_id: "rustdesk".to_owned(),
-            token: "a".repeat(64),
-        };
         let profile = crate::nanokvm::VideoProfile { codec: Codec::H264 };
         let (subscriber, accepted) = tokio::join!(
-            crate::nanokvm::MediaSubscriber::connect(path.to_str().unwrap(), &identity, "encoded", Some(&profile)),
+            crate::nanokvm::MediaSubscriber::connect(
+                path.to_str().unwrap(),
+                "encoded",
+                Some(&profile)
+            ),
             listener.accept()
         );
         let (mut bridge, _) = accepted.unwrap();
         read_subscription(&mut bridge).await;
         let (sender, mut receiver) = mpsc::channel(1);
-        let forwarder = tokio::spawn(super::forward_media(subscriber.unwrap(), sender));
+        // No session returns buffers here.
+        let (_, spares) = mpsc::channel(1);
+        let refresh = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let forwarder = tokio::spawn(super::forward_media(
+            subscriber.unwrap(),
+            sender,
+            spares,
+            Arc::clone(&refresh),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            None,
+        ));
         let frame = |marker: u8| [0, 0, 0, 1, 0x65, marker];
         async fn keyframe_request(bridge: &mut tokio::net::UnixStream, wait: Duration) -> bool {
             let mut line = Vec::new();
@@ -2937,17 +3414,27 @@ mod tests {
         assert_eq!(resumed.payload[5], 41);
         write_media_frame(&mut bridge, &frame(42), false).await;
         assert_eq!(receiver.recv().await.unwrap().unwrap().payload[5], 42);
-        // A requested keyframe that never comes is asked for again a second
-        // later, while deltas keep being dropped.
+        // The client asks to refresh: a keyframe request with the next frame.
+        refresh.store(true, std::sync::atomic::Ordering::Relaxed);
+        write_media_frame(&mut bridge, &frame(43), false).await;
+        assert_eq!(receiver.recv().await.unwrap().unwrap().payload[5], 43);
+        assert!(keyframe_request(&mut bridge, Duration::from_secs(1)).await);
+        // Once that repair held, a new stall asks at once. A requested
+        // keyframe that never comes is asked for again after 1 s, then 2 s,
+        // while deltas keep being dropped.
         while keyframe_request(&mut bridge, Duration::from_millis(50)).await {}
+        time::sleep(super::KEYFRAME_REQUEST_INTERVAL).await;
         write_media_frame(&mut bridge, &frame(50), true).await;
         write_media_frame(&mut bridge, &frame(51), false).await;
         assert!(keyframe_request(&mut bridge, Duration::from_secs(5)).await);
-        write_media_frame(&mut bridge, &frame(52), false).await;
-        assert!(!keyframe_request(&mut bridge, Duration::from_millis(200)).await);
-        time::sleep(super::KEYFRAME_REQUEST_INTERVAL).await;
-        write_media_frame(&mut bridge, &frame(53), false).await;
-        assert!(keyframe_request(&mut bridge, Duration::from_secs(5)).await);
+        for (marker, asked) in [(52, false), (53, true), (54, false), (55, true)] {
+            if marker != 52 {
+                time::sleep(super::KEYFRAME_REQUEST_INTERVAL).await;
+            }
+            write_media_frame(&mut bridge, &frame(marker), false).await;
+            let wait = Duration::from_millis(if asked { 5_000 } else { 200 });
+            assert_eq!(keyframe_request(&mut bridge, wait).await, asked, "{marker}");
+        }
         assert_eq!(receiver.recv().await.unwrap().unwrap().payload[5], 50);
         // A closed bridge still reaches the session as an error.
         drop(bridge);

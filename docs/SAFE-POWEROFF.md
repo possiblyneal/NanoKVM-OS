@@ -1,0 +1,141 @@
+# NanoKVM shutdown with network restart
+
+This feature shuts down NanoKVM's ordinary services and releases its SD storage,
+while keeping the kernel and a small network service running in RAM. It does
+not electrically power off the SoC and does not shut down the controlled
+computer. Cube, Lite and PCIe use the same software path.
+
+The target layout is F2FS on `/dev/mmcblk0p2`, FAT `/boot` and exFAT `/data`.
+The older ext4 root layout is also accepted. A successful transition unmounts
+persistent filesystems entirely; F2FS background GC, discard and checkpoint
+work are not assumed to stop merely because the application stopped.
+
+## User flow and access
+
+System settings offers **Shut down NanoKVM**, a confirmation describing the
+loss of video, keyboard, virtual disks, SSH and add-ons, and an optional
+magic-packet restart checkbox. Cancel is highlighted and focused, so Enter
+cancels. The connected computer stays on.
+
+Preparation returns a fresh 256-bit restart key through the existing
+administrator-authenticated API. The browser saves it in session storage before
+committing shutdown. The status page reports **Keep power connected** until the
+RAM runtime finishes its checks. It then offers **Start NanoKVM OS**, which
+performs a normal kernel reboot. Copying the restart key permits another browser
+to use the page. Keep the tab or save the key privately: ordinary login and
+password recovery services are stopped. The key expires at reboot and is never
+put in URLs, cookies, logs or public HTML.
+
+Web restart requires that key and a same-origin POST. Preparation and commit
+require an enabled administrator through the existing authentication middleware.
+HTTPS preserves the current certificate and port, without a plaintext fallback;
+an existing HTTP installation retains HTTP and its existing network exposure.
+The RAM server limits TCP connections before wrapping them in TLS, preserving
+HTTPS request metadata for same-origin checks. It also limits headers and
+request timeouts. A rejected restart remains visible separately from later
+successful readiness polls.
+
+Magic packets use separate UDP listeners on ports 7 and 9 and an Ethernet
+`0x0842` listener, matching the selected interface's MAC. They do not pass
+through HTTP. This option is off by default because standard WoL packets are
+unauthenticated: anybody who can reach the listener can restart the device.
+Packets received before readiness are discarded, including queued packets
+checked against kernel receive timestamps. Duplicate or concurrent starts
+produce only one reboot. Enabling magic wake also permits someone else to
+leave the safe state; do not coordinate unplugging against a concurrent wake.
+
+This is software reception on a powered, running device, not hardware WoL
+after halt. PCIe devices can return to the full OS without cycling host power.
+If all NanoKVM power is physically removed and restored, the ordinary boot path
+runs; no persistent standby flag is written. Other USB/auxiliary/PCIe feeds may
+keep a board powered when one cable is removed.
+
+## Transition and storage checks
+
+1. Close API admission atomically against active mutations; acquire the update,
+   APK runner, APK database and transfer exclusions. Ordinary GET/HEAD reads,
+   assets and status polling remain available during preparation. New WebSocket
+   and MJPEG streams, radio scans and user-disk file operations are excluded.
+   Queued package workers recheck the shutdown marker after obtaining their
+   locks. Reject recovery or network configuration in progress, unsupported storage/network layouts and
+   insufficient RAM. Network trial exclusion shares the actual
+   `/boot/net-trial.json` record and tracks background apply/rollback work
+   through its last successful sync, including retries with an absent record.
+   An unsuccessful preparation leaves normal services running.
+2. Stage the static Go helper, BusyBox and its ELF library closure in the
+   existing `/run` tmpfs. Station Wi-Fi also stages wpa_supplicant, its linked
+   libraries and a restricted self-contained configuration. The staged musl
+   interpreter supplies its reserved libc/libm/libpthread and related aliases,
+   including transitive imports; other missing libraries still refuse shutdown.
+   Probe the copies inside a chroot before stopping anything.
+3. Bind temporary RAM copies over `/etc/inittab` and `/etc/rc.conf`. An init-owned
+   acknowledgement proves BusyBox reloaded its restart action before SIGQUIT.
+   OpenRC performs the normal service stops. Its final generic unmount pass is
+   deferred to the helper; otherwise its `fuser -k` retry would kill the process
+   holding the writeback-check descriptors.
+4. The shutdown supervisor holds descriptors opened before the service stops
+   and calls `syncfs` afterwards, retaining writeback errors for that interval.
+   An inotify watch retains OpenRC service failures even though OpenRC clears
+   its failure directory at exit and may return success after a stop failure.
+5. BusyBox terminates remaining processes and execs the RAM helper as PID 1.
+   The helper waits for userspace processes to disappear, detaches USB gadgets
+   and mass-storage backing files, disables all swap and resets zram.
+6. Sync persistent filesystems, make mounts private, pivot to `/run`, move the
+   virtual filesystems, release loop backing files and unmount the old tree.
+   No lazy or forced unmount is used. Remaining persistent mounts, busy files,
+   mmap holders or uninterruptible userspace processes prevent readiness.
+7. Only after confirming all remaining mounts are memory/virtual filesystems,
+   flush and mark physical disks and their partitions read-only.
+8. Restore the selected network and listeners from RAM. Check released
+   userspace watchdog ownership, zero in-flight block I/O, and unchanged write,
+   sector, discard and flush counters for three successive one-second
+   observations, then publish readiness. Continue checking mounts, optional
+   watchdog state and block counters every second.
+
+The board kernel does not enable `CONFIG_WATCHDOG_SYSFS`, so a watchdog may
+exist without a `state` attribute. A missing optional attribute is accepted
+only on the path that has already required a clean OpenRC shutdown and the
+exit of the old userspace. The managed BusyBox watchdog receives SIGTERM,
+writes its magic close and exits. With `dw_wdt`, hardware may keep running
+while the kernel worker feeds it. If available, `state` reports
+`WDOG_ACTIVE` (userspace ownership), not `WDOG_HW_RUNNING`: `active`,
+malformed values and read errors other than absence still prevent readiness.
+An active watchdog without an open userspace descriptor is not assumed safe.
+
+A failure never becomes safe later: the RAM status reports `safe: false`. Where the RAM page is reachable, an
+authenticated reboot is available even after a failed transition; magic wake
+is accepted only after successful readiness. A fatal listener/TLS setup error
+after complete filesystem release and disk protection prints a recovery notice,
+keeps power connected for two minutes, then requests a normal kernel reboot.
+It never reports safe. Earlier fatal failures park PID 1 to avoid a kernel
+panic; serial output provides diagnostics, not a guaranteed login or recovery
+shell. These failures require manual recovery. Kernel hangs or loss of kernel
+watchdog feeding cannot be recovered by this userspace service.
+
+The claim is bounded by Linux filesystem/unmount results, block-device flush
+semantics and observable kernel counters. It does not prove an SD controller's
+internal power-loss behavior or protect against a kernel/driver/card defect.
+No finite idle interval alone proves safety; the unmount and block protection
+gates are required before the interval is measured.
+
+## Network scope
+
+Shutdown supports direct numeric IPv4 access on `eth0` or
+managed station `wlan0`. Ethernet supports the saved static configuration and
+managed udhcpc. Station Wi-Fi requires managed DHCP and a self-contained
+PSK/SAE/open network configuration. The RAM DHCP client requests the previous
+address and maintains its lease; it writes only to RAM.
+
+A changed DHCP address prevents the initial safe announcement. Find the new
+address in the router's lease list and supply the saved restart key to reboot.
+The page and current key must remain accessible independently of the stopped
+ordinary application.
+
+Preflight rejects hostname/proxy/VPN ingress, USB networking, bridges/VLANs,
+IPv6 management, classless/custom routes on the selected interface, Wi-Fi AP
+mode, static Wi-Fi, and external EAP/certificate configurations. VPN, mDNS,
+discovery, USB forwarding and add-on listeners are not preserved. Wi-Fi drivers
+and firmware must already be loaded. UDP wake depends on the
+network's unicast/broadcast/forwarding policy.
+
+The shutdown and restart pages are shown in English only.

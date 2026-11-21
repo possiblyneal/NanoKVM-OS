@@ -2,6 +2,7 @@ package audio
 
 import (
 	"NanoKVM-Server/middleware"
+	"NanoKVM-Server/service/stream/icelocal"
 	"NanoKVM-Server/service/stream/iceservers"
 	"NanoKVM-Server/service/stream/srtpaccel"
 	"NanoKVM-Server/service/stream/webrtcdtls"
@@ -42,22 +43,29 @@ func AcquireSession() bool {
 
 func ReleaseSession() { sessions.Add(-1) }
 
-func Status(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": StatusData()})
-}
-
-// StatusData is the GET /api/stream/audio/status payload, also part of the
-// combined live status.
+// StatusData is the audio part of the combined live status.
 func StatusData() gin.H {
 	return gin.H{"audio": enabled(), "bitrate": 192000, "complexity": 3}
 }
-func createPeerConnection(servers []webrtc.ICEServer) (*webrtc.PeerConnection, error) {
+func createPeerConnection(path icelocal.Path, servers []webrtc.ICEServer) (*webrtc.PeerConnection, error) {
 	settings := webrtc.SettingEngine{}
+	if path.Addresses != nil {
+		settings.SetIPFilter(path.Addresses)
+	}
+	network, err := path.Net()
+	if err != nil {
+		return nil, err
+	}
+	settings.SetNet(network)
 	srtpaccel.Configure(&settings)
 	if err := webrtcdtls.Configure(&settings); err != nil {
 		return nil, err
 	}
-	return webrtc.NewAPI(webrtc.WithSettingEngine(settings)).NewPeerConnection(webrtc.Configuration{ICEServers: servers})
+	certificates, err := webrtcdtls.Certificates()
+	if err != nil {
+		return nil, err
+	}
+	return webrtc.NewAPI(webrtc.WithSettingEngine(settings)).NewPeerConnection(webrtc.Configuration{ICEServers: servers, Certificates: certificates})
 }
 
 func Connect(c *gin.Context) {
@@ -79,7 +87,7 @@ func Connect(c *gin.Context) {
 	stopWatcher := middleware.WatchWebSocket(c.Request.Context(), ws)
 	defer stopWatcher()
 	servers := iceservers.FromConfig()
-	peer, err := createPeerConnection(servers)
+	peer, err := createPeerConnection(icelocal.For(c.Request), servers)
 	if err != nil {
 		return
 	}

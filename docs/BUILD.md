@@ -4,7 +4,7 @@
 
 - the toolchain, Linux kernel and modules, U-Boot, `fip.bin` and the boot images;
 - the SOPHGO media libraries, the board service, the server and the web UI;
-- the nineteen core NanoKVM APK packages, the Alpine root file system and the image.
+- the eighteen core NanoKVM APK packages, the Alpine root file system and the image.
 
 Host requirements, the steps, the outputs and how they are checked are described in [platform/README.md](../platform/README.md). Buildroot (`firmware/buildroot/configs/nanokvm_platform_defconfig`) builds only the toolchain, host tools and initramfs utilities; the installed OS and optional software are Alpine APKs.
 
@@ -24,15 +24,14 @@ cd web && pnpm install --frozen-lockfile && pnpm dev
 cd server && go test -tags teststub,nomsgpack ./...
 ```
 
-Host server tests require a C compiler, zlib and liblzma development headers,
-and xz-utils (on Ubuntu: `zlib1g-dev liblzma-dev xz-utils`).
+Host server tests require a C compiler and the zlib development headers (on
+Ubuntu: `zlib1g-dev`).
 
 A release-equivalent server needs the NanoKVM Go runtime (`firmware/cpu/sysmon-runtime`, which also adds the C906 ChaCha20 of `firmware/cpu/go-crypto-c906`) and the native libraries of the same build; `platform/build.sh native tools server` builds the native libraries, compression libraries and server. See [UPDATES.md](UPDATES.md) for the native APK update flow.
 
 ## Dependency maintenance
 
 See [DEPENDENCY-UPDATES.md](DEPENDENCY-UPDATES.md) for automatic dependency PRs, native upstream monitoring and the boundaries of each.
-
 
 ## NanoKVM CPU build policy
 
@@ -46,15 +45,14 @@ compiler and `GORISCV64` baseline.
 
 Userspace enables the C906 T-Head extensions and XTheadVector. This permits
 supported instructions; it does not promise automatic vectorization or a frame
-rate increase. Kernel/modules retain their qualified integer ISA and `lp64`,
+rate increase. Kernel/modules use the integer ISA and `lp64`,
 without compiler-generated floating-point or vector operations. U-Boot uses a
 separate integer-only C906 profile with `CONFIG_CC_OPTIMIZE_FOR_SPEED=y`. Kbuild's
 architecture-specific optimized routines retain their own context handling.
 
 Buildroot's target defaults and the MPI Makefile patch mirror the profile so
 standalone builds do not fall back to a different optimization level. Update
-those generated values alongside the JSON; `tests/test-cpu-profile.py` rejects
-drift. It can also exercise the real cross-compiler with `--compiler PATH`.
+those generated values alongside the JSON.
 Component output directories contain `cpu-profile*.json` with the policy hash,
 compiler identity and flags used by the build script. These files describe only
 our compiled objects, not the flags originally used for vendor binary objects.
@@ -63,15 +61,7 @@ The policy also covers the standalone EDID, board-probe and devmem tools. A
 builder records its compiler and supplied flags in `cpu-profile*.json`; conflicting
 optimization, ISA, tuning or ABI options are rejected. This validates the options
 supplied by the builder, not every option subsequently added by an upstream
-Makefile. A complete build and device qualification remain necessary.
-
-For CPU comparisons, `tests/manual/c906-profile-bench/c906-profile-bench.c` is a small integer/float test,
-not a video benchmark. Compile it with the same compiler, `-O2`, C906 tuning,
-`-mno-fence-tso`, `-mabi=lp64d` and `-ffp-contract=off`, varying only `-march`.
-Interleave repeated runs on the same device and compare checksums as well as
-elapsed time. The `-ffp-contract=off` option is for comparable benchmark arithmetic;
-it is not a production build flag. Inspect compiler vectorization reports before
-attributing any improvement to vector instructions.
+Makefile.
 
 To inspect the effective compiler commands after a kernel or module build, run
 `scripts/audit-kbuild-profile.py OUTPUT/kernel/build` (or `OUTPUT/modules`).

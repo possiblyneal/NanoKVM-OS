@@ -1,7 +1,7 @@
 import { browserPollEnv, pollWhileVisible, type PollEnv } from '@/lib/visible-poll.ts';
 
-// GET /api/vm/live-status: each part has the payload of its own endpoint
-// (vm/hdmi, vm/gpio, hid/input-status, stream/audio/status, vm/device/virtual).
+// GET /api/vm/live-status: hdmi, gpio and usb have the payload of their own
+// endpoint (vm/hdmi, vm/gpio, vm/device/virtual); input and audio exist only here.
 // usb is null for non-administrators; gpio is null when the LEDs cannot be read.
 export type LiveStatus = {
   recovery?: { active: boolean; crashes: number; retrying: boolean };
@@ -10,13 +10,15 @@ export type LiveStatus = {
   input: unknown;
   audio: { audio: boolean };
   usb: { disk?: boolean; mode?: string } | null;
+  // ATX power control is on. A server from before this field omits it.
+  atx?: boolean;
 };
 
 // status is null when the request failed. startedAt (performance.now() when
 // the request was sent) lets a listener drop data older than its own change.
 type LiveStatusListener = (status: LiveStatus | null, startedAt: number) => void;
 
-export const liveStatusInterval = 3000;
+const liveStatusInterval = 3000;
 
 // One poll shared by every listener on the page instead of one per widget.
 export function createLiveStatus(

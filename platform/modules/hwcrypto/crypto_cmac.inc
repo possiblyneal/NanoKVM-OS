@@ -55,9 +55,9 @@ static int sg2_cmac_blocks(struct ahash_request *req, int nents,
 	unsigned int off;
 	int err = 0;
 
-	mutex_lock(&lock);
+	sg2_own();
 	if (poisoned) {
-		mutex_unlock(&lock);
+		sg2_disown();
 		/* CPU-only fallback, including a state already advanced by hardware.
 		 * Never read or clean a buffer still owned by uncertain DMA. */
 		for (off = 0; off < len; off += 16) {
@@ -77,15 +77,15 @@ static int sg2_cmac_blocks(struct ahash_request *req, int nents,
 	memcpy(r.key, ctx->key, ctx->keylen);
 	memcpy(r.iv, s->mac, 16);
 	if (block)
-		memcpy(buffer, block, len);
+		memcpy(cur->in, block, len);
 	else
-		err = sg2_cmac_read(req, nents, pos, buffer, len);
+		err = sg2_cmac_read(req, nents, pos, cur->in, len);
 	if (!err)
 		err = crypto_run_locked(&r);
 	if (!err)
-		memcpy(s->mac, crypto_output + len - 16, 16);
+		memcpy(s->mac, cur->out + len - 16, 16);
 	crypto_clean_locked(&r);
-	mutex_unlock(&lock);
+	sg2_disown();
 	memzero_explicit(&r, sizeof(r));
 	return err;
 }
@@ -145,14 +145,14 @@ static int sg2_cmac_process(struct ahash_request *req, unsigned int operation)
 			s->used = 0;
 			memzero_explicit(s->tail, sizeof(s->tail));
 		} else {
-			n = min_t(unsigned int, HWCRYPTO_MAX, (remaining - 1) & ~15U);
+			n = min_t(unsigned int, sg2_room(), (remaining - 1) & ~15U);
 			err = sg2_cmac_blocks(req, nents, pos, NULL, n);
 			if (err)
 				goto failed;
 			pos += n;
 			remaining -= n;
 		}
-		cond_resched();
+		sg2_resched();
 	}
 	if (!operation)
 		return 0;
@@ -183,7 +183,7 @@ static void sg2_cmac_work(struct work_struct *work)
 	int err = sg2_cmac_process(req, r->operation);
 
 	sg2_async_leave();
-	ahash_request_complete(req, err);
+	sg2_complete(ahash_request_complete, req, err);
 }
 
 static int sg2_cmac_submit(struct ahash_request *req, unsigned int operation)
@@ -191,7 +191,7 @@ static int sg2_cmac_submit(struct ahash_request *req, unsigned int operation)
 	struct sg2_cmac_req *r = ahash_request_ctx(req);
 	int err;
 
-	if (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP)
+	if ((req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) || sg2_inline())
 		return sg2_cmac_process(req, operation);
 	err = sg2_async_enter(req->base.flags);
 	if (err)
@@ -262,17 +262,17 @@ static int sg2_cmac_setkey(struct crypto_ahash *tfm, const u8 *key, unsigned int
 	if (err)
 		return err;
 	memcpy(r.key, key, len);
-	mutex_lock(&lock);
+	sg2_own();
 	if (poisoned) {
 		err = -EIO;
 	} else {
-		memset(buffer, 0, 16);
+		memset(cur->in, 0, 16);
 		err = crypto_run_locked(&r);
 		if (!err)
-			memcpy(ctx->subkey[0], crypto_output, 16);
+			memcpy(ctx->subkey[0], cur->out, 16);
 		crypto_clean_locked(&r);
 	}
-	mutex_unlock(&lock);
+	sg2_disown();
 	if (err && READ_ONCE(poisoned)) {
 		aes_encrypt(&ctx->software, ctx->subkey[0], zero);
 		err = 0;

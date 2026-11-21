@@ -1,11 +1,61 @@
 #!/bin/sh
-# Retire the earlier package-owned wildcard flowtable before enabling
-# interface-scoped USB sharing. Never flush foreign nftables policy.
-if [ -x /usr/libexec/nanokvm/legacy/S35flowoffload ]; then
-    /usr/libexec/nanokvm/legacy/S35flowoffload start ||
-        echo "Could not retire the legacy NanoKVM flowtable; check the policy service." >&2
+# Earlier releases owned a wildcard flowtable (inet nkos_flow). The table lives
+# in the kernel after its package files are gone, and until a reboot it would
+# carry traffic past the USB local-only guard and the VPN rules. Only this
+# NanoKVM table is deleted; foreign nftables policy stays.
+if nft list table inet nkos_flow >/dev/null 2>&1; then
+    nft delete table inet nkos_flow ||
+        echo "Could not delete the legacy NanoKVM flowtable; reboot to remove it." >&2
 fi
 set -eu
+# Alpine community is listed (after 4.2.1): LLDP and UPS (lldpd, nut) come
+# from it. The line goes right after the first untagged Alpine main line, from
+# the same mirror, as the server places it (server/osupdate/community.go). A
+# list that already has an untagged community line of the same Alpine branch,
+# from any mirror, stays as it is, and so does one without an Alpine main line
+# (a custom setup). Lines are compared without surrounding blanks, a CR and
+# trailing slashes.
+repositories=/etc/apk/repositories
+# "N URL": the community line to add after line N; nothing when none is needed.
+community_add=$(awk '
+    { l = $0; gsub(/^[ \t\r]+|[ \t\r]+$/, "", l); sub(/\/+$/, "", l) }
+    l == "" || l ~ /^[@#]/ { next }
+    !main && l ~ /alpine/ && l ~ /\/main$/ {
+        main = NR; url = l; sub(/\/main$/, "/community", url)
+        branch = l; sub(/\/main$/, "", branch); sub(/^.*\//, "", branch)
+    }
+    l ~ /\/community$/ { b = l; sub(/\/community$/, "", b); sub(/^.*\//, "", b); have[b] = 1 }
+    END { if (main && !(branch in have)) print main, url }
+' "$repositories" 2>/dev/null) || community_add=
+if [ -n "$community_add" ]; then
+    community_after=${community_add%% *}
+    community_url=${community_add#* }
+    # A symlinked list is updated at its target, which keeps its owner and
+    # mode: a private mirror's list may be readable by root only. The copy is
+    # private (mktemp) until it takes the target's place. The messages name
+    # the file, not the URL, which can hold a private mirror's credentials.
+    # BusyBox awk exits 0 when a write fails (a full disk): the copy replaces
+    # the list only when it is the list with exactly the one line added.
+    if community_list=$(readlink -f "$repositories") && community_tmp=$(mktemp "$community_list.XXXXXX"); then
+        if awk -v n="$community_after" -v url="$community_url" '{ print } NR == n { print url }' \
+            "$community_list" > "$community_tmp" &&
+            [ "$(awk 'END { print NR }' "$community_tmp")" = "$(($(awk 'END { print NR }' "$community_list") + 1))" ] &&
+            [ "$(awk -v n="$((community_after + 1))" 'NR == n' "$community_tmp")" = "$community_url" ] &&
+            [ "$(awk -v n="$((community_after + 1))" 'NR != n' "$community_tmp")" = "$(awk 1 "$community_list")" ] &&
+            chown "$(stat -c %u:%g "$community_list")" "$community_tmp" &&
+            chmod "$(stat -c %a "$community_list")" "$community_tmp" &&
+            mv "$community_tmp" "$community_list"; then
+            echo "Alpine community repository: added to $repositories" >&2
+        else
+            rm -f "$community_tmp"
+            echo "Could not add the Alpine community repository to $repositories; the next upgrade tries again." >&2
+        fi
+    else
+        echo "Could not add the Alpine community repository to $repositories; the next upgrade tries again." >&2
+    fi
+    unset community_after community_url community_list community_tmp
+fi
+unset repositories community_add
 if [ -x /usr/libexec/nanokvm/console-policy ]; then
     /usr/libexec/nanokvm/console-policy
 fi
@@ -16,10 +66,22 @@ rc-update add loopback boot
 # NanoKVM services load their drivers; the kernel set the clock from the RTC.
 rc-update del hwdrivers boot >/dev/null 2>&1 || true
 [ ! -x /etc/init.d/osclock ] || rc-update add osclock boot
+# The clock no longer starts in 1970 after a power loss (added after 4.0.0).
+[ ! -x /etc/init.d/nanokvm-clock ] || rc-update add nanokvm-clock boot
 # OpenRC builds its dependency tree from all init scripts at every boot (about
 # 2 s) unless savecache kept it at shutdown; it rebuilds the tree by itself
 # when a script or a setting changed since.
 [ ! -x /etc/init.d/savecache ] || rc-update add savecache shutdown
+# bootmisc waits for the server (after 4.2.1; see the boot order below). The
+# rc_after line written further down marks the move as done, so a runlevel the
+# user changed later stays; bootmisc is added to default before it leaves
+# boot, so a step that fails is retried next time.
+if [ -f /etc/conf.d/bootmisc ] && ! grep -q '^[[:space:]]*rc_after=' /etc/conf.d/bootmisc; then
+    if [ -e /etc/runlevels/boot/bootmisc ]; then
+        rc-update add bootmisc default
+        rc-update del bootmisc boot
+    fi
+fi
 
 # Boot time settings of Alpine services (NanoKVM boot order):
 # - sshd's depend() runs `sshd -G`, which waits for the kernel's random pool
@@ -27,27 +89,48 @@ rc-update del hwdrivers boot >/dev/null 2>&1 || true
 #   sshd, and the config binds no single address, so it needs nothing more.
 # - bootmisc's copy of the kernel log on the SD card at every boot duplicates
 #   the boot log archive.
+# - bootmisc waits for the server: it writes utmp and wtmp, and its cleanup
+#   of /run and /tmp has nothing to do on tmpfs. hostname stays in boot: the
+#   server checks request Host names against it.
 # - udev-trigger replays the add event of every device at boot, about 530 on
 #   the SG2002. Without coldplug it replays those with a /dev node and the
 #   network interfaces: the same nodes, permissions and links, and the same
 #   modules, since the NanoKVM services load theirs (the SD Wi-Fi drivers are
-#   kept from udev anyway). On the stand the server started 1 s sooner. An
+#   kept from udev anyway). The server starts about 1 s sooner. An
 #   rc_coldplug the user set stays.
 if [ -f /etc/conf.d/sshd ] && ! grep -q '^[[:space:]]*rc_need=' /etc/conf.d/sshd; then
+    # shellcheck disable=SC2016 # literal text
     printf '%s\n' '# NanoKVM: no `sshd -G` while OpenRC builds its dependency tree' 'rc_need=""' >> /etc/conf.d/sshd
 fi
 if [ -f /etc/conf.d/bootmisc ]; then
     sed -i 's/^log_dmesg="YES"$/log_dmesg="NO"/' /etc/conf.d/bootmisc
 fi
+if [ -f /etc/conf.d/bootmisc ] && ! grep -q '^[[:space:]]*rc_after=' /etc/conf.d/bootmisc; then
+    printf '%s\n' '# NanoKVM: after the server' 'rc_after="nanokvm-app"' >> /etc/conf.d/bootmisc
+fi
 # NanoKVM udev coldplug default: evaluated when OpenRC sources the config.
 # Preserve service-local, exported, global and legacy-uppercase preferences.
 udev_trigger=/etc/conf.d/udev-trigger
+# shellcheck disable=SC2016 # written verbatim, expanded by OpenRC
 udev_default=': "${rc_coldplug:=${RC_COLDPLUG:-NO}}"'
 if [ -f "$udev_trigger" ] && ! grep -Fqx "$udev_default" "$udev_trigger"; then
     printf '\n%s\n%s\n' '# NanoKVM: default to device-node and network replay' "$udev_default" >> "$udev_trigger"
 fi
 unset udev_trigger udev_default
 # End NanoKVM udev coldplug default
+# Services whose stop undoes nothing a reboot or power-off does not undo
+# anyway skip their stop at shutdown; each stop costs an OpenRC service run.
+# nkos-standby accepts the failed entries OpenRC leaves for skipped stops. A
+# conf.d that already sets rc_keyword stays.
+# fsck has a real stop action when fsck_shutdown is enabled.
+for service in devfs procfs sysfs loopback hostname sysctl osclock udev-trigger; do
+    conf=/etc/conf.d/$service
+    if ! grep -q '^[[:space:]]*rc_keyword=' "$conf" 2>/dev/null; then
+        mkdir -p /etc/conf.d
+        printf '\n%s\n' 'rc_keyword="-shutdown"' >> "$conf"
+    fi
+done
+unset service conf
 # D-Bus serves only avahi, which starts it when mDNS is on (nanokvm-mdns).
 # A running D-Bus keeps running until the next boot.
 if [ -e /etc/runlevels/default/dbus ] && [ -x /etc/init.d/nanokvm-mdns ] &&
@@ -58,6 +141,7 @@ fi
 # fstab /boot noauto: nanokvm-storage mounts the boot and data partitions
 # itself, checking a volume left dirty by a power loss; localmount would mount
 # them before that. Only the two NanoKVM entries change.
+# shellcheck disable=SC2016 # an awk program
 nanokvm_fstab_entry='($1 == "/dev/mmcblk0p1" && $2 == "/boot" || $1 == "/dev/mmcblk0p3" && $2 == "/data") && $4 !~ /(^|,)noauto(,|$)/'
 if [ -f /etc/fstab ] && awk "$nanokvm_fstab_entry { found = 1 } END { exit !found }" /etc/fstab; then
     awk "$nanokvm_fstab_entry"' { $4 = "noauto," $4 } { print }' \
@@ -65,6 +149,30 @@ if [ -f /etc/fstab ] && awk "$nanokvm_fstab_entry { found = 1 } END { exit !foun
 fi
 unset nanokvm_fstab_entry
 # fstab end
+# Once per system (after 4.2.1), so a runlevel the user changed later stays:
+# modules leaves boot while the module lists name only the built-in af_packet
+# and ipv6 (the test /etc/rc.conf.d/nanokvm-boot.conf makes for procfs, which
+# wants modules again once a list names another); the persistent cron spool
+# moved from nanokvm-policy to nanokvm-policy-late, which starts now, with
+# the new S49persistent-cron, when what it needs and follows is already up;
+# otherwise it starts at the next boot.
+# The marker is written only after both steps succeed.
+boot_order_marker=/var/lib/nanokvm/boot-order-4.2.1
+if [ ! -e "$boot_order_marker" ] && [ -x /etc/init.d/nanokvm-policy-late ] &&
+    { [ ! -e /etc/runlevels/boot/modules ] ||
+        sed 's/#.*//' /etc/modules /etc/modules-load.d/*.conf /lib/modules-load.d/*.conf \
+            /usr/lib/modules-load.d/*.conf /run/modules-load.d/*.conf 2>/dev/null |
+            grep -qvxE '[[:space:]]*(af_packet|ipv6)?[[:space:]]*' ||
+        rc-update del modules boot; } &&
+    rc-update add nanokvm-policy-late default; then
+    mkdir -p "${boot_order_marker%/*}" && : > "$boot_order_marker" ||
+        echo "Could not write $boot_order_marker; the boot order is checked again at the next upgrade." >&2
+    if [ -e /run/openrc/softlevel ] && rc-service nanokvm-board status >/dev/null 2>&1 &&
+        rc-service nanokvm-app status >/dev/null 2>&1; then
+        rc-service nanokvm-policy-late start || echo "Deferred NanoKVM policy did not start; it starts at the next boot." >&2
+    fi
+fi
+unset boot_order_marker
 if [ -x /etc/init.d/nanokvm-usb-internet ]; then
     rc-update add nanokvm-usb-internet default
     if [ -e /run/openrc/softlevel ] && rc-service nanokvm-usb status >/dev/null 2>&1; then
@@ -101,9 +209,53 @@ if [ "$syslog_changed" = yes ]; then
 fi
 unset syslog_conf syslog_marker syslog_changed
 
-tmpfs_entry='tmpfs /tmp tmpfs rw,nosuid,nodev,mode=1777,size=64M 0 0'
+# Ethernet MAC: releases up to 4.2.1 derived it from 16 bits of the chip UID
+# (48:da:35:6f:xx:xx); S10uuid now uses 40 bits. A device that used the old
+# address keeps it, and its DHCP reservations. The address is recorded here,
+# in the root filesystem this update is being written to, as a complete file
+# under its final name; the boot volume may be unmounted or read-only now.
+# S10uuid uses the record when /boot/eth.mac sets no address and moves it
+# there. Decided once (a new installation is marked decided by post-install):
+# after that, removing /boot/eth.mac gives the device its new address at the
+# next boot, also when a later update runs before it.
+if [ ! -e /var/lib/nanokvm/eth-mac-checked ]; then
+    eth_mac=$(cat /sys/class/net/eth0/address 2>/dev/null || true)
+    case "$eth_mac" in
+        48:da:35:6f:??:??) ;;
+        # Another address was seen: an override. Nothing to keep.
+        ??:??:??:??:??:??) eth_mac= ;;
+        # The interface cannot be read: S10uuid derives the default of that
+        # release from the chip UID. An override in /boot/eth.mac still wins
+        # over the record.
+        *) eth_mac=legacy-default ;;
+    esac
+    if [ -n "$eth_mac" ]; then
+        mkdir -p /etc/kvm
+        if ! { printf '%s\n' "$eth_mac" > /etc/kvm/eth.mac.legacy.new &&
+            mv -f /etc/kvm/eth.mac.legacy.new /etc/kvm/eth.mac.legacy; }; then
+            rm -f /etc/kvm/eth.mac.legacy.new
+            echo "Could not record the Ethernet MAC address ($eth_mac) in /etc/kvm/eth.mac.legacy: do not reboot before /boot/eth.mac contains the address, or it changes." >&2
+            eth_mac_lost=yes
+        fi
+    fi
+    # Not decided while the record failed: the next run of this script
+    # tries again, and this one reports failure once its other steps are done.
+    if [ -z "${eth_mac_lost:-}" ]; then
+        mkdir -p /var/lib/nanokvm
+        : > /var/lib/nanokvm/eth-mac-checked
+    fi
+    unset eth_mac
+fi
+# Ethernet MAC end
+
+tmpfs_entry='tmpfs /tmp tmpfs rw,nosuid,nodev,noexec,mode=1777,size=64M 0 0'
 if ! grep -qE '^[^#]+[[:space:]]+/tmp[[:space:]]' /etc/fstab 2>/dev/null; then
     printf '%s\n' "$tmpfs_entry" >> /etc/fstab
+elif grep -qE '^tmpfs[[:space:]]+/tmp[[:space:]]+tmpfs[[:space:]]+rw,nosuid,nodev,mode=1777,size=64M[[:space:]]' /etc/fstab; then
+    # Nothing runs programs from /tmp: the line this package wrote before gets
+    # noexec, now and from the next boot. A line of another origin stays.
+    sed -i -E 's#^tmpfs([[:space:]]+)/tmp([[:space:]]+)tmpfs([[:space:]]+)rw,nosuid,nodev,mode=1777,size=64M([[:space:]])#tmpfs\1/tmp\2tmpfs\3rw,nosuid,nodev,noexec,mode=1777,size=64M\4#' /etc/fstab
+    if [ -e /run/openrc/softlevel ]; then mount -o remount,noexec /tmp 2>/dev/null || true; fi
 fi
 unset tmpfs_entry
 
@@ -124,3 +276,6 @@ if [ -f /root/.profile ] && [ "$(cat /root/.profile)" = "$legacy_root_profile" ]
     rm -f /root/.profile
 fi
 unset legacy_root_profile
+
+# The Ethernet MAC record above failed: the update is not complete.
+[ -z "${eth_mac_lost:-}" ] || exit 1

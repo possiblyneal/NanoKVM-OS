@@ -4,8 +4,8 @@ mod auth;
 mod config;
 mod connlog;
 mod direct;
-mod framing;
 mod frame_crypto;
+mod framing;
 mod identity;
 mod input;
 mod nanokvm;
@@ -101,12 +101,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let app_identity = nanokvm::Identity::load()?;
-    nanokvm::HidClient::new(config.admin_socket.clone(), app_identity.clone())
+    nanokvm::HidClient::new(config.admin_socket.clone())
         .prepare()
         .await?;
     let rustdesk_identity = identity::RustDeskIdentity::load()?;
     rustdesk_identity.publish_settings_output()?;
-    server::run(config, app_identity, rustdesk_identity).await?;
+    server::run(config, rustdesk_identity).await?;
     Ok(())
 }

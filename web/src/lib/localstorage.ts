@@ -12,9 +12,9 @@ const KEYBOARD_SYSTEM_KEY = 'nano-kvm-keyboard-system';
 const KEYBOARD_LANGUAGE_KEY = 'nano-kvm-keyboard-language';
 const MENU_DISABLED_ITEMS_KEY = 'nano-kvm-menu-disabled-items';
 const MENU_AUTO_HIDE_KEY = 'nano-kvm-menu-auto-hide';
-const MOBILE_MENU_PLACEMENT_KEY = 'nano-kvm-mobile-menu-placement';
+const THEME_KEY = 'nano-kvm-theme';
 const KEYBOARD_LED_STATUS_VISIBLE_KEY = 'nano-kvm-keyboard-led-status-visible';
-const POWER_CONFIRM_KEY = 'nano-kvm-power-confirm';
+const HOST_LED_STATUS_VISIBLE_KEY = 'nano-kvm-host-led-status-visible';
 
 export function getLanguage() {
   return localStorage.getItem(LANGUAGE_KEY);
@@ -131,19 +131,12 @@ export function setMenuDisplayMode(mode: string) {
   localStorage.setItem(MENU_AUTO_HIDE_KEY, mode);
 }
 
-export function getMobileMenuPlacement(): unknown {
-  const value = localStorage.getItem(MOBILE_MENU_PLACEMENT_KEY);
-  if (!value) return null;
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
+export function getTheme() {
+  return localStorage.getItem(THEME_KEY);
 }
 
-export function setMobileMenuPlacement(placement: { edge: string; top: number }) {
-  localStorage.setItem(MOBILE_MENU_PLACEMENT_KEY, JSON.stringify(placement));
+export function setTheme(theme: string) {
+  localStorage.setItem(THEME_KEY, theme);
 }
 
 export function getKeyboardLedStatusVisible(): boolean {
@@ -155,14 +148,14 @@ export function setKeyboardLedStatusVisible(visible: boolean) {
   localStorage.setItem(KEYBOARD_LED_STATUS_VISIBLE_KEY, String(visible));
 }
 
-export function getPowerConfirm() {
-  const enabled = localStorage.getItem(POWER_CONFIRM_KEY);
-  return enabled !== 'false';
+export function getHostLedStatusVisible(): boolean {
+  return localStorage.getItem(HOST_LED_STATUS_VISIBLE_KEY) !== 'false';
 }
 
-export function setPowerConfirm(enabled: boolean) {
-  localStorage.setItem(POWER_CONFIRM_KEY, String(enabled));
+export function setHostLedStatusVisible(visible: boolean) {
+  localStorage.setItem(HOST_LED_STATUS_VISIBLE_KEY, String(visible));
 }
+
 // Lowest latency unless this browser chose smooth playback.
 export function getDirectPlayback(): DirectPlayback {
   return localStorage.getItem('direct-playback') === 'paced' ? 'paced' : 'immediate';
@@ -170,4 +163,22 @@ export function getDirectPlayback(): DirectPlayback {
 
 export function setDirectPlayback(mode: DirectPlayback) {
   localStorage.setItem('direct-playback', mode);
+}
+
+// The layout of the host a paste is typed for, and how fast: the last ones
+// chosen in this browser.
+export function getPasteLayout(): string {
+  return localStorage.getItem('nano-kvm-paste-layout') ?? 'en';
+}
+
+export function setPasteLayout(layout: string) {
+  localStorage.setItem('nano-kvm-paste-layout', layout);
+}
+
+export function getPasteSpeed(): 'normal' | 'slow' {
+  return localStorage.getItem('nano-kvm-paste-speed') === 'slow' ? 'slow' : 'normal';
+}
+
+export function setPasteSpeed(speed: 'normal' | 'slow') {
+  localStorage.setItem('nano-kvm-paste-speed', speed);
 }

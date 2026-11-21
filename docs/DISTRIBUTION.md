@@ -5,9 +5,8 @@ NanoKVM OS retains component-specific upstream licenses. The root GPL-3.0 licens
 ## What this repository contains
 
 - The application, web UI, board service, packaging, OpenRC services and build recipes.
-- Patches to upstream components (`platform/kernel`, `platform/uboot`, `platform/modules`, `platform/native`).
+- Patches to upstream components (`platform/kernel`, `platform/uboot`, `platform/fsbl`, `platform/modules`, `platform/native`).
 - Pins of every upstream input in `platform/sources.lock`, with their hashes.
-- `platform/fip/base-fip.bin`, the stock Sipeed first-stage boot firmware (see [platform/README.md](../platform/README.md#corresponding-source)).
 - The public APK signing key of NanoKVM OS releases (`firmware/alpine/keys`).
 
 Upstream sources are not copied into this repository. `platform/build.sh` downloads each one from its own publisher and checks it against `sources.lock`.
@@ -18,7 +17,7 @@ These components are published by their authors in public repositories but carry
 
 | Component | Publisher | Used for |
 |---|---|---|
-| `cvi_mpi`, including about 900 prebuilt ISP and audio objects | [SOPHGO](https://github.com/sophgo/cvi_mpi) | the media libraries in `/kvmapp/server/dl_lib` |
+| `cvi_mpi` (its prebuilt ISP/3A and audio objects are not built or shipped) | [SOPHGO](https://github.com/sophgo/cvi_mpi) | the media libraries in `/kvmapp/server/dl_lib` |
 | `SensorSupportList` | [SOPHGO](https://github.com/sophgo/SensorSupportList) | the LT6911 HDMI receiver driver in `libkvm_mmf` |
 | `cviruntime`, `cvikernel` and the model schema `cvibuilder`, the TPU runtime | [SOPHGO](https://github.com/sophgo/cviruntime), as ported to dma-buf heaps in [duo-buildroot-sdk-v2](https://github.com/leafpmpmp/duo-buildroot-sdk-v2/tree/mainline-tpu) | `nanokvm-ocr` and `nanokvm-screen` in `nanokvm-tpu` (linked statically) |
 | `coda980.bin`, `monet.bin` video codec firmware | [Sipeed LicheeRV-Nano-Build](https://github.com/sipeed/LicheeRV-Nano-Build) | `/usr/share/fw_vcodec` |

@@ -16,6 +16,8 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	"NanoKVM-Server/journal"
 )
 
 // Kind is what an event is about; each channel picks the kinds it gets.
@@ -25,7 +27,7 @@ const (
 	KindPower    Kind = "power"
 	KindHDMI     Kind = "hdmi"
 	KindSecurity Kind = "security"
-	// KindScreen: a crash seen on the host's screen (the TPU add-on).
+	// KindScreen: a crash seen on the host's screen (the TPU classifier).
 	KindScreen Kind = "screen"
 	// KindTest is the page's Test button; it ignores the channel's kinds.
 	KindTest Kind = "test"
@@ -77,6 +79,18 @@ type Rendered struct {
 	Device   string
 	Time     time.Time
 	Image    []byte
+
+	// delivery is shared by the attempts of one delivery; nil for a test.
+	delivery *delivery
+}
+
+// delivery is what the attempts of one delivery share, so a retry does not
+// repeat what an earlier attempt got through.
+type delivery struct {
+	id string
+	// photoTo is the Telegram destination (API, bot, chat and topic) that
+	// got the picture: a retry to another one sends it again.
+	photoTo string
 }
 
 // Text is the body with the device and the time under it, for channels with
@@ -94,9 +108,31 @@ const (
 	// waits included, so a destination that hangs or is down cannot pile up
 	// goroutines and requests. maxChannelDeliveries keeps one such channel
 	// from taking every slot. A delivery beyond either is dropped and logged.
-	maxDeliveries        = 16
+	// Login events, which outsiders can cause, have a pool of their own of
+	// the same size, so they never take the host's slots: each pool holds a
+	// delivery to every one of the maxChannels channels.
+	maxDeliveries        = maxChannels
 	maxChannelDeliveries = 4
 )
+
+// coalesced are the messages an outsider can repeat at will, with the time
+// in which only one of them is sent.
+var coalesced = map[string]time.Duration{
+	"security.lockout":       10 * time.Minute,
+	"security.attempt-limit": 10 * time.Minute,
+}
+
+// heldEvents are the events of a coalesced message held back since.
+type heldEvents struct {
+	since, until time.Time
+	dropped      int
+}
+
+// opposite pairs the messages of the host's states.
+var opposite = map[string]string{
+	"power.on": "power.off", "power.off": "power.on",
+	"hdmi.lost": "hdmi.restored", "hdmi.restored": "hdmi.lost",
+}
 
 // retryDelays are the waits before the second, third and fourth attempts.
 var retryDelays = []time.Duration{10 * time.Second, time.Minute, 5 * time.Minute}
@@ -120,13 +156,17 @@ type Service struct {
 	mu     sync.Mutex
 	config Config
 	recent map[string]time.Time
-	// active counts the deliveries alive, inFlight those of each channel id.
-	active   int
+	held   map[string]heldEvents
+	// active counts the deliveries alive of the host's events and of login
+	// events, inFlight those of each channel id.
+	active   [2]int
 	inFlight map[string]int
 	// authErrors are the failed sign-ins of each channel id, for the page.
 	authErrors map[string]string
 
 	startOnce sync.Once
+	// record, when set, gets every event that is dispatched: the journal.
+	record func(Event)
 }
 
 func newService(path string) *Service {
@@ -137,6 +177,7 @@ func newService(path string) *Service {
 		now:        time.Now,
 		sleep:      sleepContext,
 		recent:     make(map[string]time.Time),
+		held:       make(map[string]heldEvents),
 		inFlight:   make(map[string]int),
 		authErrors: make(map[string]string),
 	}
@@ -199,8 +240,24 @@ var (
 
 // Default is the device's notification service, with its stored settings.
 func Default() *Service {
-	stdOnce.Do(func() { std = newService(ConfigPath) })
+	stdOnce.Do(func() {
+		std = newService(ConfigPath)
+		std.record = func(e Event) {
+			journal.Default.Add(journal.Entry{Time: e.Time, Kind: string(e.Kind), Severity: e.Severity.String(),
+				Message: e.Message, Vars: e.Vars, Details: e.Details})
+		}
+	})
 	return std
+}
+
+// Describe puts a journal entry into the words of language (English when
+// the language or the message is not known there).
+func Describe(language string, e journal.Entry) (title, body string) {
+	if !slices.Contains(Languages, language) {
+		language = Languages[0]
+	}
+	r := render(Event{Message: e.Message, Vars: e.Vars, Details: e.Details, Time: e.Time}, language, nil)
+	return r.Title, r.Body
 }
 
 // Emit queues an event for the device's channels.
@@ -238,13 +295,39 @@ func (s *Service) dispatch(e Event) {
 		}
 	}
 	_, repeated := s.recent[key]
-	if !repeated {
+	held := false
+	if window, ok := coalesced[e.Message]; ok && !repeated {
+		// Each address an attacker gets locked out would be a message of its
+		// own: one goes out per window, the next one counts the rest.
+		c := s.held[e.Message]
+		if held = now.Before(c.until); held {
+			c.dropped++
+		} else {
+			if c.dropped > 0 {
+				e.Details = fmt.Sprintf("%d more addresses blocked since %s.", c.dropped, c.since.Format("15:04"))
+			}
+			c = heldEvents{since: now, until: now.Add(window)}
+		}
+		s.held[e.Message] = c
+	}
+	if !repeated && !held {
+		// A state change ends the repeats of the state before it: off, on,
+		// off within the window must still report the last off.
+		if before, ok := opposite[e.Message]; ok {
+			delete(s.recent, fmt.Sprint(before, e.Vars))
+		}
 		s.recent[key] = now
 	}
 	s.mu.Unlock()
-	if repeated {
-		log.Debugf("notifications: repeated %s dropped", e.Message)
+	if repeated || held {
+		log.Debugf("notifications: repeated %s held back", e.Message)
 		return
+	}
+	// The journal gets what the channels would, whether or not a channel
+	// takes it: after the repeats are held back, so that an outsider's
+	// logins cannot fill it.
+	if s.record != nil && e.Kind != KindTest {
+		s.record(e)
 	}
 	var targets []Channel
 	for _, ch := range config.Channels {
@@ -256,39 +339,66 @@ func (s *Service) dispatch(e Event) {
 		return
 	}
 	for _, ch := range targets {
-		if !s.admit(ch.ID) {
+		if !s.admit(ch.ID, e.Kind) {
 			log.Warnf("notifications: %s %q is behind, dropped %s", ch.Type, ch.Name, e.Message)
 			continue
 		}
-		go s.deliver(ch, render(e, config.Language, config.template(ch.Template)))
+		go s.deliver(ch, e)
 	}
 }
 
-// admit takes a delivery slot for a channel; false when none is free.
-func (s *Service) admit(id string) bool {
+// pool is the slot pool of an event's kind: 1 for login events, 0 for the
+// host's.
+func pool(kind Kind) int {
+	if kind == KindSecurity {
+		return 1
+	}
+	return 0
+}
+
+// admit takes a delivery slot for a channel; false when none is free. Login
+// events, which outsiders can cause, leave the last slot of a channel to the
+// host's events.
+func (s *Service) admit(id string, kind Kind) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active >= maxDeliveries || s.inFlight[id] >= maxChannelDeliveries {
+	limit := maxChannelDeliveries
+	if kind == KindSecurity {
+		limit--
+	}
+	if s.active[pool(kind)] >= maxDeliveries || s.inFlight[id] >= limit {
 		return false
 	}
-	s.active++
+	s.active[pool(kind)]++
 	s.inFlight[id]++
 	return true
 }
 
-func (s *Service) release(id string) {
+func (s *Service) release(id string, kind Kind) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.active--
+	s.active[pool(kind)]--
 	if s.inFlight[id]--; s.inFlight[id] <= 0 {
 		delete(s.inFlight, id)
 	}
 }
 
+// renderFor writes the event for a channel by the settings of now: a retry
+// after the channel changed type is escaped for its new type.
+func (s *Service) renderFor(ch Channel, e Event) Rendered {
+	s.mu.Lock()
+	config := s.config
+	s.mu.Unlock()
+	return renderFor(e, config.Language, config.template(ch.Template), markup(ch.Type))
+}
+
 // deliver sends an admitted delivery, retrying, and then frees its slot.
-func (s *Service) deliver(ch Channel, r Rendered) {
-	defer s.release(ch.ID)
+func (s *Service) deliver(ch Channel, e Event) {
+	defer s.release(ch.ID, e.Kind)
+	d := &delivery{id: newID()}
 	for attempt := 0; ; attempt++ {
+		r := s.renderFor(ch, e)
+		r.delivery = d
 		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 		err := s.send(ctx, ch, r)
 		cancel()
@@ -306,7 +416,25 @@ func (s *Service) deliver(ch Channel, r Rendered) {
 		if !s.sleep(context.Background(), retryDelays[attempt]) {
 			return
 		}
+		// The channel may have been deleted, turned off or changed meanwhile:
+		// a retry goes by its settings of now.
+		var ok bool
+		if ch, ok = s.channel(ch.ID, e.Kind); !ok {
+			return
+		}
 	}
+}
+
+// channel is the enabled channel of id if it still takes events of kind.
+func (s *Service) channel(id string, kind Kind) (Channel, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ch := range s.config.Channels {
+		if ch.ID == id && ch.Enabled && ch.wants(kind) {
+			return ch, true
+		}
+	}
+	return Channel{}, false
 }
 
 // Test sends a test message to one channel at once, written by template (nil:

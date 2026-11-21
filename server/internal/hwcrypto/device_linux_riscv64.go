@@ -28,6 +28,7 @@ func Open(onError func(error)) (*Device, error) {
 	}
 	fd := f.Fd()
 	const command = uintptr(3<<30) | (unsafe.Sizeof(request{}) << 16) | ('K' << 8) | 0xc1
+	const chainCommand = uintptr(3<<30) | (unsafe.Sizeof(ctrSHA1Request{}) << 16) | ('K' << 8) | 0xc5
 	return &Device{
 		onError: onError,
 		closeFD: f.Close,
@@ -36,8 +37,19 @@ func Open(onError func(error)) (*Device, error) {
 			// sleeps only beyond that. A runtime-visible syscall that long lets
 			// sysmon hand the only P to another thread; on the C906 that doubled
 			// the CPU cost of a 1200-byte packet (64 to 30 us). Contention for the
-			// module lock (other Crypto API users) is bounded by their 4 KiB chunks.
+			// module lock is bounded by one piece of another Crypto API user:
+			// 64 KiB, about 0.7 ms for CCM (an encrypted SMB share being read).
 			_, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, fd, command, uintptr(unsafe.Pointer(r)))
+			runtime.KeepAlive(r)
+			if errno != 0 {
+				return errno
+			}
+			return nil
+		},
+		// Raw for the same reason; a frame's packets are a few hundred
+		// microseconds in the engine.
+		submitChain: func(r *ctrSHA1Request) error {
+			_, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, fd, chainCommand, uintptr(unsafe.Pointer(r)))
 			runtime.KeepAlive(r)
 			if errno != 0 {
 				return errno

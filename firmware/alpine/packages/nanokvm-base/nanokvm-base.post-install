@@ -9,15 +9,19 @@ for service in devfs dmesg procfs sysfs; do
     [ ! -x "/etc/init.d/$service" ] || rc-update add "$service" sysinit
 done
 # NanoKVM services load their drivers explicitly; the kernel set the clock
-# from the RTC (osclock provides "clock" instead of hwclock).
-for service in loopback bootmisc hostname localmount modules osclock sysctl udev udev-trigger; do
+# from the RTC (osclock provides "clock" instead of hwclock), and
+# nanokvm-clock keeps it from starting in 1970. modules runs when procfs
+# wants it (/etc/rc.conf.d/nanokvm-boot.conf).
+for service in loopback hostname localmount osclock nanokvm-clock sysctl udev udev-trigger; do
     [ ! -x "/etc/init.d/$service" ] || rc-update add "$service" boot
 done
 for service in nanokvm-storage nanokvm-modules nanokvm-board \
-	       nanokvm-network nanokvm-usb-internet nanokvm-usb nanokvm-policy nanokvm-ssh nanokvm-app nanokvm-rescue nanokvm-watchdog chronyd crond nanokvm-mdns; do
+	       nanokvm-network nanokvm-usb-internet nanokvm-usb nanokvm-policy nanokvm-ssh nanokvm-app nanokvm-policy-late bootmisc nanokvm-rescue nanokvm-watchdog chronyd crond nanokvm-mdns; do
 	[ ! -x "/etc/init.d/$service" ] || rc-update add "$service" default
 done
 [ ! -x /etc/init.d/mount-ro ] || rc-update add mount-ro shutdown
+# A clean install already has the 4.2.1 boot order (nanokvm-base.post-upgrade).
+mkdir -p /var/lib/nanokvm && : > /var/lib/nanokvm/boot-order-4.2.1
 # OpenRC builds its dependency tree from all init scripts at every boot (about
 # 2 s) unless savecache kept it at shutdown; it rebuilds the tree by itself
 # when a script or a setting changed since.
@@ -29,27 +33,48 @@ done
 #   sshd, and the config binds no single address, so it needs nothing more.
 # - bootmisc's copy of the kernel log on the SD card at every boot duplicates
 #   the boot log archive.
+# - bootmisc waits for the server: it writes utmp and wtmp, and its cleanup
+#   of /run and /tmp has nothing to do on tmpfs. hostname stays in boot: the
+#   server checks request Host names against it.
 # - udev-trigger replays the add event of every device at boot, about 530 on
 #   the SG2002. Without coldplug it replays those with a /dev node and the
 #   network interfaces: the same nodes, permissions and links, and the same
 #   modules, since the NanoKVM services load theirs (the SD Wi-Fi drivers are
-#   kept from udev anyway). On the stand the server started 1 s sooner. An
+#   kept from udev anyway). The server starts about 1 s sooner. An
 #   rc_coldplug the user set stays.
 if [ -f /etc/conf.d/sshd ] && ! grep -q '^[[:space:]]*rc_need=' /etc/conf.d/sshd; then
+    # shellcheck disable=SC2016 # literal text
     printf '%s\n' '# NanoKVM: no `sshd -G` while OpenRC builds its dependency tree' 'rc_need=""' >> /etc/conf.d/sshd
 fi
 if [ -f /etc/conf.d/bootmisc ]; then
     sed -i 's/^log_dmesg="YES"$/log_dmesg="NO"/' /etc/conf.d/bootmisc
 fi
+if [ -f /etc/conf.d/bootmisc ] && ! grep -q '^[[:space:]]*rc_after=' /etc/conf.d/bootmisc; then
+    printf '%s\n' '# NanoKVM: after the server' 'rc_after="nanokvm-app"' >> /etc/conf.d/bootmisc
+fi
 # NanoKVM udev coldplug default: evaluated when OpenRC sources the config.
 # Preserve service-local, exported, global and legacy-uppercase preferences.
 udev_trigger=/etc/conf.d/udev-trigger
+# shellcheck disable=SC2016 # written verbatim, expanded by OpenRC
 udev_default=': "${rc_coldplug:=${RC_COLDPLUG:-NO}}"'
 if [ -f "$udev_trigger" ] && ! grep -Fqx "$udev_default" "$udev_trigger"; then
     printf '\n%s\n%s\n' '# NanoKVM: default to device-node and network replay' "$udev_default" >> "$udev_trigger"
 fi
 unset udev_trigger udev_default
 # End NanoKVM udev coldplug default
+# Services whose stop undoes nothing a reboot or power-off does not undo
+# anyway skip their stop at shutdown; each stop costs an OpenRC service run.
+# nkos-standby accepts the failed entries OpenRC leaves for skipped stops. A
+# conf.d that already sets rc_keyword stays.
+# fsck has a real stop action when fsck_shutdown is enabled.
+for service in devfs procfs sysfs loopback hostname sysctl osclock udev-trigger; do
+    conf=/etc/conf.d/$service
+    if ! grep -q '^[[:space:]]*rc_keyword=' "$conf" 2>/dev/null; then
+        mkdir -p /etc/conf.d
+        printf '\n%s\n' 'rc_keyword="-shutdown"' >> "$conf"
+    fi
+done
+unset service conf
 
 # Fresh images are closed to SSH until the user enables it. Recovery restores
 # the complete old /etc/kvm directory, including the absence of this marker.
@@ -65,15 +90,13 @@ touch /etc/kvm/ssh_stop
 # setting stay as they are.
 syslog_conf=/etc/conf.d/syslog
 syslog_marker='# NanoKVM: the live system log in RAM'
-syslog_changed=no
 if [ ! -e "$syslog_conf" ] || [ "$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$syslog_conf")" = 'SYSLOGD_OPTS="-t"' ]; then
     mkdir -p "$(dirname "$syslog_conf")"
     printf '%s\n%s\n%s\n' "$syslog_marker" 'mkdir -p /run/log' \
         'SYSLOGD_OPTS="-t -O /run/log/messages -s 512 -b 1"' > "$syslog_conf"
-    syslog_changed=yes
 fi
 # A fresh image starts syslog with the RAM log; nothing was written to the card.
-unset syslog_conf syslog_marker syslog_changed
+unset syslog_conf syslog_marker
 mkdir -p /etc/kvm/cron/crontabs
 if [ ! -L /etc/crontabs ]; then
     cp -an /etc/crontabs/. /etc/kvm/cron/crontabs/ 2>/dev/null || true
@@ -89,7 +112,7 @@ fi
 if ! grep -qE '^[^#]+[[:space:]]+/data[[:space:]]' /etc/fstab 2>/dev/null; then
     printf '%s\n' '/dev/mmcblk0p3 /data exfat noauto,rw,nosuid,nodev,noexec 0 0' >> /etc/fstab
 fi
-tmpfs_entry='tmpfs /tmp tmpfs rw,nosuid,nodev,mode=1777,size=64M 0 0'
+tmpfs_entry='tmpfs /tmp tmpfs rw,nosuid,nodev,noexec,mode=1777,size=64M 0 0'
 if ! grep -qE '^[^#]+[[:space:]]+/tmp[[:space:]]' /etc/fstab 2>/dev/null; then
     printf '%s\n' "$tmpfs_entry" >> /etc/fstab
 fi
@@ -129,5 +152,10 @@ mkdir -p /etc/ssh/sshd_config.d
 if [ ! -e /etc/ssh/sshd_config.d/00-nanokvm-root.conf ]; then
     printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/00-nanokvm-root.conf
 fi
+
+# A new installation has the 40-bit Ethernet MAC from its first boot: there is
+# no older address for a later update to keep (see post-upgrade).
+mkdir -p /var/lib/nanokvm
+: > /var/lib/nanokvm/eth-mac-checked
 
 exit 0

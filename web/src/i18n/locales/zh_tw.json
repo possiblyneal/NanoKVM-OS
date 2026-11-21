@@ -285,8 +285,6 @@
   },
   "power": {
     "title": "電源控制",
-    "showConfirm": "顯示確認框",
-    "showConfirmTip": "電源操作需要二次確認",
     "reset": "重新啟動",
     "powerShort": "電源 (短按)",
     "powerLong": "電源 (長按)",
@@ -350,12 +348,13 @@
         "modeAlways": "始終顯示",
         "keyboardLedStatus": "鍵盤鎖定狀態指示燈",
         "keyboardLedStatusDesc": "在選單列中顯示遠端電腦的 Caps Lock、Num Lock 和 Scroll Lock 狀態。",
+        "hostLedStatus": "電源與硬碟指示燈",
+        "hostLedStatusDesc": "在選單列中顯示遠端電腦的電源與硬碟指示燈。",
         "icons": "選單列按鈕",
         "iconsDesc": "是否在選單欄中顯示子選單圖示",
         "hiddenCount": "已隱藏 {{count}} 個",
         "showAll": "全部顯示"
       },
-      "buttonColor": {},
       "browser": "在此瀏覽器中",
       "browserDesc": "僅儲存在此瀏覽器中；其他瀏覽器和使用者各有自己的設定。",
       "device": "對此裝置的所有人",
@@ -364,6 +363,13 @@
       "branding": {
         "upload": "上傳"
       }
+    },
+    "hostLedStatus": {
+      "groupLabel": "遠端電腦的電源與硬碟指示燈",
+      "powerLed": "電源指示燈",
+      "powerLedShort": "電",
+      "hddLed": "硬碟指示燈",
+      "hddLedShort": "碟"
     },
     "keyboardLedStatus": {
       "groupLabel": "遠端鍵盤鎖定狀態",
@@ -623,12 +629,8 @@
       "indexSchedule": {
         "save": "儲存"
       },
-      "addons": {
-        "title": "附加元件",
-        "packages": "套件",
-        "install": "安裝"
-      },
       "title": "軟體",
+      "packages": "套件",
       "available": "可用套件",
       "updatesTab": "更新",
       "search": "搜尋",
@@ -740,10 +742,7 @@
       }
     },
     "rustdesk": {
-      "absent": "尚未安裝",
       "stopped": "已停止",
-      "install": "安裝",
-      "remove": "移除",
       "save": "儲存設定",
       "server": "伺服器",
       "passwordMode": "密碼",
@@ -797,8 +796,7 @@
       "eventHint": {
         "power": "主機被開啟或關閉；需要啟用 ATX 控制並連接電源指示燈。",
         "hdmi": "畫面遺失或恢復，包括主機關閉顯示器時；僅在視訊擷取執行時偵測。",
-        "security": "登入失敗後被封鎖的位址、從新位址登入。",
-        "screen": "由 TPU 附加元件辨識的藍屏或 kernel panic；無人觀看視訊時讀取畫面文字，並隨截圖一起傳送。"
+        "security": "登入失敗後被封鎖的位址、IPMI 登入嘗試過多、從新位址登入。"
       },
       "field": {
         "token": "權杖",
@@ -879,6 +877,7 @@
         "hdmi_lost": "HDMI 訊號遺失",
         "hdmi_restored": "HDMI 訊號恢復",
         "security_lockout": "登入已被封鎖",
+        "security_attempt-limit": "登入嘗試受限",
         "security_new-address": "從新位址登入",
         "screen_bsod": "藍屏",
         "screen_panic": "Kernel panic",
@@ -924,16 +923,6 @@
         "authError": "登入已失效：{{error}}",
         "changed": "登入期間服務、用戶端 ID 或租用戶已變更。請重新登入。"
       }
-    },
-    "addonPage": {
-      "failed": "無法讀取附加元件的值",
-      "notRunning": "附加元件的服務未執行",
-      "refused": "附加元件拒絕了此操作",
-      "saved": "已儲存",
-      "save": "儲存",
-      "status": "狀態",
-      "yes": "是",
-      "no": "否"
     }
   },
   "picoclaw": {

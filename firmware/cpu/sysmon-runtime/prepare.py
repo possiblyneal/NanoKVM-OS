@@ -83,23 +83,41 @@ edit(f'{chacha}/chacha_noasm.go', '//go:build (!arm64 && !s390x && !ppc64 && !pp
 edit(f'{chacha}/chacha_generic.go', '\tif uint64(s.counter)+blocksPerBuf > 1<<32 {\n',
      '\tif uint64(s.counter)+blocksPerBuf >= 1<<32 {\n')
 vendor_files = [f'{chacha}/chacha_noasm.go', f'{chacha}/chacha_generic.go']
-for name, pkg in [('chacha_riscv64.go', chacha), ('chacha_riscv64.s', chacha)]:
-    shutil.copyfile(crypto / name, out / 'src' / pkg / name)
-    vendor_files.append(f'{pkg}/{name}')
+# chacha_xtheadvector_riscv64.go selects the C906 kernel; the nanokvmqemu
+# build tag (chacha_qemu_riscv64.go) the generic code.
+for name in ['chacha_riscv64.go', 'chacha_riscv64.s', 'chacha_xtheadvector_riscv64.go', 'chacha_qemu_riscv64.go']:
+    shutil.copyfile(crypto / name, out / 'src' / chacha / name)
+    vendor_files.append(f'{chacha}/{name}')
 # Poly1305: keep the pinned upstream reference, install CRYPTOGAMS (the
-# kernel's and OpenSSL's Poly1305) behind Go's update.
+# kernel's and OpenSSL's Poly1305) and the vector kernel behind Go's update.
 poly = 'vendor/golang.org/x/crypto/internal/poly1305'
 materialize(poly)
 if sha256(crypto / 'sum_riscv64.s') != pin['x_crypto_v0.57.0_sum_riscv64_s_sha256']:
     parser.error('sum_riscv64.s differs from x/crypto v0.57.0')
 edit(f'{poly}/mac_noasm.go', '(!amd64 && !loong64 && !ppc64le && !ppc64 && !s390x)',
      '(!amd64 && !loong64 && !ppc64le && !ppc64 && !riscv64 && !s390x)')
-edit(f'{poly}/sum_asm.go', '(amd64 || loong64 || ppc64 || ppc64le)', '(amd64 || loong64 || ppc64 || ppc64le || riscv64)')
+# riscv64 gets sum_asm.go's mac wrapper, but update is Go code
+# (sum_vector_riscv64.go) that picks the vector kernel or updateScalar.
+asm_tag = '//go:build gc && !purego && (amd64 || loong64 || ppc64 || ppc64le)\n'
+update_decl = '//go:noescape\nfunc update(state *macState, msg []byte)\n\n'
+text = (out / 'src' / poly / 'sum_asm.go').read_text()
+require_once(text, asm_tag, f'{poly}/sum_asm.go')
+require_once(text, update_decl, f'{poly}/sum_asm.go')
+text = text.replace(asm_tag, '//go:build gc && !purego\n\n'
+                    '// NanoKVM: sum_asm.go for riscv64, without the update declaration\n'
+                    '// (sum_vector_riscv64.go implements it).\n').replace(update_decl, '')
+(out / 'src' / poly / 'sum_asm_riscv64.go').write_text(text)
 shutil.copyfile(crypto / 'sum_c906_riscv64.s', out / 'src' / poly / 'sum_riscv64.s')
 shutil.copyfile(crypto / 'sum_misaligned_riscv64.go', out / 'src' / poly / 'sum_misaligned_riscv64.go')
 shutil.copyfile(crypto / 'sum_c906_riscv64.go', out / 'src' / poly / 'sum_c906_riscv64.go')
-vendor_files += [f'{poly}/mac_noasm.go', f'{poly}/sum_asm.go', f'{poly}/sum_riscv64.s', f'{poly}/sum_misaligned_riscv64.go',
-                 f'{poly}/sum_c906_riscv64.go']
+# The vector kernel (radix 2^26, XTheadVector) takes long messages; update
+# (sum_vector_riscv64.go) hands the rest to the CRYPTOGAMS updateScalar. The
+# nanokvmqemu build tag (sum_qemu_riscv64.go) keeps updateScalar only.
+poly_files = ['sum_vector_riscv64.go', 'sum_vector_riscv64.s', 'sum_xtheadvector_riscv64.go', 'sum_qemu_riscv64.go']
+for name in poly_files:
+    shutil.copyfile(crypto / name, out / 'src' / poly / name)
+vendor_files += [f'{poly}/mac_noasm.go', f'{poly}/sum_asm_riscv64.go', f'{poly}/sum_riscv64.s', f'{poly}/sum_misaligned_riscv64.go',
+                 f'{poly}/sum_c906_riscv64.go'] + [f'{poly}/{name}' for name in poly_files]
 # Short substring search without Rabin-Karp (go-bytes-index): where Index
 # falls back to Rabin-Karp, a sep of at most 255 bytes uses Horspool.
 index = source.parent / 'go-bytes-index'
@@ -130,48 +148,17 @@ edit('internal/stringslite/strings.go', '''			// See comment in ../bytes/bytes.g
 			j := bytealg.IndexRabinKarp(s[i:], substr)
 ''')
 vendor_files += ['bytes/bytes.go', 'internal/stringslite/strings.go']
-# SHA-1 and SHA-256 blocks for T-Head cores (go-crypto-c906/gen_sha_c906.py),
-# chosen by cpu.RISCV64.HasXTheadBb, which riscv_hwprobe's mvendorid sets.
-for pkg in ['internal/cpu', 'crypto/internal/fips140deps/cpu', 'crypto/internal/fips140/sha256', 'crypto/sha1']:
+# SHA-256, SHA-512 (go-crypto-c906/gen_sha2_c906.py) and SHA-1 blocks
+# (gen_sha_c906.py) for the C906 replace Go's riscv64 assembly under the same
+# name: NanoKVM OS runs on this CPU only, there is no selection at run time.
+for pkg in ['crypto/internal/fips140/sha256', 'crypto/internal/fips140/sha512', 'crypto/sha1']:
     materialize(pkg)
-edit('internal/cpu/cpu.go', '\tHasZvkt           bool // Vector Data-Independent Execution Latency\n',
-     '\tHasZvkt           bool // Vector Data-Independent Execution Latency\n'
-     '\tHasXTheadBb       bool // T-Head XTheadBb (NanoKVM: mvendorid of a T-Head core)\n'
-     '\tHasXTheadVector   bool // T-Head XTheadVector (NanoKVM: riscv_hwprobe vendor key)\n')
-edit('internal/cpu/cpu_riscv64.go', '\t\t{Name: "zvkt", Feature: &RISCV64.HasZvkt},\n',
-     '\t\t{Name: "zvkt", Feature: &RISCV64.HasZvkt},\n'
-     '\t\t{Name: "xtheadbb", Feature: &RISCV64.HasXTheadBb},\n'
-     '\t\t{Name: "xtheadvector", Feature: &RISCV64.HasXTheadVector},\n')
-edit('internal/cpu/cpu_riscv64_linux.go', '\t\t{riscv_HWPROBE_KEY_CPUPERF_0, 0},\n\t}\n',
-     '\t\t{riscv_HWPROBE_KEY_CPUPERF_0, 0},\n'
-     '\t\t{0, 0}, // NanoKVM: RISCV_HWPROBE_KEY_MVENDORID\n'
-     '\t\t{11, 0}, // NanoKVM: RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0\n\t}\n')
-edit('internal/cpu/cpu_riscv64_linux.go', '\tif pairs[1].key != -1 {\n',
-     '\t// Every T-Head RISC-V core (vendor ID 0x5b7) implements XTheadBb, which\n'
-     '\t// Linux reports neither in hwprobe nor in /proc/cpuinfo.\n'
-     '\tif pairs[2].key != -1 {\n'
-     '\t\tRISCV64.HasXTheadBb = pairs[2].value == 0x5b7\n'
-     '\t}\n'
-     '\tif pairs[3].key != -1 { // RISCV_HWPROBE_VENDOR_EXT_XTHEADVECTOR\n'
-     '\t\tRISCV64.HasXTheadVector = pairs[3].value&1 != 0\n'
-     '\t}\n'
-     '\tif pairs[1].key != -1 {\n')
-edit('crypto/internal/fips140deps/cpu/cpu.go', '\tRISCV64HasV = cpu.RISCV64.HasV\n',
-     '\tRISCV64HasV        = cpu.RISCV64.HasV\n'
-     '\tRISCV64HasXTheadBb = cpu.RISCV64.HasXTheadBb\n')
 sha = 'crypto/internal/fips140/sha256'
-edit(f'{sha}/sha256block_asm.go', '//go:build (386 || loong64 || riscv64) && !purego\n',
-     '//go:build (386 || loong64) && !purego\n')
-edit(f'{sha}/sha256block_riscv64.s', 'TEXT ·block(SB),0,$64-32\n', 'TEXT ·blockRV64(SB),0,$64-32\n')
-for name in ['sha256block_riscv64.go', 'sha256block_c906_riscv64.s']:
-    shutil.copyfile(crypto / name, out / 'src' / sha / name)
-edit('crypto/sha1/sha1block_decl.go', '//go:build (386 || arm || loong64 || riscv64) && !purego\n',
-     '//go:build (386 || arm || loong64) && !purego\n')
-edit('crypto/sha1/sha1block_riscv64.s', 'TEXT ·block(SB),NOSPLIT,$64-32\n', 'TEXT ·blockRV64(SB),NOSPLIT,$64-32\n')
-for name in ['sha1block_riscv64.go', 'sha1block_c906_riscv64.s']:
-    shutil.copyfile(crypto / name, out / 'src/crypto/sha1' / name)
-# Keccak-f[1600] for T-Head cores (go-crypto-c906/gen_keccak_c906.py), chosen
-# like the SHA blocks by cpu.RISCV64.HasXTheadBb.
+sha512 = 'crypto/internal/fips140/sha512'
+for pkg, name in [(sha, 'sha256block_riscv64.s'), (sha512, 'sha512block_riscv64.s')]:
+    shutil.copyfile(crypto / name, out / 'src' / pkg / name)
+shutil.copyfile(crypto / 'sha1block_riscv64.s', out / 'src/crypto/sha1/sha1block_riscv64.s')
+# Keccak-f[1600] for the C906 (go-crypto-c906/gen_keccak_c906.py), always.
 sha3 = 'crypto/internal/fips140/sha3'
 materialize(sha3)
 edit(f'{sha3}/sha3_noasm.go', '//go:build (!amd64 && !arm64 && !s390x) || purego\n',
@@ -179,18 +166,24 @@ edit(f'{sha3}/sha3_noasm.go', '//go:build (!amd64 && !arm64 && !s390x) || purego
 for name in ['sha3_riscv64.go', 'keccak_c906_riscv64.s']:
     shutil.copyfile(crypto / name, out / 'src' / sha3 / name)
 vendor_files += [f'{sha3}/sha3_noasm.go', f'{sha3}/sha3_riscv64.go', f'{sha3}/keccak_c906_riscv64.s']
-vendor_files += ['internal/cpu/cpu.go', 'internal/cpu/cpu_riscv64.go', 'internal/cpu/cpu_riscv64_linux.go',
-                 'crypto/internal/fips140deps/cpu/cpu.go', f'{sha}/sha256block_asm.go', f'{sha}/sha256block_riscv64.s',
-                 f'{sha}/sha256block_riscv64.go', f'{sha}/sha256block_c906_riscv64.s',
-                 'crypto/sha1/sha1block_decl.go', 'crypto/sha1/sha1block_riscv64.s',
-                 'crypto/sha1/sha1block_riscv64.go', 'crypto/sha1/sha1block_c906_riscv64.s']
+# AES block functions for the C906 (go-crypto-c906/gen_aes_c906.py), always:
+# CTR, CBC and GCM of the generic code call them a block at a time.
+aes = 'crypto/internal/fips140/aes'
+materialize(aes)
+edit(f'{aes}/aes_noasm.go', '//go:build (!amd64 && !s390x && !ppc64 && !ppc64le && !arm64) || purego\n',
+     '//go:build (!amd64 && !s390x && !ppc64 && !ppc64le && !arm64 && !riscv64) || purego\n')
+for name in ['aes_riscv64.go', 'aes_c906_riscv64.s']:
+    shutil.copyfile(crypto / name, out / 'src' / aes / name)
+vendor_files += [f'{aes}/aes_noasm.go', f'{aes}/aes_riscv64.go', f'{aes}/aes_c906_riscv64.s']
+# GHASH with 8-bit tables for the C906 (go-crypto-c906/gen_ghash_table.py),
+# always: Go's generic GHASH multiplies with integer multiplications.
+edit(f'{aes}/gcm/gcm_noasm.go', '//go:build (!amd64 && !s390x && !ppc64 && !ppc64le && !arm64) || purego\n',
+     '//go:build (!amd64 && !s390x && !ppc64 && !ppc64le && !arm64 && !riscv64) || purego\n')
+for name in ['gcm_riscv64.go', 'ghash_c906_riscv64.s']:
+    shutil.copyfile(crypto / name, out / 'src' / aes / 'gcm' / name)
+vendor_files += [f'{aes}/gcm/gcm_noasm.go', f'{aes}/gcm/gcm_riscv64.go', f'{aes}/gcm/ghash_c906_riscv64.s']
+vendor_files += [f'{sha}/sha256block_riscv64.s', f'{sha512}/sha512block_riscv64.s', 'crypto/sha1/sha1block_riscv64.s']
 text = original.decode()
-# memmove: misaligned 8-byte loads where riscv_hwprobe reports them fast.
-zbb = '\t\triscv64HasZbb = cpu.RISCV64.HasZbb\n'
-require_once(text, zbb)
-text = text.replace(zbb, zbb + '\t\tnanokvmFastMisaligned = cpu.RISCV64.HasFastMisaligned\n'
-                    '\t\tnanokvmVectorMemmove = cpu.RISCV64.HasXTheadVector && nanokvmVectorEnabled()\n'
-                    '\t\tnanokvmVectorMemclr = nanokvmVectorMemmove\n')
 anchor = 'func sysmon() {\n'
 require_once(text, anchor)
 text = text.replace(anchor, anchor + '\tnanokvmSysmonInit()\n')
@@ -212,48 +205,74 @@ text = text[:pos] + '\tnanokvmThreadInit()\n' + text[pos:]
 (out / 'src/runtime/proc.go').write_text(text)
 # A source and destination of different alignment go straight to the 8-byte
 # loops (misaligned loads and stores, as Linux's fast-unaligned usercopy)
-# instead of the byte loops when misaligned access is fast. The test sits out
-# of line, so the co-aligned path is unchanged.
+# instead of the byte loops: misaligned access is fast on the C906, which the
+# NanoKVM kernel states as a platform property. QEMU handles it too.
 # Copies of nanokvmVectorMemmoveMin bytes or more go to the XTheadVector loop
-# (gen_memmove_c906.py) when nanokvmVectorMemmove is set; the test for it
-# costs smaller copies a compare and a branch.
+# (gen_memmove_c906.py), unless the nanokvmqemu build tag leaves
+# const_nanokvmXTheadVector undefined (nanokvm_xtheadvector_riscv64.go);
+# smaller copies pay a compare and a branch.
 edit('runtime/memmove_riscv64.s', '#include "textflag.h"\n', '#include "go_asm.h"\n#include "textflag.h"\n')
 edit('runtime/memmove_riscv64.s', '\tBEQ\tX10, X11, done\n\tBEQZ\tX12, done\n',
      '\tBEQ\tX10, X11, done\n\tBEQZ\tX12, done\n\n'
+     '#ifdef const_nanokvmXTheadVector\n'
      '\t// NanoKVM: large copies with XTheadVector (nanokvm_memmove.go).\n'
      '\tMOV\t$const_nanokvmVectorMemmoveMin, X9\n'
      '\tBLTU\tX12, X9, nanokvm_scalar\n'
-     '\tMOVBU\truntime·nanokvmVectorMemmove(SB), X9\n'
-     '\tBEQZ\tX9, nanokvm_scalar\n'
      '\tJMP\truntime·nanokvmMemmoveVector(SB)\n'
-     'nanokvm_scalar:\n')
+     'nanokvm_scalar:\n'
+     '#endif\n')
 for d in 'fb':
     edit('runtime/memmove_riscv64.s',
          '\t// Check alignment - if alignment differs we have to do one byte at a time.\n'
          f'\tAND\t$7, X10, X5\n\tAND\t$7, X11, X6\n\tBNE\tX5, X6, {d}_loop8_unaligned_check\n',
-         '\t// Check alignment - if alignment differs we have to do one byte at a time,\n'
-         '\t// unless misaligned loads are fast (NanoKVM: nanokvm_memmove.go).\n'
-         f'\tAND\t$7, X10, X5\n\tAND\t$7, X11, X6\n\tBNE\tX5, X6, {d}_misaligned\n')
-    edit('runtime/memmove_riscv64.s',
-         f'\tJMP\t{d}_loop4_check\n\n{d}_loop8_unaligned_check:\n',
-         f'\tJMP\t{d}_loop4_check\n\n'
-         f'{d}_misaligned:\n'
-         '\tMOVBU\truntime·nanokvmFastMisaligned(SB), X7\n'
-         f'\tBNEZ\tX7, {d}_loop_check\n'
-         f'{d}_loop8_unaligned_check:\n')
+         '\t// NanoKVM: if alignment differs, copy misaligned 8-byte words; the\n'
+         '\t// C906 accesses them natively and fast.\n'
+         f'\tAND\t$7, X10, X5\n\tAND\t$7, X11, X6\n\tBNE\tX5, X6, {d}_loop_check\n')
 # Clears of nanokvmVectorMemclrMin bytes or more go to the XTheadVector loop
-# (gen_memclr_c906.py) when nanokvmVectorMemclr is set; smaller clears pay a
+# (gen_memclr_c906.py) under the same build constant; smaller clears pay a
 # compare and a branch.
 edit('runtime/memclr_riscv64.s', '#include "textflag.h"\n', '#include "go_asm.h"\n#include "textflag.h"\n')
 edit('runtime/memclr_riscv64.s', '\t// X10 = ptr\n\t// X11 = n\n\n',
      '\t// X10 = ptr\n\t// X11 = n\n\n'
+     '#ifdef const_nanokvmXTheadVector\n'
      '\t// NanoKVM: large clears with XTheadVector (nanokvm_memclr.go).\n'
      '\tMOV\t$const_nanokvmVectorMemclrMin, X9\n'
      '\tBLTU\tX11, X9, nanokvm_scalar\n'
-     '\tMOVBU\truntime·nanokvmVectorMemclr(SB), X9\n'
-     '\tBEQZ\tX9, nanokvm_scalar\n'
      '\tJMP\truntime·nanokvmMemclrVector(SB)\n'
-     'nanokvm_scalar:\n')
+     'nanokvm_scalar:\n'
+     '#endif\n')
+# memequal (bytes.Equal, string and array comparisons): from
+# nanokvmVectorMemequalMin bytes the XTheadVector loop (gen_memequal_c906.py)
+# under the same build constant; Go's own vector loop needs RVV 1.0. Equal and
+# Compare with source alignments that differ use the 8-byte loops with
+# misaligned words, as memmove above, instead of comparing byte by byte.
+bytealg = 'internal/bytealg'
+materialize(bytealg)
+edit(f'{bytealg}/equal_riscv64.s', '\tMOV\t$32, X23\n\tBLT\tX12, X23, loop4_check\n\n',
+     '\tMOV\t$32, X23\n\tBLT\tX12, X23, loop4_check\n\n'
+     '#ifdef const_nanokvmXTheadVector\n'
+     '\t// NanoKVM: large comparisons with XTheadVector (nanokvm_memequal_riscv64.s).\n'
+     '\tMOV\t$const_nanokvmVectorMemequalMin, X9\n'
+     '\tBLTU\tX12, X9, nanokvm_scalar\n'
+     '\tJMP\truntime·nanokvmMemequalVector(SB)\n'
+     'nanokvm_scalar:\n'
+     '#endif\n\n')
+edit(f'{bytealg}/equal_riscv64.s',
+     '\t// Check alignment - if alignment differs we have to do one byte at a time.\n'
+     '\tAND\t$7, X10, X9\n\tAND\t$7, X11, X19\n\tBNE\tX9, X19, loop4_check\n',
+     '\t// NanoKVM: if alignment differs, compare misaligned 8-byte words; the\n'
+     '\t// C906 accesses them natively and fast.\n'
+     '\tAND\t$7, X10, X9\n\tAND\t$7, X11, X19\n\tBNE\tX9, X19, loop32_check\n')
+edit(f'{bytealg}/compare_riscv64.s',
+     '\t// Check alignment - if alignment differs we have to do one byte at a time.\n'
+     '\tAND\t$7, X10, X7\n\tAND\t$7, X12, X8\n\tBNE\tX7, X8, check8_unaligned\n',
+     '\t// NanoKVM: if alignment differs, compare misaligned 8-byte words; the\n'
+     '\t// C906 accesses them natively and fast.\n'
+     '\tAND\t$7, X10, X7\n\tAND\t$7, X12, X8\n\tBNE\tX7, X8, compare_scalar_aligned\n')
+shutil.copyfile(source / 'bytealg_memequal_riscv64.s', out / 'src' / bytealg / 'nanokvm_memequal_riscv64.s')
+shutil.copyfile(source / 'bytealg_xtheadvector_riscv64.go', out / 'src' / bytealg / 'nanokvm_xtheadvector_riscv64.go')
+vendor_files += [f'{bytealg}/equal_riscv64.s', f'{bytealg}/compare_riscv64.s',
+                 f'{bytealg}/nanokvm_memequal_riscv64.s', f'{bytealg}/nanokvm_xtheadvector_riscv64.go']
 for p in source.glob('nanokvm_*'):
     shutil.copyfile(p, out / 'src/runtime' / p.name)
 manifest = {'source_go': str(base), 'goroot': str(out), 'source_pin': pin,

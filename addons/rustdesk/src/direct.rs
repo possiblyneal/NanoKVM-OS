@@ -2,7 +2,6 @@
 use crate::{
     config::Config,
     identity::RustDeskIdentity,
-    nanokvm::Identity,
     protocol::{rendezvous_message, LocalAddr, NatType, PunchHoleSent, RendezvousMessage},
     rendezvous, server,
 };
@@ -73,13 +72,12 @@ pub(crate) struct Request {
 pub(crate) fn spawn(
     request: Request,
     config: Arc<Config>,
-    app: Arc<Identity>,
     rd: Arc<RustDeskIdentity>,
     mut shutdown: watch::Receiver<bool>,
     limits: server::ClientLimits,
 ) {
     // Acquire before spawning: the cap includes network setup, listeners and authentication.
-    let Some(pending) = limits.try_pending() else {
+    let Some(pending) = limits.try_requested(rendezvous::decode_address(&request.peer).ip()) else {
         return;
     };
     tokio::spawn(async move {
@@ -92,10 +90,8 @@ pub(crate) fn spawn(
         };
         match connection {
             Ok((stream, peer)) => {
-                if let Err(error) = server::serve(
-                    stream, peer, config, app, rd, true, shutdown, limits, pending,
-                )
-                .await
+                if let Err(error) =
+                    server::serve(stream, peer, config, rd, true, shutdown, limits, pending).await
                 {
                     crate::connlog::connection_log!("RustDesk direct TCP ended: {error}")
                 }
@@ -105,13 +101,14 @@ pub(crate) fn spawn(
                 if *shutdown.borrow() {
                     return;
                 }
-                crate::connlog::connection_log!("RustDesk direct TCP unavailable: {error}; using relay");
+                crate::connlog::connection_log!(
+                    "RustDesk direct TCP unavailable: {error}; using relay"
+                );
                 rendezvous::spawn_fallback_relay(
                     request.peer,
                     request.peer_v6,
                     request.relay,
                     config,
-                    app,
                     rd,
                     shutdown,
                     limits,

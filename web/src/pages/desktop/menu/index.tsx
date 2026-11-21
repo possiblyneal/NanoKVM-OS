@@ -3,40 +3,41 @@ import { useAuth } from '@/contexts/auth.ts';
 import { Button, Divider } from 'antd';
 import clsx from 'clsx';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
-import { ChevronDownIcon, ChevronUpIcon, GripVerticalIcon } from 'lucide-react';
+import { ChevronDownIcon, GripVerticalIcon } from 'lucide-react';
 import Draggable, { DraggableData, DraggableEvent } from 'react-draggable';
 import { useTranslation } from 'react-i18next';
 
 import { getRuntimeStatus } from '@/api/picoclaw.ts';
-import { getHardware } from '@/api/vm.ts';
-import { atxFromHardware } from '@/lib/atx.ts';
-import { clampMobileMenuTop, MobileMenuEdge } from '@/lib/mobile-layout.ts';
+import { subscribeLiveStatus } from '@/lib/live-status.ts';
 import { pollWhileVisible } from '@/lib/visible-poll.ts';
-import { atxEnabledAtom } from '@/jotai/atx.ts';
+import { atxEnabledAtom, atxLocalChange } from '@/jotai/atx.ts';
 import { isKeyboardOpenAtom } from '@/jotai/keyboard.ts';
 import { picoclawChatOpenAtom, picoclawRuntimeStatusAtom } from '@/jotai/picoclaw.ts';
 import { isHdmiEnabledAtom } from '@/jotai/screen.ts';
 import {
+  hostLedStatusVisibleAtom,
   keyboardLedStatusVisibleAtom,
   menuCloseSignalAtom,
   menuDisabledItemsAtom
 } from '@/jotai/settings.ts';
 import { useMenuBounds } from '@/hooks/useMenuBounds.ts';
 import { useMenuVisibility } from '@/hooks/useMenuVisibility.ts';
-import { useMobileMenuPlacement } from '@/hooks/useMobileMenuPlacement.ts';
 import { useResponsiveDevice } from '@/hooks/useResponsiveDevice.ts';
 import { useUsbAudio } from '@/hooks/useUsbAudio.ts';
 import { useUsbInput } from '@/hooks/useUsbInput.ts';
 import { MobileMenuItemProvider } from '@/components/menu-item.tsx';
+import { ThemeToggle } from '@/components/theme-toggle.tsx';
 
 import { Control } from '../control.tsx';
+import { HostLedStatus } from '../host-led-status';
 import { KeyboardLedStatus } from '../keyboard-led-status';
 import { AudioMenu } from './audio';
 import { Fullscreen } from './fullscreen';
 import { Keyboard } from './keyboard';
-import { Logout } from './logout';
+import { CtrlAltDel } from './keyboard/ctrl-alt-del.tsx';
 import { Mouse } from './mouse';
 import { Collapse, Expand } from './operations';
+import { OverviewLink } from './overview.tsx';
 import { Power } from './power';
 import { Recorder } from './recorder';
 import { Screen } from './screen';
@@ -46,10 +47,6 @@ import { Wol } from './wol';
 
 // Admin-only items come from one lazily loaded chunk (see admin-items.ts).
 const loadAdminItems = () => import('./admin-items.ts');
-const Capture = lazy(() => loadAdminItems().then((module) => ({ default: module.Capture })));
-const DownloadImage = lazy(() =>
-  loadAdminItems().then((module) => ({ default: module.DownloadImage }))
-);
 const Image = lazy(() => loadAdminItems().then((module) => ({ default: module.Image })));
 const Picoclaw = lazy(() => loadAdminItems().then((module) => ({ default: module.Picoclaw })));
 const Script = lazy(() => loadAdminItems().then((module) => ({ default: module.Script })));
@@ -57,10 +54,10 @@ const ScreenText = lazy(() => loadAdminItems().then((module) => ({ default: modu
 const Terminal = lazy(() => loadAdminItems().then((module) => ({ default: module.Terminal })));
 const UsbMenu = lazy(() => loadAdminItems().then((module) => ({ default: module.UsbMenu })));
 
-// Keeps a lazy toolbar item's 30x30 slot while its chunk loads, so the bar
+// Keeps a lazy toolbar item's slot while its chunk loads, so the bar
 // does not shift. Image renders nothing until the virtual disk state is known,
 // so its placeholder is empty as well.
-const ToolbarSlot = () => <div className="h-[30px] w-[30px]" aria-hidden="true" />;
+const ToolbarSlot = () => <div className="size-9" aria-hidden="true" />;
 function lazyItem(key: string, item: ReactNode, placeholder: ReactNode = <ToolbarSlot />) {
   return (
     <Suspense key={key} fallback={placeholder}>
@@ -69,12 +66,11 @@ function lazyItem(key: string, item: ReactNode, placeholder: ReactNode = <Toolba
   );
 }
 
-const mobileRailToggleButtonClass =
-  'flex! size-[40px]! min-w-[40px]! touch-manipulation items-center! justify-center! !p-0 text-neutral-300 transition-colors hover:!bg-neutral-700/80 hover:!text-white active:!bg-neutral-600/70';
-
 const mobileMenuPopoverClassName = 'nanokvm-mobile-menu-popover';
 
-type MenuVariant = 'desktop' | 'mobile';
+// desktop: the floating bar; bottom and side: a phone's bar, held upright or
+// turned sideways.
+type MenuVariant = 'desktop' | 'bottom' | 'side';
 
 export const Menu = () => {
   const audio = useUsbAudio();
@@ -114,29 +110,24 @@ export const Menu = () => {
   }, [picoclawStatus?.installed, setPicoclawOpen]);
   const captureEnabled = useAtomValue(isHdmiEnabledAtom);
   const isKeyboardOpen = useAtomValue(isKeyboardOpenAtom);
-  const mobileRailRef = useRef<HTMLDivElement | null>(null);
 
   const menuDisabledItems = useAtomValue(menuDisabledItemsAtom);
-  // The power button needs ATX power control on (System > Device).
+  // The power button needs ATX power control on (System > Device). The shared
+  // live status follows a change made in another tab or by another admin, and
+  // a request that failed is simply answered by the next one.
   const [atxEnabled, setAtxEnabled] = useAtom(atxEnabledAtom);
-  useEffect(() => {
-    if (atxEnabled !== null) return;
-    let disposed = false;
-    getHardware()
-      .then((rsp) => {
-        if (!disposed && rsp.code === 0) setAtxEnabled(atxFromHardware(rsp.data));
-      })
-      .catch(() => {
-        /* Without the answer the power button stays hidden. */
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [atxEnabled, setAtxEnabled]);
+  useEffect(
+    () =>
+      subscribeLiveStatus((status, startedAt) => {
+        if (typeof status?.atx === 'boolean' && startedAt >= atxLocalChange.at) {
+          setAtxEnabled(status.atx);
+        }
+      }),
+    [setAtxEnabled]
+  );
   const menuCloseSignal = useAtomValue(menuCloseSignalAtom);
   const isKeyboardLedStatusVisible = useAtomValue(keyboardLedStatusVisibleAtom);
-  const [isMobileRailCollapsed, setIsMobileRailCollapsed] = useState(false);
-  const [mobileRailOffset, setMobileRailOffset] = useState({ x: 0, y: 0 });
+  const isHostLedStatusVisible = useAtomValue(hostLedStatusVisibleAtom);
   const [dismissMenuKey, setDismissMenuKey] = useState(0);
 
   const {
@@ -148,12 +139,21 @@ export const Menu = () => {
     setIsMenuExpanded
   } = useMenuVisibility();
 
-  const menuBounds = useMenuBounds(nodeRef, isMenuExpanded);
   const responsiveDevice = useResponsiveDevice();
-  const isMobileRailActive = responsiveDevice.isMobilePortrait;
+  const phoneBar: MenuVariant | null = responsiveDevice.isMobilePortrait
+    ? 'bottom'
+    : responsiveDevice.isPhoneLandscape
+      ? 'side'
+      : null;
+  const isMobileRailActive = phoneBar !== null;
+  const menuBounds = useMenuBounds(nodeRef, isMenuExpanded, !isMobileRailActive);
   const isTouchLandscapeMenu =
     responsiveDevice.isTouchLikeDevice && responsiveDevice.isLandscapeViewport;
-  const { placement, updatePlacement } = useMobileMenuPlacement();
+  const showKeyboardLedStatus = usbInput.keyboard && isKeyboardLedStatusVisible;
+  // The host's LEDs come from the ATX header, as the power button does.
+  const showHostLedStatus = atxEnabled && isHostLedStatusVisible;
+  // The two panels sit on opposite sides of the menu, at the ends of the
+  // phone's bottom bar too.
 
   useEffect(() => {
     if (menuCloseSignal > 0) {
@@ -161,17 +161,9 @@ export const Menu = () => {
     }
   }, [menuCloseSignal, setIsMenuExpanded]);
 
-  useEffect(() => {
-    if (!isMenuExpanded) setIsMobileRailCollapsed(true);
-  }, [isMenuExpanded]);
-
   function onDragStop(_e: DraggableEvent, data: DraggableData) {
     if (data.x === 0 && data.y === 0) return;
     handleMoved();
-  }
-
-  function onMobileDrag(_e: DraggableEvent, data: DraggableData) {
-    setMobileRailOffset({ x: data.x, y: data.y });
   }
 
   const dismissMenus = useCallback(() => {
@@ -186,28 +178,16 @@ export const Menu = () => {
     dismissMenus();
   }
 
-  function onMobileDragStop(_e: DraggableEvent, data: DraggableData) {
-    setMobileRailOffset({ x: 0, y: 0 });
-    if (data.x === 0 && data.y === 0) return;
-
-    const railRect = mobileRailRef.current?.getBoundingClientRect();
-    const railWidth = railRect?.width ?? 0;
-    const railHeight = railRect?.height ?? 480;
-    const left =
-      railRect?.left ?? (placement.edge === 'left' ? 0 : window.innerWidth - railWidth) + data.x;
-    const top = railRect?.top ?? placement.top + data.y;
-    const edge: MobileMenuEdge = left + railWidth / 2 < window.innerWidth / 2 ? 'left' : 'right';
-
-    updatePlacement(edge, clampMobileMenuTop(top, window.innerHeight, railHeight));
-  }
-
   function isEnabled(item: string) {
     return !menuDisabledItems.includes(item);
   }
 
   function renderDivider(variant: MenuVariant, key: string) {
-    if (variant === 'mobile') {
-      return <div key={key} className="my-1 h-px w-7 shrink-0 bg-neutral-600/60" />;
+    if (variant === 'bottom') {
+      return <div key={key} className="mx-1 h-6 w-px shrink-0 bg-neutral-600/60" />;
+    }
+    if (variant === 'side') {
+      return <div key={key} className="my-1 h-px w-6 shrink-0 bg-neutral-600/60" />;
     }
 
     return <Divider key={key} type="vertical" />;
@@ -215,14 +195,12 @@ export const Menu = () => {
 
   function renderMenuItems(variant: MenuVariant): ReactNode[] {
     const items: ReactNode[] = [];
-    const tooltipPlacement =
-      variant === 'mobile' ? (placement.edge === 'right' ? 'left' : 'right') : 'bottom';
+    const tooltipPlacement = variant === 'bottom' ? 'top' : variant === 'side' ? 'left' : 'bottom';
 
     // Only join non-empty groups, including when appearance settings hide tools.
     const groups: ReactNode[][] = [
       [
         <Screen key="screen" />,
-        ...(isAdmin ? [lazyItem('capture', <Capture />)] : []),
         <Screenshot key="screenshot" />,
         ...(isAdmin ? [lazyItem('screen-text', <ScreenText />, null)] : []),
         ...(isEnabled('recorder') ? [<Recorder key="recorder" />] : [])
@@ -233,6 +211,9 @@ export const Menu = () => {
         ...(captureEnabled && usbInput.keyboard && isEnabled('keyboard')
           ? [<Keyboard key="keyboard" quickAccess={responsiveDevice.isTouchLikeDevice} />]
           : []),
+        ...(captureEnabled && usbInput.keyboard && isEnabled('ctrl-alt-del')
+          ? [<CtrlAltDel key="ctrl-alt-del" />]
+          : []),
         ...(captureEnabled && (usbInput.absolute || usbInput.relative) && isEnabled('mouse')
           ? [<Mouse key="mouse" />]
           : [])
@@ -242,8 +223,7 @@ export const Menu = () => {
             lazyItem('usb', <UsbMenu />),
             ...(isEnabled('image')
               ? [lazyItem('image', <Image tooltipPlacement={tooltipPlacement} />, null)]
-              : []),
-            ...(isEnabled('download') ? [lazyItem('download', <DownloadImage />)] : [])
+              : [])
           ]
         : [],
       isAdmin
@@ -258,15 +238,13 @@ export const Menu = () => {
       [
         ...(isEnabled('wol') ? [<Wol key="wol" />] : []),
         ...(atxEnabled && isEnabled('power')
-          ? [<Power key="power" vertical={variant === 'mobile'} />]
+          ? [<Power key="power" vertical={variant === 'side'} />]
           : [])
       ],
-      variant === 'mobile'
+      variant !== 'desktop'
         ? [
-            <Settings key="settings" tooltipPlacement={tooltipPlacement} />,
-            ...(isEnabled('logout')
-              ? [<Logout key="logout" tooltipPlacement={tooltipPlacement} />]
-              : [])
+            ...(isEnabled('theme') ? [<ThemeToggle key="theme" bar />] : []),
+            <Settings key="settings" tooltipPlacement={tooltipPlacement} />
           ]
         : []
     ];
@@ -283,86 +261,67 @@ export const Menu = () => {
     return items;
   }
 
-  if (isMobileRailActive) {
-    const sideClass = placement.edge === 'left' ? 'left-2' : 'right-2';
-
+  if (phoneBar) {
+    // A phone: the bar along the bottom edge when held upright, along the
+    // right edge when turned sideways, where the picture is limited by the
+    // height and loses nothing to it. The console page leaves the bar its room.
+    // Its menus open towards the screen.
+    const side = phoneBar === 'side';
     return (
-      <Draggable
-        key="mobile-menu"
-        nodeRef={mobileRailRef}
-        handle="strong"
-        position={mobileRailOffset}
-        onStart={onMenuDragStart}
-        onDrag={onMobileDrag}
-        onStop={onMobileDragStop}
+      <div
+        className={clsx(
+          'fixed transition-opacity duration-300',
+          side ? 'inset-y-0 right-0' : 'inset-x-0 bottom-0'
+        )}
+        style={{
+          zIndex: isKeyboardOpen ? 998 : 1000,
+          opacity: isInitialized ? 1 : 0,
+          ...(side
+            ? { paddingRight: 'env(safe-area-inset-right)' }
+            : { paddingBottom: 'env(safe-area-inset-bottom)' })
+        }}
       >
-        <div
-          ref={mobileRailRef}
-          className={clsx(
-            'fixed z-1000 transition-opacity duration-300',
-            sideClass,
-            isInitialized ? 'opacity-100' : 'opacity-0'
-          )}
-          style={{ top: placement.top, zIndex: isKeyboardOpen ? 998 : 1000 }}
+        <MobileMenuItemProvider
+          mobilePlacement={side ? 'right' : 'bottom'}
+          mobilePopoverClassName={mobileMenuPopoverClassName}
+          dismissMenuKey={dismissMenuKey}
+          onRequestMobileMenuDismiss={dismissMenus}
         >
-          <MobileMenuItemProvider
-            mobilePlacement={placement.edge}
-            mobilePopoverClassName={mobileMenuPopoverClassName}
-            dismissMenuKey={dismissMenuKey}
-            onRequestMobileMenuDismiss={dismissMenus}
+          <div
+            className={clsx(
+              'nanokvm-touch-toolbar nanokvm-phone-bar border-line box-border flex gap-1 bg-neutral-900',
+              side
+                ? 'h-full w-14 flex-col items-center border-l py-1.5'
+                : 'h-14 items-center border-t px-1.5'
+            )}
           >
-            <div className="nanokvm-touch-toolbar w-[48px] overflow-hidden rounded-[24px] bg-neutral-800/90 shadow-lg shadow-black/30 outline outline-1 outline-neutral-700/80 backdrop-blur">
-              {/* Collapsing hides the items but keeps them mounted: a browser ISO,
-                  a recording or an open dialog belongs to its item. */}
-              {isMobileRailCollapsed && (
-                <div className="flex flex-col items-center p-1">
-                  <strong>
-                    <div className="flex size-[40px] cursor-move items-center justify-center rounded-full text-neutral-500 select-none">
-                      <GripVerticalIcon size={18} />
-                    </div>
-                  </strong>
-                  <Button
-                    type="text"
-                    className={clsx(mobileRailToggleButtonClass, 'rounded-full')}
-                    onClick={() => setIsMobileRailCollapsed(false)}
-                    aria-label={t('menu.expand')}
-                    icon={<ChevronDownIcon size={18} aria-hidden="true" />}
-                  />
-                </div>
-              )}
-              <div
-                className={clsx(
-                  'max-h-[calc(100dvh-96px)] [scrollbar-width:none] flex-col items-center overflow-x-hidden overflow-y-auto p-1 *:shrink-0 [&::-webkit-scrollbar]:hidden',
-                  isMobileRailCollapsed ? 'hidden' : 'flex'
-                )}
-                style={{ maxHeight: `calc(100dvh - ${placement.top}px - 16px)` }}
-              >
-                <strong>
-                  <div className="flex size-[40px] cursor-move items-center justify-center rounded text-neutral-500 select-none">
-                    <GripVerticalIcon size={18} />
-                  </div>
-                </strong>
-
-                {renderDivider('mobile', 'divider-handle')}
-                {renderMenuItems('mobile')}
-
-                {isEnabled('collapse') && (
-                  <>
-                    {renderDivider('mobile', 'divider-collapse')}
-                    <Button
-                      type="text"
-                      className={clsx(mobileRailToggleButtonClass, 'shrink-0 rounded')}
-                      onClick={() => setIsMobileRailCollapsed(true)}
-                      aria-label={t('menu.collapse')}
-                      icon={<ChevronUpIcon size={18} aria-hidden="true" />}
-                    />
-                  </>
-                )}
+            {showKeyboardLedStatus && (
+              <div className={clsx('flex shrink-0', side ? 'h-12' : 'h-9')}>
+                <KeyboardLedStatus />
               </div>
+            )}
+            <OverviewLink />
+            {/* The items scroll when they do not fit; all of them stay mounted:
+                a browser ISO, a recording or an open dialog belongs to its
+                item. */}
+            <div
+              className={clsx(
+                'flex flex-1 [scrollbar-width:none] items-center overscroll-contain *:shrink-0 [&::-webkit-scrollbar]:hidden',
+                side
+                  ? 'min-h-0 flex-col overflow-x-hidden overflow-y-auto'
+                  : 'min-w-0 overflow-x-auto overflow-y-hidden'
+              )}
+            >
+              {renderMenuItems(phoneBar)}
             </div>
-          </MobileMenuItemProvider>
-        </div>
-      </Draggable>
+            {showHostLedStatus && (
+              <div className={clsx('flex shrink-0', side ? 'h-12' : 'h-9')}>
+                <HostLedStatus />
+              </div>
+            )}
+          </div>
+        </MobileMenuItemProvider>
+      </div>
     );
   }
 
@@ -377,7 +336,7 @@ export const Menu = () => {
       <div
         ref={nodeRef}
         className={clsx(
-          'pointer-events-none fixed top-[10px] left-1/2 z-1000 w-max transition-opacity duration-300',
+          'pointer-events-none fixed top-[10px] left-1/2 z-1000 w-max max-w-[calc(100vw-16px)] transition-opacity duration-300',
           isInitialized ? 'opacity-100' : 'opacity-0'
         )}
       >
@@ -396,7 +355,7 @@ export const Menu = () => {
                 'absolute z-10 !p-0 transition-all duration-300',
                 isTouchLandscapeMenu
                   ? 'top-0 left-1/2 flex! !h-10 !w-16 !min-w-16 -translate-x-1/2 items-center! justify-center! !rounded-b !bg-neutral-800/80 text-neutral-300 shadow-lg shadow-black/30 backdrop-blur'
-                  : 'top-[-10px] left-0 h-[46px]! w-full! bg-transparent!',
+                  : 'top-[-10px] left-0 h-[54px]! w-full! bg-transparent!',
                 isMenuHidden ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0'
               )}
               onPointerDown={(event) => {
@@ -421,32 +380,35 @@ export const Menu = () => {
           )}
 
           <div className="sticky top-[10px] flex w-full justify-center">
+            {isMenuExpanded && showKeyboardLedStatus && !isTouchLandscapeMenu && (
+              <div
+                className={clsx(
+                  'mr-1.5 flex h-11 shrink-0 transition-all duration-300',
+                  isMenuHidden ? 'pointer-events-none opacity-0' : 'pointer-events-auto opacity-100'
+                )}
+              >
+                <KeyboardLedStatus />
+              </div>
+            )}
             <div
               className={clsx(
-                'pointer-events-auto max-w-[calc(100vw-16px)] items-center rounded bg-neutral-800/80 pr-2 pl-1 transition-all duration-300',
-                isTouchLandscapeMenu ? 'nanokvm-touch-toolbar h-[44px]' : 'h-[36px]',
+                'nanokvm-console-bar border-line pointer-events-auto min-w-0 items-center rounded-[14px] border bg-neutral-900/90 pr-1.5 pl-1 shadow-lg shadow-black/30 backdrop-blur transition-all duration-300',
+                isTouchLandscapeMenu ? 'nanokvm-touch-toolbar h-[44px]' : 'h-11',
                 isMenuExpanded ? 'flex' : 'hidden',
                 isMenuHidden ? 'translate-y-[-110%] opacity-80' : 'translate-y-0 opacity-100'
               )}
             >
-              {isMenuExpanded &&
-                usbInput.keyboard &&
-                isKeyboardLedStatusVisible &&
-                !isTouchLandscapeMenu && (
-                  <div
-                    className={clsx(
-                      'absolute inset-y-0 right-full mr-1 transition-all duration-300',
-                      isMenuHidden ? 'pointer-events-none opacity-0' : 'opacity-100'
-                    )}
-                  >
-                    <KeyboardLedStatus />
-                  </div>
-                )}
               <strong className="shrink-0">
-                <div className="flex h-[30px] cursor-move items-center justify-center pl-1 text-neutral-500 select-none">
+                <div className="flex h-9 cursor-move items-center justify-center px-1 text-neutral-500 select-none">
                   <GripVerticalIcon size={18} />
                 </div>
               </strong>
+              {isMenuExpanded && showKeyboardLedStatus && isTouchLandscapeMenu && (
+                <div className="ml-1 flex h-7 shrink-0">
+                  <KeyboardLedStatus />
+                </div>
+              )}
+              <OverviewLink />
               <Divider type="vertical" className="shrink-0" />
 
               <MobileMenuItemProvider dismissMenuKey={dismissMenuKey}>
@@ -454,12 +416,31 @@ export const Menu = () => {
                   {renderMenuItems('desktop')}
                 </div>
                 <Divider type="vertical" className="shrink-0" />
+                {isEnabled('theme') && <ThemeToggle bar />}
                 <Settings />
-                {isEnabled('logout') && <Logout />}
                 {isEnabled('fullscreen') && <Fullscreen />}
                 {isEnabled('collapse') && <Collapse toggleMenu={setIsMenuExpanded} />}
               </MobileMenuItemProvider>
+              {/* The touch toolbar takes the whole width: the panels are inside it, at its ends. */}
+              {isMenuExpanded && showHostLedStatus && isTouchLandscapeMenu && (
+                <>
+                  <Divider type="vertical" className="shrink-0" />
+                  <div className="flex h-7 shrink-0">
+                    <HostLedStatus />
+                  </div>
+                </>
+              )}
             </div>
+            {isMenuExpanded && showHostLedStatus && !isTouchLandscapeMenu && (
+              <div
+                className={clsx(
+                  'ml-1.5 flex h-11 shrink-0 transition-all duration-300',
+                  isMenuHidden ? 'pointer-events-none opacity-0' : 'pointer-events-auto opacity-100'
+                )}
+              >
+                <HostLedStatus />
+              </div>
+            )}
           </div>
 
           {!isMenuExpanded && (

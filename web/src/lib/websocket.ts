@@ -1,4 +1,5 @@
 import { notifyAuthExpired } from '@/lib/auth-events.ts';
+import { ConnectRecovery, RECOVERY_RECONNECT_DELAY } from '@/lib/connect-recovery.ts';
 import { HoldKeepalive, KEEPALIVE_MESSAGE } from '@/lib/hold-keepalive.ts';
 import { getBaseUrl } from '@/lib/service.ts';
 
@@ -14,13 +15,18 @@ export enum MessageEvent {
   Heartbeat = 0,
   Keyboard = 1,
   Mouse = 2,
-  Control = 3
+  Control = 3,
+  // [4] is the hold keepalive (hold-keepalive.ts).
+  // [5, 1] the page is visible, [5, 0] hidden: crash-screen notifications go
+  // out while nobody is looking.
+  Visibility = 5
 }
 
 interface WsClientOptions {
   url?: string;
   heartbeatInterval?: number;
   reconnectInterval?: number;
+  recoveryReconnectInterval?: number;
   maxReconnectAttempts?: number;
 }
 
@@ -28,6 +34,8 @@ const DEFAULT_OPTIONS: Required<WsClientOptions> = {
   url: `${getBaseUrl('ws')}/api/ws`,
   heartbeatInterval: 10 * 1000,
   reconnectInterval: 3 * 1000,
+  // Retries soon after a lost connection: see ConnectRecovery.
+  recoveryReconnectInterval: RECOVERY_RECONNECT_DELAY,
   maxReconnectAttempts: Number.POSITIVE_INFINITY
 };
 
@@ -36,7 +44,12 @@ export class WsClient {
   private instance: WebSocket | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly recovery = new ConnectRecovery();
+  private openedAt: number | null = null;
+  private createdAt = 0;
   private reconnectAttempts = 0;
+  private reconnectingSince = 0;
   private shouldReconnect = true;
   private captureInputEnabled = false;
   private controlEnabled = false;
@@ -84,6 +97,7 @@ export class WsClient {
     // afresh: the first goes at once, whatever happened in the background.
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', () => {
+        this.sendVisibility();
         if (document.visibilityState !== 'visible') return;
         this.reconnectAttempts = 0;
         this.retryAtOnce = true;
@@ -93,6 +107,11 @@ export class WsClient {
   }
 
   private retryAtOnce = true;
+
+  private sendVisibility(): void {
+    if (this.instance?.readyState !== WebSocket.OPEN) return;
+    this.instance.send(new Uint8Array([MessageEvent.Visibility, WsClient.pageVisible() ? 1 : 0]));
+  }
 
   private static pageVisible(): boolean {
     return typeof document === 'undefined' || document.visibilityState === 'visible';
@@ -238,7 +257,16 @@ export class WsClient {
     previous?.close();
     const socket = new WebSocket(this.options.url);
     this.instance = socket;
+    this.openedAt = null;
+    this.createdAt = Date.now();
     socket.binaryType = 'arraybuffer';
+    const timeout = this.recovery.connectTimeout(this.createdAt);
+    if (timeout !== null) {
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (socket.readyState === WebSocket.CONNECTING) socket.close();
+      }, timeout);
+    }
 
     // A late callback from a replaced connection must not affect the new one.
     socket.onopen = () => {
@@ -256,16 +284,22 @@ export class WsClient {
   }
 
   private handleOpen(): void {
+    this.openedAt = Date.now();
+    this.clearConnectTimer();
+    this.recovery.opened(this.openedAt - this.createdAt);
     this.reconnectAttempts = 0;
     this.lastHeartbeatAt = Date.now();
     this.missedHeartbeats = 0;
     this.heartbeatAcknowledged = false;
     this.send(new Uint8Array([KEEPALIVE_MESSAGE]));
+    this.sendVisibility();
     this.updateConnectionStatus('connected');
     this.startHeartbeat();
   }
 
   private handleClose(event: CloseEvent): void {
+    this.clearConnectTimer();
+    if (this.openedAt !== null) this.recovery.lost(Date.now());
     this.stopHeartbeat();
     this.inputReports.clear();
     this.setControlEnabled(false);
@@ -313,16 +347,18 @@ export class WsClient {
     this.heartbeatTimer = setInterval(() => {
       const now = Date.now();
       // A suspended page did not send its scheduled probes. Give the open
-      // socket fresh heartbeat windows on return instead of closing it for
-      // time spent with paused or throttled browser timers.
+      // socket one fresh heartbeat window on return instead of closing it for
+      // time spent with paused or throttled browser timers; a socket that
+      // died meanwhile (a new network after sleep) never reports a close.
       if (now - this.lastHeartbeatAt >= 3 * this.options.heartbeatInterval) {
-        this.missedHeartbeats = 0;
+        this.missedHeartbeats = 1;
       }
       this.lastHeartbeatAt = now;
       // Count unanswered windows that actually ran. Older servers do not
       // acknowledge heartbeats, so keep their existing behavior.
       if (this.heartbeatAcknowledged && ++this.missedHeartbeats >= 3) {
         this.updateConnectionStatus('reconnecting');
+        this.recovery.lost(now);
         const previous = this.instance;
         this.instance = null;
         previous?.close();
@@ -355,21 +391,33 @@ export class WsClient {
     }
 
     this.reconnectAttempts++;
-    this.updateConnectionStatus(this.reconnectAttempts >= 3 ? 'disconnected' : 'reconnecting');
+    // Disconnected at the first retry 6 s or more after the loss, whatever the retry delays: the
+    // stock backoff showed it once the second retry failed, about 3 s when retries
+    // fail at once and much later while they hang in SYN backoff.
+    const now = Date.now();
+    if (this.reconnectAttempts === 1) this.reconnectingSince = now;
+    this.updateConnectionStatus(
+      now - this.reconnectingSince >= 2 * this.options.reconnectInterval
+        ? 'disconnected'
+        : 'reconnecting'
+    );
     console.log(`[WebSocket] Reconnecting... (attempt ${this.reconnectAttempts})`);
 
     // The first retry of a visible page, and the first after it comes back,
     // goes at once: a lost connection is usually back within a handshake.
-    // A hidden page keeps the backoff.
-    const atOnce = WsClient.pageVisible() && (this.reconnectAttempts === 1 || this.retryAtOnce);
+    // Later retries soon after a lost connection come soon too (see
+    // ConnectRecovery). A hidden page keeps the backoff.
+    const visible = WsClient.pageVisible();
+    const atOnce = visible && (this.reconnectAttempts === 1 || this.retryAtOnce);
     this.retryAtOnce = false;
-    this.reconnectTimer = setTimeout(
-      () => {
-        this.reconnectTimer = null;
-        this.createConnection();
-      },
-      atOnce ? 0 : this.options.reconnectInterval
-    );
+    let delay = this.options.reconnectInterval;
+    if (atOnce) delay = 0;
+    else if (visible && this.recovery.recovering(Date.now()))
+      delay = this.options.recoveryReconnectInterval;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.createConnection();
+    }, delay);
   }
 
   private cleanup(): void {
@@ -378,6 +426,15 @@ export class WsClient {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+
+    this.clearConnectTimer();
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
     }
   }
 }

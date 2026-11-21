@@ -1,6 +1,22 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
+// The address of a link the chat may follow: an absolute http(s) URL of
+// another host. Text on the host's screen can steer the model, so a link
+// into this device's own interface (a page, an API route) is shown as text.
+function externalHref(href: string | undefined) {
+  if (!href) return undefined;
+  try {
+    const url = new URL(href, window.location.href);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined;
+    if (url.host === window.location.host || url.hostname === window.location.hostname)
+      return undefined;
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
 type MarkdownContentProps = {
   content?: string;
   className?: string;
@@ -25,16 +41,21 @@ export const MarkdownContent = ({ content, className }: MarkdownContentProps) =>
               {children}
             </p>
           ),
-          a: ({ children, href }) => (
-            <a
-              className="text-sky-300 underline decoration-sky-400/40 underline-offset-2 hover:text-sky-200"
-              href={href}
-              rel="noreferrer"
-              target="_blank"
-            >
-              {children}
-            </a>
-          ),
+          a: ({ children, href }) => {
+            const target = externalHref(href);
+            return target ? (
+              <a
+                className="text-sky-300 underline decoration-sky-400/40 underline-offset-2 hover:text-sky-200"
+                href={target}
+                rel="noreferrer noopener"
+                target="_blank"
+              >
+                {children}
+              </a>
+            ) : (
+              <span className="text-sky-300">{children}</span>
+            );
+          },
           ul: ({ children }) => <ul className="my-2 list-disc pl-5">{children}</ul>,
           ol: ({ children }) => <ol className="my-2 list-decimal pl-5">{children}</ol>,
           li: ({ children }) => <li className="my-1 leading-6 wrap-break-word">{children}</li>,
@@ -46,14 +67,14 @@ export const MarkdownContent = ({ content, className }: MarkdownContentProps) =>
           ),
           h3: ({ children }) => <h3 className="mt-2 text-sm font-medium first:mt-0">{children}</h3>,
           blockquote: ({ children }) => (
-            <blockquote className="my-2 border-l-2 border-white/15 pl-3 text-neutral-300">
+            <blockquote className="border-tint/15 my-2 border-l-2 pl-3 text-neutral-300">
               {children}
             </blockquote>
           ),
           code: ({ children, className: codeClassName, ...props }: any) =>
             !String(codeClassName || '').includes('language-') ? (
               <code
-                className="rounded bg-black/25 px-1.5 py-0.5 font-mono text-[0.92em]"
+                className="bg-shade/25 rounded px-1.5 py-0.5 font-mono text-[0.92em]"
                 {...props}
               >
                 {children}
@@ -64,7 +85,7 @@ export const MarkdownContent = ({ content, className }: MarkdownContentProps) =>
               </code>
             ),
           pre: ({ children }) => (
-            <pre className="my-2 overflow-x-auto rounded-xl bg-black/30 px-3 py-2 text-xs leading-6 text-neutral-100">
+            <pre className="bg-shade/30 my-2 overflow-x-auto rounded-xl px-3 py-2 text-xs leading-6 text-neutral-100">
               {children}
             </pre>
           ),
@@ -74,10 +95,10 @@ export const MarkdownContent = ({ content, className }: MarkdownContentProps) =>
             </div>
           ),
           th: ({ children }) => (
-            <th className="border-b border-white/10 px-2 py-1 font-semibold">{children}</th>
+            <th className="border-tint/10 border-b px-2 py-1 font-semibold">{children}</th>
           ),
           td: ({ children }) => (
-            <td className="border-b border-white/5 px-2 py-1 align-top">{children}</td>
+            <td className="border-tint/5 border-b px-2 py-1 align-top">{children}</td>
           )
         }}
       >

@@ -1,7 +1,9 @@
 // Package redfish serves the part of DMTF Redfish that power management
 // tools use (fence_redfish, Ansible's community.general.redfish_*, Metal3):
 // the service root, one computer system with its power state and reset
-// action, its chassis and manager, and login sessions.
+// action, its chassis and manager, and login sessions; and, when the
+// settings allow it, the manager's virtual media (media.go); and the host's
+// sensors while its agent reports them (sensors.go).
 package redfish
 
 import (
@@ -62,8 +64,9 @@ type session struct {
 }
 
 type failures struct {
-	count int
-	since time.Time
+	count    int
+	since    time.Time
+	reported bool // the lockout went to OnLockout
 }
 
 // Handler is the Redfish service.
@@ -73,15 +76,32 @@ type Handler struct {
 	power              Power
 	now                func() time.Time
 
+	// OnLockout and OnLogin, when set, hear of a client locked out after
+	// failures failed logins and of a login, for the security events.
+	// OnLogin hears of each client once while it keeps logging in.
+	OnLockout func(addr string, failures int, lock time.Duration)
+	OnLogin   func(user, addr string)
+
+	// Media, when set, is the virtual drive: the manager then has a
+	// VirtualMedia collection with its one member.
+	Media Media
+
+	// Sensors, when set, are the host's sensors as its agent reports them:
+	// the chassis then has Thermal, Power and Sensors while they are on.
+	Sensors Sensors
+
 	mu       sync.Mutex
 	sessions map[string]*session // by token
 	failed   map[string]*failures
+	// loggedIn are the clients OnLogin heard of; Basic auth logs in on
+	// every request.
+	loggedIn map[string]bool
 }
 
 func New(username, password string, info Info, power Power) *Handler {
 	return &Handler{
 		username: username, password: password, info: info, power: power, now: time.Now,
-		sessions: map[string]*session{}, failed: map[string]*failures{},
+		sessions: map[string]*session{}, failed: map[string]*failures{}, loggedIn: map[string]bool{},
 	}
 }
 
@@ -153,9 +173,8 @@ func (h *Handler) beginLogin(addr string) *failures {
 	return f
 }
 
-func (h *Handler) loginSucceeded(addr string, reservation *failures) {
+func (h *Handler) loginSucceeded(user, addr string, reservation *failures) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	// A delayed success must not refund a newer window or a replacement
 	// record after eviction. Only return the attempt that we reserved.
 	if f := h.failed[addr]; f != nil && f == reservation {
@@ -163,6 +182,31 @@ func (h *Handler) loginSucceeded(addr string, reservation *failures) {
 		if f.count--; f.count <= 0 {
 			delete(h.failed, addr)
 		}
+	}
+	first := !h.loggedIn[addr]
+	if first {
+		if len(h.loggedIn) >= maxTracked {
+			clear(h.loggedIn)
+		}
+		h.loggedIn[addr] = true
+	}
+	h.mu.Unlock()
+	if first && h.OnLogin != nil {
+		h.OnLogin(user, addr)
+	}
+}
+
+// loginFailed tells OnLockout once when a failed login locks addr out.
+func (h *Handler) loginFailed(addr string, reservation *failures) {
+	h.mu.Lock()
+	f := h.failed[addr]
+	lockout := f != nil && f == reservation && f.count >= maxFailures && !f.reported
+	if lockout {
+		f.reported = true
+	}
+	h.mu.Unlock()
+	if lockout && h.OnLockout != nil {
+		h.OnLockout(addr, maxFailures, failWindow)
 	}
 }
 
@@ -234,9 +278,10 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) bool {
 			return false
 		}
 		if h.credentialsMatch(user, password) {
-			h.loginSucceeded(addr, reservation)
+			h.loginSucceeded(user, addr, reservation)
 			return true
 		}
+		h.loginFailed(addr, reservation)
 	}
 	w.Header().Set("WWW-Authenticate", `Basic realm="NanoKVM BMC"`)
 	writeError(w, http.StatusUnauthorized, "NoValidSession", "Authentication is required.")
@@ -307,12 +352,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	case path == chassisPath:
 		h.get(w, r, func() any { return h.chassis(r.Context()) })
+	case h.sensorsOn() && (path == thermalPath || path == powerPath || path == sensorsPath || strings.HasPrefix(path, sensorsPath+"/")):
+		h.sensors(w, r, path)
 	case path == root+"/Managers":
 		h.get(w, r, func() any {
 			return collection(root+"/Managers", "#ManagerCollection.ManagerCollection", "Manager Collection", managerPath)
 		})
 	case path == managerPath:
 		h.get(w, r, h.manager)
+	case h.Media != nil && mediaIn(path):
+		base, _ := mediaBase(path)
+		h.media(w, r, base, path)
 	case path == root+"/SessionService":
 		h.get(w, r, h.sessionService)
 	case path == sessionsPath:
@@ -403,6 +453,9 @@ func (h *Handler) system(ctx context.Context) any {
 		}},
 		"Links": object{"Chassis": []object{link(chassisPath)}, "ManagedBy": []object{link(managerPath)}},
 	}
+	if h.Media != nil {
+		system["VirtualMedia"] = link(systemPath + mediaSuffix)
+	}
 	// Without a power LED the state is not known; Redfish has no "unknown"
 	// value, so the property is left out.
 	if on, known, err := h.power.Status(ctx); err == nil && known {
@@ -427,11 +480,14 @@ func (h *Handler) chassis(ctx context.Context) any {
 	if on, known, err := h.power.Status(ctx); err == nil && known {
 		chassis["PowerState"] = powerState(on)
 	}
+	if h.sensorsOn() {
+		chassis["Thermal"], chassis["Power"], chassis["Sensors"] = link(thermalPath), link(powerPath), link(sensorsPath)
+	}
 	return chassis
 }
 
 func (h *Handler) manager() any {
-	return object{
+	manager := object{
 		"@odata.id":       managerPath,
 		"@odata.type":     "#Manager.v1_18_0.Manager",
 		"Id":              "1",
@@ -446,6 +502,10 @@ func (h *Handler) manager() any {
 			"ManagerForChassis": []object{link(chassisPath)},
 		},
 	}
+	if h.Media != nil {
+		manager["VirtualMedia"] = link(managerPath + mediaSuffix)
+	}
+	return manager
 }
 
 func (h *Handler) reset(w http.ResponseWriter, r *http.Request) {
@@ -541,10 +601,11 @@ func (h *Handler) createSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.credentialsMatch(body.UserName, body.Password) {
+		h.loginFailed(addr, reservation)
 		writeError(w, http.StatusUnauthorized, "NoValidSession", "Invalid user name or password.")
 		return
 	}
-	h.loginSucceeded(addr, reservation)
+	h.loginSucceeded(body.UserName, addr, reservation)
 	s := &session{id: randomHex(8), token: randomHex(24), lastUsed: h.now()}
 	h.mu.Lock()
 	for token, old := range h.sessions {

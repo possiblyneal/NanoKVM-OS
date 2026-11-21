@@ -15,6 +15,10 @@ import (
 // Never rewrite mirrors, tagged overlays or unrelated Alpine repositories.
 var channelRepository = regexp.MustCompile(`^https://dormancygrace\.github\.io/NanoKVM-OS/(beta/)?alpine/(v[0-9]+\.[0-9]+)/riscv64(?:/Packages\.adb)?/?$`)
 
+// updateLock is Lock, which the channel tests replace: Lock needs the
+// device's update state directory.
+var updateLock = Lock
+
 type ChannelStatus struct {
 	Channel           string `json:"channel"`
 	Available         bool   `json:"available"`
@@ -115,7 +119,7 @@ func SetChannel(channel string) error {
 	if err = saveAPKStatus(APKStatus{State: "idle"}); err != nil {
 		return err
 	}
-	return writeAtomic(repositoriesPath, []byte(strings.Join(lines, "\n")), 0644)
+	return writeRepositories([]byte(strings.Join(lines, "\n")))
 }
 
 // Keep in step with scripts/package-versions.py. Add-ons are independent and
@@ -162,6 +166,14 @@ func stablePackageTargets(output string) ([]string, error) {
 	var targets []string
 	for _, name := range corePackages {
 		if found[name] == "" {
+			if name == "nanokvm-app" && found["nanokvm-release"] != "" {
+				// New releases provide this compatibility name themselves.
+				// Keep an exact constraint: the mandatory APK simulation must
+				// verify that the stable release really provides this version.
+				// Omitting it could retain a beta's concrete compatibility APK.
+				targets = append(targets, name+"="+found["nanokvm-release"])
+				continue
+			}
 			if legacy := apkrollback.LegacyTargets(name); legacy != nil {
 				targets = append(targets, legacy...)
 				continue

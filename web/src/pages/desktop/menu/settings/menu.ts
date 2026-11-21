@@ -1,8 +1,7 @@
 // The settings navigation as data, the way OpenWrt's LuCI menu.d and
-// Cockpit manifests work: every entry names its place, built-in pages and
-// pages added later (add-ons) go into the same list and are sorted
-// together. Whether an entry shows (admin, hardware, installed add-on) is
-// decided where the pages are rendered, not here.
+// Cockpit manifests work: every entry names its place, and the list is
+// sorted by it. Whether an entry shows (admin, hardware)
+// is decided where the pages are rendered, not here.
 
 import { settingsParentOf } from './tabs.ts';
 
@@ -23,13 +22,20 @@ export type SettingsMenuEntry = {
 export const builtinMenu = [
   { id: 'dashboard', order: 10, icon: 'dashboard', title: { key: 'dashboard.title' } },
   { id: 'video', order: 20, icon: 'video', title: { key: 'videoSettings.title' } },
+  { id: 'video-general', order: 10, icon: 'settings', title: { key: 'settings.network.general' } },
+  {
+    id: 'video-watermark',
+    order: 20,
+    icon: 'stamp',
+    title: { key: 'videoSettings.watermark.title' }
+  },
 
-  { id: 'usb', order: 30, icon: 'usb', title: { key: 'settings.usb.gadget' } },
+  { id: 'usb', order: 30, icon: 'usb', title: { key: 'settings.usb.menu' } },
   {
     id: 'usb-composition',
     order: 10,
     icon: 'layers',
-    title: { key: 'settings.usb.compositionMenu' }
+    title: { key: 'settings.usb.modeMenu' }
   },
   {
     id: 'usb-identity',
@@ -65,10 +71,30 @@ export const builtinMenu = [
   { id: 'services-bmc', order: 10, icon: 'server', title: { key: 'settings.bmc.title' } },
   { id: 'services-rustdesk', order: 20, icon: 'rustdesk', title: { text: 'RustDesk' } },
   {
+    id: 'services-host-sensors',
+    order: 25,
+    icon: 'thermometer',
+    title: { key: 'settings.hostSensors.title' }
+  },
+  {
     id: 'services-notifications',
     order: 30,
     icon: 'bell',
     title: { key: 'settings.notifications.title' }
+  },
+  {
+    id: 'services-schedule',
+    order: 40,
+    icon: 'clock',
+    title: { key: 'settings.schedule.title' }
+  },
+  { id: 'services-lldp', order: 50, icon: 'network', title: { text: 'LLDP' } },
+  { id: 'services-snmp', order: 60, icon: 'radio-tower', title: { text: 'SNMP' } },
+  {
+    id: 'services-ups',
+    order: 70,
+    icon: 'battery',
+    title: { key: 'settings.netServices.ups.title' }
   },
 
   { id: 'system', order: 70, icon: 'shield', title: { key: 'settings.system.title' } },
@@ -79,6 +105,7 @@ export const builtinMenu = [
   { id: 'system-recovery', order: 50, icon: 'download', title: { key: 'settings.recovery.title' } },
   { id: 'system-updates', order: 60, icon: 'download', title: { key: 'settings.updates.title' } },
   { id: 'system-memory', order: 70, icon: 'memory', title: { key: 'settings.memory.title' } },
+  { id: 'system-events', order: 75, icon: 'scan-text', title: { key: 'settings.events.title' } },
   {
     id: 'system-diagnostics',
     order: 80,
@@ -98,16 +125,10 @@ export const builtinMenu = [
 
   { id: 'software', order: 90, icon: 'package', title: { key: 'settings.software.title' } },
   {
-    id: 'software-addons',
+    id: 'software-packages',
     order: 10,
     icon: 'package',
-    title: { key: 'settings.software.addons.title' }
-  },
-  {
-    id: 'software-packages',
-    order: 20,
-    icon: 'package',
-    title: { key: 'settings.software.addons.packages' }
+    title: { key: 'settings.software.packages' }
   },
 
   { id: 'appearance', order: 100, icon: 'palette', title: { key: 'settings.appearance.title' } },

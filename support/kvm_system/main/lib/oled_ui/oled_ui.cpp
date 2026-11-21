@@ -19,6 +19,7 @@ struct oled_ip_window_t {
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     char eth_addr[16] = {};
     char wifi_addr[16] = {};
+    bool wifi_module = false;
     uint64_t deadline_ms = 0;
     bool restored = false;
     bool settings_stamp_known = false;
@@ -81,13 +82,14 @@ bool oled_settings_changed()
     return changed;
 }
 
-bool copy_ip_window_snapshot(char *eth_addr, char *wifi_addr, size_t size)
+bool copy_ip_window_snapshot(char *eth_addr, char *wifi_addr, size_t size, bool &wifi_module)
 {
     if (eth_addr == NULL || wifi_addr == NULL || size < 16U) return false;
     const uint64_t now = oled_monotonic_ms();
     pthread_mutex_lock(&oled_ip_window.mutex);
     const bool active = oled_ip_window.deadline_ms > now;
     if (active) {
+        wifi_module = oled_ip_window.wifi_module;
         memcpy(eth_addr, oled_ip_window.eth_addr, sizeof(oled_ip_window.eth_addr));
         memcpy(wifi_addr, oled_ip_window.wifi_addr, sizeof(oled_ip_window.wifi_addr));
     }
@@ -114,7 +116,8 @@ void oled_ip_window_status(bool force)
 {
     char eth_addr[16] = {};
     char wifi_addr[16] = {};
-    if (!copy_ip_window_snapshot(eth_addr, wifi_addr, sizeof(eth_addr))) return;
+    bool wifi_module = false;
+    if (!copy_ip_window_snapshot(eth_addr, wifi_addr, sizeof(eth_addr), wifi_module)) return;
 
     static uint64_t moved = 0;
     static unsigned step = 0;
@@ -125,7 +128,8 @@ void oled_ip_window_status(bool force)
     const unsigned font = narrow ? 4U : 8U;
     char lines[2][24] = {};
     format_window_line(lines[0], sizeof(lines[0]), 'E', eth_addr, narrow);
-    format_window_line(lines[1], sizeof(lines[1]), 'W', wifi_addr, narrow);
+    const unsigned count = wifi_module ? 2U : 1U;
+    if (count == 2U) format_window_line(lines[1], sizeof(lines[1]), 'W', wifi_addr, narrow);
 
     const unsigned line_width = std::max(strlen(lines[0]), strlen(lines[1])) * (narrow ? 4U : 6U);
     const unsigned block_width = std::min(width, line_width);
@@ -136,10 +140,11 @@ void oled_ip_window_status(bool force)
         force = true;
     }
     const unsigned x = (step * 13U) % (width - block_width + 1U);
-    const unsigned page = step % (pages - 2U + 1U);
+    const unsigned page = step % (pages - count + 1U);
     force = force || strcmp(lines[0], shown[0]) != 0 || strcmp(lines[1], shown[1]) != 0;
     if (force) OLED_Clear();
-    for (unsigned i = 0; i < 2U; ++i) {
+    if (count == 1U) shown[1][0] = 0;
+    for (unsigned i = 0; i < count; ++i) {
         if (force || strcmp(lines[i], shown[i]) != 0) {
             OLED_ShowString(x, page + i, lines[i], font);
             strcpy(shown[i], lines[i]);
@@ -185,6 +190,8 @@ void oled_ip_window_observe(const char *eth_addr, const char *wifi_addr)
 
     const char *next_eth = eth_addr == NULL ? "" : eth_addr;
     const char *next_wifi = wifi_addr == NULL ? "" : wifi_addr;
+    // Module detection runs on this worker. A live address can arrive before its next probe.
+    oled_ip_window.wifi_module = kvm_sys_state.wifi_state >= 0 || next_wifi[0] != 0;
     const bool eth_changed = strcmp(next_eth, oled_ip_window.eth_addr) != 0;
     const bool wifi_changed = strcmp(next_wifi, oled_ip_window.wifi_addr) != 0;
     const bool eth_event = next_eth[0] != 0 && eth_changed;
@@ -241,9 +248,14 @@ int qrencode(char *string)
 		printf("error\n");
 		return -1;
 	}
-	qrAddData(p, (const qr_byte_t*)string, strlen(string));
+	if (!qrAddData(p, (const qr_byte_t*)string, strlen(string))) {
+		printf("add data error\n");
+		qrDestroy(p);
+		return -1;
+	}
 	if (!qrFinalize(p)) {
 		printf("finalize error\n");
+		qrDestroy(p);
 		return -1;
 	}
 
@@ -258,20 +270,7 @@ int qrencode(char *string)
 			OLED_ShowStringTurn(3, 1, "WiKi", 8);
 		}
 	}
-	int size = 0;
-	// width = height = qr_vertable[version] * mag + sep * mag * 2
-	qr_byte_t * buffer = qrSymbolToBMP(p, 5, 5, &size);
-	if (buffer == NULL) {
-		printf("error %s", qrGetErrorInfo(p));
-		return -1;
-	}
-	// output qrcode to file
-	// ofstream f("/etc/kvm/wifi_config.bmp");
-	// if (f.fail()) {
-	// 	return -1;
-	// }
-	// f.write((const char *)buffer, size);
-	// f.close();
+	qrDestroy(p);
 	return 0;
 }
 
@@ -500,7 +499,6 @@ void kvm_wifi_config_ui_disp(uint8_t first_disp, uint8_t subpage_changed)
 				show_wifi_starting();
 				break;
 			case 1: // QRcode
-				printf("WIFI:T:WPA2;S:NanoKVM;P:%s;;\n", kvm_sys_state.wifi_ap_pass);
 				sprintf(cmd, "WIFI:T:WPA2;S:NanoKVM;P:%s;;", kvm_sys_state.wifi_ap_pass);
 				qrencode(cmd);
 				break;
@@ -562,18 +560,6 @@ void oled_auto_sleep(void)
     }
     oled_set_sleep_state(sleeping);
     if (kvm_sys_state.page == 0) kvm_sys_state.sub_page = sleeping ? 1 : 0;
-}
-
-void kvm_show_UE(void)
-{
-	if(kvm_hw_ver != 2){
-		OLED_ShowString(0, 0, "HDMI: UE", 16);
-	} else {
-		OLED_Revolve();
-		OLED_ShowString(0, 0, "HDMI: UE", 16);
-		// OLED_ShowString_AlignRight(AlignRightEND_P, 3, "  FPS", 4);
-		// kvm_init_pcie_ui();
-	}
 }
 
 void kvm_oled_splash(void)

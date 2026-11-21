@@ -76,6 +76,7 @@ done
     fail "/data is read-only without a USB data disk; check its filesystem first"
 plan=$("$bundle/stock-layout" plan /dev/mmcblk0) || fail "unsupported SD layout"
 # Only the compiled helper emits these nine decimal integers, never shell code.
+# shellcheck disable=SC2086 # split into its nine values
 set -- $plan
 [ "$#" = 9 ] || fail "invalid layout plan"
 for part in 1 2 3; do
@@ -104,7 +105,8 @@ need_data=$(( $(du -sk "$bundle" | awk '{print $1}') + ($(wc -c </boot/boot.sd) 
 [ ! -e /boot/dbg.sd ] || fail "remove the existing debug boot override first"
 stage=/data/.nanokvm-stock-install
 [ ! -e "$stage" ] || fail "$stage already exists; inspect its status before starting another migration"
-echo "Ready: keep partition 3; build a 64 MiB boot and $(( $3 / 2048 )) MiB root inside old partition 2."
+echo "Ready: build a 64 MiB boot and $(( $3 / 2048 )) MiB root inside old partition 2."
+echo "ALL FILES ON PARTITION 3 (/data) WILL BE ERASED: the new system recreates it after the root. Copy them off first."
 echo "The stock OS and installed applications will be replaced. Network and SSH access settings are retained."
 echo "The web login becomes admin/admin and requires a new password. Keep power connected."
 [ -z "$data_luns" ] || echo "Partition 3, shared as a USB disk, will be detached from the USB host."
@@ -121,6 +123,7 @@ screen_owner=$(pidof kvm_system 2>/dev/null) || screen_owner=
 # Resumed first, it can take the INT of that stop.
 resume_screen() {
     [ -n "$screen_owner" ] || return 0
+    # shellcheck disable=SC2086 # pidof may list several PIDs
     kill -CONT $screen_owner 2>/dev/null || true
     screen_owner=
     [ ! -x /kvmapp/system/init.d/S95nanokvm ] || /kvmapp/system/init.d/S95nanokvm restart >/dev/null 2>&1 || true
@@ -129,6 +132,7 @@ trap 'resume_screen; rmdir /run/nanokvm-stock-install.lock 2>/dev/null || true' 
 # Ends a signalled installer through the EXIT trap too (a signal ignored
 # when it started, as under nohup, stays ignored).
 trap 'exit 1' HUP INT TERM
+# shellcheck disable=SC2086 # pidof may list several PIDs
 [ -z "$screen_owner" ] || kill -STOP $screen_owner 2>/dev/null || true
 oled prepare
 for file in $data_luns; do
@@ -171,7 +175,7 @@ boot/usb.disk0.ro boot/usb.userdisk boot/usb.rndis0 boot/usb.ncm boot/usb.acm
 boot/usb.audio boot/disable_hid boot/usb.disable_keyboard boot/usb.disable_relative boot/usb.disable_absolute
 boot/usb.vid boot/usb.pid boot/usb.manufacturer boot/usb.product boot/usb.storage.vendor
 boot/usb.storage.image boot/usb.storage.setup boot/usb.storage.user boot/usb.serialnumber boot/usb.notwakeup
-boot/usb.internet boot/rndis.nodhcpd boot/rndis.ipv4_prefix'
+boot/usb.internet boot/usb.host_access boot/rndis.nodhcpd boot/rndis.ipv4_prefix'
 for path in $paths; do
     [ ! -L "/$path" ] || fail "settings symlink is unsupported: $path"
     [ -e "/$path" ] || continue
@@ -192,6 +196,29 @@ if [ -e /etc/kvm/ssh_stop ]; then echo off; else echo on; fi >"$stage/ssh-state"
 # Only the recovery's OLED progress reads the board (checked above); it is
 # no part of the transaction, and without it the screen stays as it is.
 cp /etc/kvm/hw "$stage/board" || true
+# Stock firmware drove the ATX lines on Alpha and Beta (a Lite reports beta);
+# keep ATX power control on there, as an upgrade from an earlier NanoKVM OS
+# does (nanokvm.post-upgrade). A new image otherwise turns it off.
+case "$(cat /etc/kvm/hw 2>/dev/null || true)" in
+    alpha | beta)
+        mkdir -p "$settings/etc/kvm"
+        printf 'on\n' >"$settings/etc/kvm/atx"
+        ;;
+esac
+# NanoKVM OS derives the Ethernet MAC from more of the chip UID than stock
+# firmware did. Keep the address this device runs with, and its DHCP
+# reservations, as the override NanoKVM OS reads. Stock firmware takes an
+# empty eth.mac for none: it is not carried over.
+[ -s "$settings/boot/eth.mac" ] || rm -f "$settings/boot/eth.mac"
+if [ ! -e "$settings/boot/eth.mac" ]; then
+    eth_mac=$(cat /sys/class/net/eth0/address 2>/dev/null || true)
+    case "$eth_mac" in
+        ??:??:??:??:??:??)
+            mkdir -p "$settings/boot"
+            printf '%s\n' "$eth_mac" >"$settings/boot/eth.mac"
+            ;;
+    esac
+fi
 # Record regular files only; tar directory entries must not replace the new
 # root's /etc and /root directory permissions with staging-directory modes.
 (cd "$settings" && find . -type f) >"$settings.paths"
@@ -226,6 +253,7 @@ mv -f /boot/.nanokvm-recovery.new /boot/boot.sd || { restore_boot; fail "cannot 
 sync
 # A stopped kvm_system ignores the INT and TERM of stock shutdown, which
 # would wait 25 s for it; it also must not redraw the last screen.
+# shellcheck disable=SC2086 # pidof may list several PIDs
 [ -z "$screen_owner" ] || kill -KILL $screen_owner 2>/dev/null || true
 screen_owner=
 oled restart
