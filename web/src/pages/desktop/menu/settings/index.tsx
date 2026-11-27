@@ -18,6 +18,7 @@ import {
   BellIcon,
   BluetoothIcon,
   BotIcon,
+  CastIcon,
   ChevronRightIcon,
   ClockIcon,
   DownloadIcon,
@@ -107,6 +108,9 @@ const DateTimeSettings = lazyPage(() =>
 const MCP = lazyPage(() => import('./mcp').then((module) => ({ default: module.MCP })));
 const Memory = lazyPage(() => import('./memory').then((module) => ({ default: module.Memory })));
 const Netbird = lazyPage(() => import('./netbird').then((module) => ({ default: module.Netbird })));
+const Zerotier = lazyPage(() =>
+  import('./zerotier').then((module) => ({ default: module.Zerotier }))
+);
 const Notifications = lazyPage(() =>
   import('./notifications').then((module) => ({ default: module.Notifications }))
 );
@@ -123,6 +127,9 @@ const VideoSettings = lazyPage(() =>
 );
 const WatermarkPage = lazyPage(() =>
   import('./video/watermark.tsx').then((module) => ({ default: module.WatermarkPage }))
+);
+const RtspPage = lazyPage(() =>
+  import('./services/rtsp.tsx').then((module) => ({ default: module.RtspPage }))
 );
 const VPNList = lazyPage(() =>
   import('./vpn/list').then((module) => ({ default: module.VPNList }))
@@ -190,6 +197,7 @@ const menuIcons: Record<string, ReactNode> = {
   bell: <BellIcon size={16} />,
   bluetooth: <BluetoothIcon size={16} />,
   bot: <BotIcon size={16} />,
+  cast: <CastIcon size={16} />,
   clock: <ClockIcon size={16} />,
   dashboard: <LayoutDashboardIcon size={16} />,
   download: <DownloadIcon size={16} />,
@@ -404,9 +412,11 @@ export const Settings = ({
         'vpn-openvpn': <OpenVPN setIsLocked={setIsLocked} />,
         'vpn-tailscale': <Tailscale setIsLocked={setIsLocked} />,
         'vpn-netbird': <Netbird setIsLocked={setIsLocked} />,
+        'vpn-zerotier': <Zerotier setIsLocked={setIsLocked} />,
         services: null,
         'services-bmc': <BmcSettingsPage />,
         'services-rustdesk': <RustDeskControls />,
+        'services-rtsp': <RtspPage />,
         'services-host-sensors': <HostSensorsPage />,
         'services-notifications': <Notifications />,
         'services-schedule': <ScheduledTasks />,

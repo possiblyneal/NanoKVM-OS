@@ -139,11 +139,13 @@ def check_alpine_inventory(root=ROOT):
                         raise ValueError('Unrecognized APK dependency: ' + item)
                     packages.add(name)
         # Optional VPN packages use the same repository resolver as Software.
-        tools = (root / 'server/service/extensions/vpn/versions.go').read_text()
-        match = re.search(r'var tools = map\[string\]string\{([^}]+)\}', tools)
+        tools = (root / 'server-cpp/src/extensions/vpn.cpp').read_text()
+        match = re.search(r'std::map<std::string, std::string> tools\{(.+?)\};', tools, re.S)
         if not match:
             raise ValueError('VPN package inventory could not be read')
-        optional = set(re.findall(r'"([^"\n]+)":', match[1]))
+        optional = set(re.findall(r'\{"([^"\n]+)",', match[1]))
+        # ZeroTier is shipped as nanokvm-zerotier and tracked in upstream-watch.json.
+        optional.discard('zerotier')
         optional = {'wireguard-tools' if name == 'wireguard' else name for name in optional}
         packages |= optional | {'busybox', 'apk-tools'}
         available = {}
@@ -174,15 +176,6 @@ def check(source, root=ROOT):
             result['status'] = 'update available' if b > a else ('current' if a == b else 'pinned ahead')
             if source.get('policy'):
                 result['detail'] = source['policy']
-        elif kind == 'go-proxy':
-            module = source['module']
-            escaped = re.sub('[A-Z]', lambda m: '!' + m[0].lower(), module)
-            url = 'https://proxy.golang.org/' + escaped + '/@latest'
-            latest = json.loads(request(url))['Version']
-            normalized = current if current.startswith('v') else 'v' + current
-            result.update(latest=latest, link=url,
-                          status='current' if normalized == latest else 'review module release',
-                          detail='Independent nested-module check; Dependabot cannot always resolve parent tags. Review versions before changing go.mod')
         elif kind == 'github-channel':
             data = github('repos/' + source['repo'] + '/releases/latest')
             if not any(a['name'] == source['asset'] for a in data['assets']):
@@ -214,21 +207,6 @@ def check(source, root=ROOT):
             result.update(latest=release['tag_name'] + ' (' + head[:12] + ')', link=release['html_url'],
                           status={'ahead': 'update available', 'identical': 'current',
                                   'behind': 'pinned ahead', 'diverged': 'review branch divergence'}[data['status']])
-        elif kind == 'launchpad-binary':
-            url = ('https://api.launchpad.net/1.0/ubuntu/+archive/primary?'
-                   + urllib.parse.urlencode({'ws.op': 'getPublishedBinaries', 'binary_name': source['package'],
-                       'exact_match': 'true', 'status': 'Published',
-                       'distro_arch_series': 'https://api.launchpad.net/1.0/ubuntu/' + source['series'] + '/amd64',
-                       'order_by_date': 'true', 'ws.size': '100'}))
-            data = json.loads(request(url))
-            versions = sorted({row['binary_package_version'] for row in data['entries']})
-            if not versions:
-                raise ValueError('No published Ubuntu binary versions')
-            # Debian version ordering is not numeric or lexical. Report candidates;
-            # never present a possibly older pocket version as an automatic upgrade.
-            result.update(latest=', '.join(versions), link='https://launchpad.net/ubuntu/' + source['series'] + '/+package/' + source['package'],
-                          status='review package versions' if any(v != current for v in versions) else 'current',
-                          detail='Published amd64 versions in the selected Ubuntu series; compare with dpkg before repinning')
         elif kind == 'alpine-rootfs':
             branch = '.'.join(current.split('.')[:2])
             arch = source.get('arch', 'riscv64')
@@ -301,8 +279,7 @@ def render(results):
                                         cell(status), cell(item['path'])]) + ' |')
     lines += ['', '## Integration requirements', '',
               '- Review upstream changes and preserve NanoKVM patches; a newer commit on a vendor branch is a review candidate, not a qualified release.',
-              '- Update related source/archive hashes, Go runtime patches, module ABI and platform output manifest together after rebuilding and testing.',
-              '- Do not overwrite patched Pion sources by only bumping go.mod versions.',
+              '- Update related source/archive hashes, module ABI and platform output manifest together after rebuilding and testing.',
               '- Selected Buildroot packages and compiler/libc recipes follow the stable Buildroot release pin. Development-branch recipe changes do not produce reports or PRs; GCC stable releases are checked separately.',
               '- Production OpenSSL follows the pinned 3.5 LTS source branch. Other Alpine repository-managed rows show availability, not the installed device version.',
               '- This watcher does not run apk upgrade or change devices.',

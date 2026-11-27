@@ -1,12 +1,13 @@
 pkgname=nanokvm-kmod
 pkgver=${PKGVER:-0.1.0}
-pkgrel=0
+pkgrel=${PKGREL:-0}
 pkgdesc="NanoKVM kernel modules"
 url="https://github.com/sipeed/NanoKVM"
 arch="riscv64"
 license="GPL-2.0-only"
 depends="kmod"
 # Named nanokvm-kmod-sg2002 before 3.7.0.
+provides="nanokvm-kmod-sg2002=$pkgver-r$pkgrel"
 replaces="nanokvm-kmod-sg2002"
 source="$pkgname-$pkgver.tar.gz"
 options="!check !strip"

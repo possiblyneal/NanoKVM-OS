@@ -8,12 +8,11 @@ It calls these component builders:
 | build-mpi.sh, build-isp.py, build-mpi-bin.py | the SOPHGO media libraries |
 | build-mmf.py, build-capture.py | `libkvm_mmf.so` and `libkvm.so` |
 | build-system.py | `kvm_system` |
-| build-server-existing-libs.py | `NanoKVM-Server`, `nkos-update` and `nkos-apply-updates` |
 | build-busybox-devmem.sh, build-usb-audio.py | `devmem` and `usb-audio-capture` |
 | build-qhd-edid.py, build-monitor-edids.py, build-portrait-edid.py | the EDID profiles |
 | edid-rgb-range.py | lets the source send full-range RGB: the last step of the EDID profiles |
 | build-openssl.py | Pinned OpenSSL 3.5 LTS runtime with the C906/O3 profile |
-| build-alpine-packages.sh | the eighteen APK packages, inside the Alpine builder tree |
+| build-alpine-packages.sh | the OS packages, inside the Alpine builder tree |
 | build-alpine-sd-image.py | the SD card image |
 
 Run them through `platform/build.sh`: it prepares their pinned sources and toolchain.

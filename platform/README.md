@@ -4,14 +4,14 @@
 - the toolchain, the Linux kernel and all kernel modules, U-Boot, OpenSBI, `fip.bin`, the initramfs and the `boot.sd` images;
 - the SOPHGO media libraries, the board service `kvm_system`, the server, the update helpers and the web UI;
 - the board tools, the EDID profiles and the firmware files;
-- the eighteen `nanokvm-*` APK packages, the Alpine 3.24 root file system and the SD card image.
+- the `nanokvm-*` APK packages, the Alpine 3.24 root file system and the SD card image.
 
 Every upstream input is pinned in `sources.lock` and checked when it is downloaded. Two builds of the same tree give identical outputs, and CI lists the outputs that each change alters (see [Verification](#verification)). The full image and the `nanokvm-bootloader` package install the built `fip.bin` (see [opensbi/README.md](opensbi/README.md)).
 
 | Output | Shipped in |
 |---|---|
-| `images/Image` (Linux `7.3.5-nanokvm-os-r10`) | every `boot.sd` |
-| `images/lib/modules/7.3.5-nanokvm-os-r10/` (70 in-tree and 17 out-of-tree modules, `modules.*`) | `nanokvm-kmod` |
+| `images/Image` (Linux `7.3.6-nanokvm-os-r10`) | every `boot.sd` |
+| `images/lib/modules/7.3.6-nanokvm-os-r10/` (70 in-tree and 17 out-of-tree modules, `modules.*`) | `nanokvm-kmod` |
 | `images/boot/*.sd`, `*.sha256`, `kernel.release` (one per board, `NAME.dtb`, each with the 144 MiB CMA video region) | `nanokvm-kernel`, `/usr/lib/nanokvm/boot` |
 | `images/dtb/*.dtb`, `images/initramfs.cpio.lz4` | inside the `boot.sd` images |
 | `images/licenses/initramfs/` (Buildroot `legal-info`: `manifest.csv` and the license texts of the initramfs userland and C library) | `nanokvm-kernel`, `/usr/share/licenses/nanokvm-kernel/initramfs` |
@@ -19,19 +19,31 @@ Every upstream input is pinned in `sources.lock` and checked when it is download
 | `images/opensbi/*`, `images/fip-manifest.json` | host build provenance and loader checks |
 | `images/native/*.so` (2 HDMI-light libraries) | `nanokvm`, `/kvmapp/server/dl_lib` |
 | `images/system/kvm_system` | `nanokvm`, `/kvmapp/kvm_system` |
-| `images/server/NanoKVM-Server`, `nkos-update`, `nkos-apply-updates`, `nkos-usb-internet` | `nanokvm`, `nanokvm-base` |
+| `images/server/NanoKVM-Server`, `nkos-update`, `nkos-apply-updates`, `nkos-usb-internet`, `nkos-standby` | `nanokvm`, `nanokvm-base` |
 | `images/web/` | `nanokvm-web`, `/kvmapp/server/web` |
 | `images/tools/` (devmem, `nanokvm_update_edid`, `nkos-board-probe`, `usb-audio-capture`, EDID profiles) | `nanokvm-base`, `nanokvm`, `nanokvm-firmware` |
-| `images/tools/zlib-ng/` (zlib-ng as `libz.so.1`, its license; zlib-ng is also linked statically into NanoKVM-Server for its gzip reader) | `nanokvm-zlib`, in place of Alpine's `zlib`; the license also in `nanokvm`, `/usr/share/licenses/nanokvm` |
-| `images/tools/exfatprogs/`, `images/tools/i2c-tools/` (exfatprogs 1.4.5 and i2c-tools 4.4 with their licenses) | `nanokvm-exfatprogs`, `nanokvm-i2c-tools` |
+| `images/tools/zlib-ng/` (zlib-ng as `libz.so.1`, used by NanoKVM-Server at runtime, and its license) | `nanokvm-zlib`, in place of Alpine's `zlib`; the license also in `nanokvm`, `/usr/share/licenses/nanokvm` |
+| `images/tools/exfatprogs/` (exfatprogs 1.4.5 and its license) | `nanokvm-exfatprogs1` |
 | `fip.bin`, `fip-licenses/` | `nanokvm-bootloader`; its trigger puts `fip.bin` on the boot partition |
 | `images/firmware/` (AIC8800 Wi-Fi, regulatory database, video codec) | `nanokvm-firmware` |
-| `release/apk/` | the signed APK repository of the eighteen packages: `recipes/riscv64/` with the packages, `APKINDEX.tar.gz` and `Packages.adb`, and the public keys |
+| `release/apk/` | the signed APK repository of the OS packages: `recipes/riscv64/` with the packages, `APKINDEX.tar.gz` and `Packages.adb`, and the public keys |
 | `release/alpine-rootfs.tar.gz`, `release/installed-packages.txt`, `release/installed-licenses.txt` | the root file system, its package versions and their declared licenses |
 | `release/image/NanoKVM-OS-<version>.img.zip`, `SHA256SUMS` | the SD card image |
 | `release/stock-installer/nanokvm_X.Y.Z.tar.gz`, `SHA256SUMS` | stock Sipeed migration package (`stock-installer` step; included with SD image releases) |
 
 ## Release and installation versions
+
+Use the Release workflow on `v4` for Go-based 4.x releases and on `main` for
+5.x. Both branches support patch and minor releases. The first release on
+the 5.x line is 5.0.0 (or 5.0.0-beta.1 on the beta channel). For a tag build,
+set the matching version in `firmware/alpine/release.env` and tag a commit on
+the corresponding branch. Keep the release workflow and version selector in
+sync when backporting release tooling to `v4`.
+
+Stable and beta are shared across majors. Once stable offers 5.x, publishing
+publish subsequent 4.x fixes as regular GitHub releases. A Pages-only update
+below the public channel head is rejected before the build. Older maintenance
+releases also keep the newer public stable OS release marked Latest on GitHub.
 
 `firmware/alpine/release.env` supplies `NANOKVM_VERSION`, shared by the OS and
 new SD images, and `NANOKVM_APK_VERSION`, its APK-comparable representation.
@@ -55,11 +67,11 @@ both historical and current image filenames.
 
 ## Build
 
-On a Linux x86-64 host (tested on Ubuntu 24.04) with:
+On a Linux x86-64 host (Ubuntu 26.04 in CI) with:
 - the [Buildroot requirements](https://buildroot.org/downloads/manual/manual.html#requirement), plus `git` 2.27 or newer, `curl`, `openssl`, `libssl-dev`, `flex` and `bison`;
 - `libatomic` for the official Node.js 26 binaries (on Ubuntu: `libatomic1`);
 - OpenSSL 3.5 or newer on the host: the kernel configuration records whether the host OpenSSL supports ML-DSA (`CONFIG_OPENSSL_SUPPORTS_ML_DSA`), so an older one fails the `kernel` step's configuration check. The pins come from Ubuntu 26.04;
-- for the packages, rootfs and image steps: Linux 6.7 or newer, `newuidmap` and `newgidmap` (package `uidmap`), and subordinate IDs for the build user in `/etc/subuid` and `/etc/subgid` (Ubuntu adds them for every user).
+- for the packages, rootfs and image steps: Linux 6.7 or newer, `newuidmap` and `newgidmap` (package `uidmap`), subordinate IDs for the build user in `/etc/subuid` and `/etc/subgid` (Ubuntu adds them for every user), and a static `/usr/bin/qemu-riscv64` (package `qemu-user` on Ubuntu 26.04).
 
 ```sh
 platform/build.sh -d
@@ -75,7 +87,7 @@ The build needs no root. The packages, rootfs and image steps run as root of a u
 
 The first run downloads about 2 GB and needs about 25 GB of disk space. Building the toolchain takes most of the first run (20 minutes on 16 threads); the other steps take about 10 minutes. Later runs reuse the toolchain while its inputs are unchanged: the Buildroot pin, `firmware/buildroot` and the toolchain recipe in `build.sh`. If one of them changes, `build.sh` refuses the old toolchain and names the directories to delete. Steps can be run on their own, for example `platform/build.sh kernel modules hashes`. The step order is in `build.sh --help`. Use `-o DIR` for another output directory and `-j N` for the number of jobs.
 
-Go modules, npm packages and Alpine packages are downloaded during the build and checked against `server/go.sum`, `web/pnpm-lock.yaml` and the signed Alpine indexes. Alpine updates its 3.24 packages with security fixes, so a later build installs their newer versions; `release/installed-packages.txt` lists the versions in the image.
+npm packages and Alpine packages are downloaded during the build and checked against `web/pnpm-lock.yaml` and the signed Alpine indexes. Alpine updates its 3.24 packages with security fixes, so a later build installs their newer versions; `release/installed-packages.txt` lists the versions in the image.
 
 ### Debug kernel
 
@@ -98,7 +110,8 @@ A mismatch prints a unified diff and stops the build.
 The debug kernel has a `-debug` release suffix and adds `kernel/config-debug.fragment`:
 perf and the CPU counters, frame pointers, function, syscall and block I/O
 tracing, kprobes, SysRq, hung-task and lockup detectors, dynamic debug,
-`/proc/config.gz` and per-task accounting, plus DWARF for `vmlinux` on the
+`/proc/config.gz` and per-task accounting, every kernel export (the release
+kernel exports only what its modules import), plus DWARF for `vmlinux` on the
 build host (its installed modules are stripped). It costs time on every call
 and interrupt, so it is not for measuring release behaviour.
 
@@ -126,7 +139,7 @@ remain installed for old package verification and rollback. See the
 
 The package `nanokvm-keys` installs the public keys of `firmware/alpine/keys` (with `-d`, also the test keys) in `/etc/apk/keys` and owns them, so a later release can add or remove a key; on an older device it also moves the NanoKVM repository line to the v3 index. The rootfs step copies the keys into the root before it installs `nanokvm-release`, and apk takes over the identical files; the step fails if a key in `/etc/apk/keys` has no owner. Publishing a release, moving to the ECDSA key and replacing a key are described in [firmware/alpine/README.md](../firmware/alpine/README.md#signing-keys).
 
-The root file system uses official Alpine packages (`BUILD_PROFILE="stock"`), with NanoKVM-built zlib-ng and OpenSSL runtimes. `nanokvm-openssl` supplies OpenSSL 3.5.9 LTS with the C906 `-O3` profile and ABI3 libraries. Releases up to v2.0-b7 used a broader `c906-scalar` overlay; that overlay is not built here.
+The root file system uses official Alpine packages (`BUILD_PROFILE="stock"`), with NanoKVM-built zlib-ng and OpenSSL runtimes. `nanokvm-openssl3` supplies OpenSSL 3.5.9 LTS with the C906 `-O3` profile and ABI3 libraries. Releases up to v2.0-b7 used a broader `c906-scalar` overlay; that overlay is not built here.
 
 ## What is here
 
@@ -136,10 +149,11 @@ The root file system uses official Alpine packages (`BUILD_PROFILE="stock"`), wi
 | `sources.lock` | Every upstream input: archives by SHA-256, Git trees by commit and tree id |
 | `build.sh` | All build steps |
 | `packages.list` | The contents of the fifteen APK packages: each file, its mode and where it comes from |
-| `kernel/` | `config` and patches for kernel.org Linux 7.3.5 |
+| `kernel/` | `config` and patches for kernel.org Linux 7.3.6 |
 | `modules/<name>/` | Patches for the SOPHGO media drivers (`osdrv`), AIC8800 and RTL8733BS Wi-Fi; `hwcrypto/` is the CryptoDMA driver source |
 | `uboot/` | `defconfig` and patches for U-Boot 2026.10 |
 | `lolcat/` | Byte I/O and terminal-output fixes for lolcat 1.5, the rainbow SSH shell's filter (original 1.4 optimization: 15 times faster on the C906) |
+| `zlib-ng/` | zlib-ng for the C906: the hash table slides four entries at a time (deflate level 1 about 13 % faster), CRC-32 uses slicing-by-8 below 176 bytes and the small Chorba variant with a slicing-by-8 tail from 176 bytes on. Calls of 8 to 128 bytes are about 1.5 to 1.7 times as fast, and calls of 32 KiB and longer are about twice as fast. Output is unchanged |
 | `fsbl/` | Patches for the Sipeed SDK's FSBL (BL2) and its board memory map; see [fsbl/README.md](fsbl/README.md) |
 | `boot/` | FIT template, initramfs file list and `init`; `stock-init` is the stock Sipeed initramfs init, and `stock-init.diff` turns it into `init` |
 | `native/cvi_mpi/` | Patches for the SOPHGO media libraries (`cvi_mpi`) |
@@ -150,7 +164,7 @@ The build also uses these parts of the repository:
 - `firmware/sensor/patches/`: NanoKVM I2C/MIPI wiring and LT6911UXC/LT6911D identification; applied before compiling MMF;
 - `firmware/mpi/`: the MMF capture-size helper and compatibility headers;
 - `firmware/alpine/`: the APK recipes, OpenRC services and compatibility scripts, `release.env` with the version;
-- `server/`, `web/`, `support/` (including `nanokvm_update_edid/`), `kvmapp/`: the application;
+- `server-cpp/`, `web/`, `support/` (including `nanokvm_update_edid/`), `kvmapp/`: the application;
 - `scripts/`: the component builders that `build.sh` calls.
 
 ## U-Boot console and uEnv.txt
@@ -188,7 +202,7 @@ gh run download RUN-ID -n outputs-sha256 -D ci
 scripts/compare-outputs.py --check ci/SHA256SUMS build/platform/images/SHA256SUMS
 ```
 
-The release uses GCC 16.2 / Binutils 2.47 and the component profiles in `cpu-profile.json`: kernel and modules use `-O3` without LTO and with `-mno-strict-align` (the C906 handles misaligned access in hardware), while source-owned userspace uses scalar `-O2`.
+The release uses GCC 16.2 / Binutils 2.47 and the component profiles in `cpu-profile.json`: kernel and modules use `-O3` without LTO and with `-mno-strict-align` (the C906 handles misaligned access in hardware), the server, OpenSSL and the TPU runtime use `-O3`, and scalar `-O2` is the userspace default. The initramfs BusyBox selects `-Oz`.
 
 Kernel, device trees and modules change with the reviewed C906 vector-context, video-clock and memory-profile updates. The AIC8800 driver includes the cfg80211 compatibility patch. U-Boot, the initramfs, FIT images, native media libraries, system service and native tools are built from the pinned inputs. The closed SOPHGO ISP/3A objects are not used: the HDMI receiver's YUV bypasses the ISP's image processing. Go uses its own compiler; the profile applies to its C/C++ interoperability code.
 
@@ -235,7 +249,7 @@ For three years after we last distribute a NanoKVM OS v2 release, we will give a
 
 Buildroot and the external platform steps use Buildroot's ccache-enabled SDK
 wrapper. This covers C/C++ compilation for the kernel, modules, U-Boot,
-OpenSBI and native code. Go, Rust compilation, linking and image packaging
+OpenSBI, native code and the server. Rust compilation, linking and image packaging
 are not cached by ccache. The existing complete-toolchain and download caches
 remain in use.
 
@@ -282,8 +296,9 @@ not test newly built boot images.
 
 ## Component optimization profiles
 
-Kernel and modules use GCC `-O3` without LTO; source-owned userspace
-uses scalar `-O2`. USB audio uses the small core for float Opus encoding with the
+Kernel and modules use GCC `-O3` without LTO; the server, OpenSSL and the TPU
+runtime use `-O3`. The userspace default is scalar `-O2`. The initramfs BusyBox selects `-Oz`.
+USB audio uses the small core for float Opus encoding with the
 `smallcore` profile; tinyalsa and the capture helper use the `audio` profile. Handwritten vendor RVV/assembly remains available.
 See [component profiles](../docs/COMPONENT-BUILD-PROFILES.md) for the profile
 of each component, the reasons for it and the RustDesk build.
@@ -297,7 +312,7 @@ APK owns the old MPI library paths and removes files no longer shipped when upgr
 
 ### Application package split
 
-The build produces eighteen core APKs. `nanokvm` owns the server, board service,
+The build produces sixteen core APKs. `nanokvm` owns the server, board service,
 native libraries and application scripts; `nanokvm-web` owns
 `/kvmapp/server/web`. The separate `nanokvm-app` compatibility APK is no longer
 built. `nanokvm-release` provides its old name at the release's APK version
@@ -306,26 +321,27 @@ valid while APK removes the old monolith or metapackage. The split packages decl
 `replaces=nanokvm-app` so APK can transfer ownership during the upgrade.
 The OpenRC service is still named `nanokvm-app`.
 
-In the same way `nanokvm-kernel`, `nanokvm-kmod`, `nanokvm-firmware` and
-`nanokvm-bootloader` were named with a `-sg2002` suffix before 3.7.0 (there is
-no other board). The old names are file-free metapackages depending on the new
-ones (`nanokvm-release` depends on them, and older
-installations list them in their world); the new packages replace them.
-A rollback to a release from before 3.7.0 removes the new packages and installs
-the old ones (`apkrollback.LegacyTargets`).
+Before 3.7.0 the kernel, modules, board firmware and bootloader packages had
+a `-sg2002` suffix. All four packages now provide their old names
+directly, so existing APK world entries still resolve.
+
+An existing 4.x installation can upgrade to 5.x. Returning to 4.x requires
+writing a 4.x image to the SD card. Switching from beta to stable within 5.x
+continues to use the package updater.
 
 ### Tools in place of Alpine community packages
 
-`nanokvm-exfatprogs` (exfatprogs 1.4.5: `mkfs.exfat` formats `/data` at first
-boot) and `nanokvm-i2c-tools` (i2c-tools 4.4: `i2cdetect` identifies the board)
-are the only programs of `nanokvm-release` and its dependencies that Alpine
-ships in its community repository, so the release needs only Alpine main (the
-image installs LLDP and UPS from community next to it, see
-[the repository list](../firmware/alpine/README.md)). The `tools` step builds them
-from the pinned upstream releases with the image's toolchain: i2c-tools
-statically, exfatprogs against the device's `libblkid`. Each package
-`provides` and `replaces` the Alpine package of the same tool, so an upgrade
-removes the Alpine package and a dependency on the tool's name is satisfied.
+`nanokvm-exfatprogs1` supplies `mkfs.exfat` for formatting `/data` on first
+boot and `fsck.exfat` for checking it. The `tools` step builds exfatprogs
+from its pinned upstream release against the device's `libblkid`.
+The OS installs Alpine's `i2c-tools` package for HDMI receiver detection
+(`i2cdetect`). When installing from the local `release/apk/` repository,
+enable Alpine v3.24 community alongside main to resolve this dependency.
+The published OS index also serves the identical Alpine-signed APK, so devices
+can update with only Alpine main enabled. To update the mirrored APK, change
+its filename and SHA-256 together in `scripts/index-apk-repo.py`.
+A compatibility package preserves the old name for explicit installs and older
+rollback clients.
 
 The browser package requires `nanokvm-web-api=2`, provided by the server
 (2: the browser sends passwords as typed, marked `passwordEncoding: "plain"`,
@@ -379,7 +395,7 @@ finished outputs and small immutable kernel ABI exports. Pinned kernel sources
 and working headers are recreated only when a consumer must be rebuilt; Linux
 is not recompiled for that preparation. Only
 main writes shared snapshots; pull requests can read them. Keys, signed assets,
-root file systems and Go/Node SDKs are outside this cache. The compiler cache
+root file systems and the Node SDK are outside this cache. The compiler cache
 continues to speed components that do require rebuilding.
 
 Packages, their release metadata and signatures, corresponding source, and the

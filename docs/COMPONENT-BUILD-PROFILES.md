@@ -7,13 +7,14 @@ optimization level.
 | --- | --- | --- |
 | Linux and matching modules, including UAC | GCC 16.2, -O3, thead-c906, lp64 | Compiler vectorization off; LTO off |
 | Media libraries, MMF/capture, JSON/miniz and kvm_system | GCC 16.2, -O2, thead-c906, lp64d | Compiler vectorization off |
-| Go server/updater C/CGO objects | GCC -O2 source profile | Go compiler/runtime selection stays separate |
+| NanoKVM-Server and its helpers (server-cpp), with libdatachannel, libwebsockets, libjpeg-turbo, libspng and live555 | GCC 16.2, -O3 server profile, thead-c906, lp64d | Compiler vectorization off. The build uses the same profile for its link-time copy of libcurl. The device loads Alpine’s libcurl.so.4. |
 | Source-owned network tools and private musl | GCC -O2 source profile | Compiler vectorization off |
+| BusyBox of the initramfs | GCC -Oz (BusyBox's own Makefile.flags comes after the profile) | Compiler vectorization off |
 | tinyalsa and usb-audio-capture | GCC -O2 audio profile | Compiler vectorization off |
 | Program of the small core (nanokvm_c906l: Opus encoder) | GCC -O2 smallcore profile (userspace ISA without xtheadvector), float Opus, static PIE | Compiler vectorization off |
-| zlib-ng (nanokvm-zlib, libz.so.1; static in NanoKVM-Server) | GCC -O2, thead-c906, lp64d, -mno-strict-align, without xtheadvector | Compiler vectorization off; RVV and Zbc code off |
-| OpenSSL 3.5.9 LTS (nanokvm-openssl) | GCC -O3, thead-c906, lp64d, without xtheadvector | Compiler vectorization and LTO off; scalar inline memory operations; upstream crypto code |
-| TPU runtime (cviruntime, cvikernel; static in nanokvm-ocr and nanokvm-screen) | GCC -O2, thead-c906, lp64d, with xtheadvector | Upstream flags otherwise; the C++ library linked statically |
+| zlib-ng (nanokvm-zlib, libz.so.1, loaded by NanoKVM-Server) | GCC -O2, thead-c906, lp64d, -mno-strict-align, without xtheadvector; platform/zlib-ng patches | Compiler vectorization off; RVV and Zbc code off; no runtime CPU dispatch |
+| OpenSSL 3.5.9 LTS (nanokvm-openssl3) | GCC -O3, thead-c906, lp64d, with xtheadvector | Compiler vectorization and LTO off; scalar inline memory operations; upstream crypto code with firmware/crypto/openssl-c906 patches |
+| TPU runtime (cviruntime, cvikernel; static in nanokvm-ocr and nanokvm-screen) | GCC -O3 tpu profile, thead-c906, lp64d, with xtheadvector | Upstream flags otherwise; the C++ library linked statically |
 | RustDesk | Rust opt-level=3, scalar XTHead | fat LTO; codegen-units=1 |
 | U-Boot/FIP and official Alpine packages (except zlib and OpenSSL) | Their own build policies | Not covered by these profiles |
 
@@ -22,7 +23,7 @@ still includes xtheadvector: existing vendor/intrinsic/assembly implementations
 remain usable. Kernel ISA stays separate from userspace FP/vector ISA.
 
 platform/cpu-profile.json supplies the defaults. The common flags/metadata
-helper accepts userspace, kernel, audio, bootloader and openssl. Kbuild is pinned to
+helper accepts userspace, kernel, audio, bootloader, openssl, smallcore, tpu and server. Kbuild is pinned to
 the GCC compiler and CONFIG_LTO_NONE; the command auditor rejects accidental
 -flto options. Kernel PI/EFI/LZ4 and external JPEG/Realtek Makefiles inherit
 the requested optimizer rather than appending -O2. CVI SYS/GDC and json-c
@@ -61,7 +62,14 @@ emit legacy RVV 0.7.1.
   which has no vector unit.
 - RustDesk: the speed comes mostly from the T-Head target features, not
   from LTO.
-- Other native components: scalar -O2 is the default.
+- Server: -O3. All measurements of the server were made at this level.
+- TPU runtime and its programs: -O3. A recognition of a full 1920 x 1080 screen
+  of text took about 12 % less CPU than at -O2 (user 0.65 s instead of 0.82 s),
+  with the same text; the TPU's own time (about 31 s) is the same.
+- Other native components: scalar -O2 is the default. -O3 was measured for
+  zlib-ng, the media libraries, kvm_system, fsck.f2fs, usb-audio-capture and
+  the small core's Opus program: no gain, larger code; for zlib-ng's adler32
+  and the Opus program it was slower.
 - Compiler flags do not select hardware AES/SHA or change TLS algorithms.
 
 OpenSSL details: [C906/OpenSSL 3.5 LTS](../firmware/crypto/openssl-c906/README.md).

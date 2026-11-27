@@ -14,6 +14,8 @@ A video mode combines the monitor resolution and the stream frame rate. The page
 
 The **bitrate** is a ceiling for motion, from 1 to 20 Mbit/s. New devices use 20 Mbit/s, which keeps QHD@60 sharp in motion; 3 Mbit/s suits remote and mobile connections. A still desktop sends much less than the ceiling.
 
+**Slow connections.** When no H.264/H.265 viewer takes the stream cleanly and one loses pictures because its connection cannot carry it (for two seconds running, every viewer loses at least 2 % of a second's pictures and one at least 15 %), the device lowers the bit rate by a quarter, down to 1 Mbit/s, and raises it by half again after eight seconds in which some viewer keeps up, for a minute no higher than just below the rate that was too much. Each step takes effect at an IDR. Video settings and the video menu show the lowered rate ("held at 8.2 Mbit/s: slow connection"); the setting itself does not change, and a new session starts at the setting. WebRTC and RustDesk viewers count as keeping up, and one viewer that loses nothing keeps the setting for everyone: a slow viewer beside it gets fewer pictures instead. Viewers sharing one slow link all lose some pictures, so the rate comes down for them. A viewer that drops again within three seconds of an IDR asks for the next one later, doubling up to every eight seconds, so its IDRs do not crowd the stream of the others. Below about 4–5 Mbit/s at 1440p60 the encoder may send more than the lowered rate.
+
 The encoder applies its rate-control limits before capture starts and uses NormalP, with a keyframe when a viewer asks for one and at least every ten seconds. There are no GOP or SmartP settings. H.264 uses the Main profile. Native encoder diagnostics go to the application log.
 
 ## HDMI receivers
@@ -66,7 +68,7 @@ Every profile identifies the monitor as NanoKVM's: manufacturer ID `SPD`, produc
 
 Without a fixed serial number each profile keeps its own, and the serial text becomes that number in decimal: Windows remembers the display mode per monitor identity, so distinct serials keep a mode chosen under one rate profile from returning after a switch to another. A fixed serial number lets a headless workstation see its usual monitor, at the cost of that behaviour.
 
-The server writes the identity into the base block of the profile it programs (through `/run/nanokvm-monitor-edid.bin`) and records the hash of what it wrote (`server/common/monitor_identity.go`). The identity is saved in `/etc/kvm/monitor_identity` only after a successful write and applies to every later profile change. Restoring NanoKVM's identity deletes the file and writes the profile as shipped. Like any EDID write, it briefly reconnects HDMI, and a Cube or Lite with an LT6911C or LT6911UXC needs a power cycle afterwards.
+The server writes the identity into the base block of the profile it programs (through `/run/nanokvm-monitor-edid.bin`) and records the hash of what it wrote (`server-cpp/src/video/monitor.cpp`). The identity is saved in `/etc/kvm/monitor_identity` only after a successful write and applies to every later profile change. Restoring NanoKVM's identity deletes the file and writes the profile as shipped. Like any EDID write, it briefly reconnects HDMI, and a Cube or Lite with an LT6911C or LT6911UXC needs a power cycle afterwards.
 
 ### Refresh follows the frame rate
 
@@ -145,7 +147,7 @@ Next to a video stream, MJPEG and video reads run side by side. With 4:2:0 MJPEG
 
 ## Frame rate and codec limits
 
-The frame rate is capped by the larger of the input and the encoded size, in either orientation: up to 1280×720 at 120 fps, up to 1920×1088 at 100 fps, up to 2560×1440 at 60 fps, larger sizes at 30 fps. With the video overclock the encoder sustains about 250 million pixels per second: 3840×2160 at 30 and 2560×1440 at 60 fps. At 1920×1080 a fixed per-frame cost limits it to about 109 fps, so the 1080p monitor is offered at up to 90 Hz. The server and the native capture library use one table (`server/common/video_status.go`, `kvm_mmf/include/internal/capture_rate.hpp`). The saved request is kept across source changes and restored when the source allows it again. Settings show the delivered rate when it is below the request.
+The frame rate is capped by the larger of the input and the encoded size, in either orientation: up to 1280×720 at 120 fps, up to 1920×1088 at 100 fps, up to 2560×1440 at 60 fps, larger sizes at 30 fps. With the video overclock the encoder sustains about 250 million pixels per second: 3840×2160 at 30 and 2560×1440 at 60 fps. At 1920×1080 a fixed per-frame cost limits it to about 109 fps, so the 1080p monitor is offered at up to 90 Hz. The server and the native capture library use one table (`server-cpp/src/video/screen.cpp`, `kvm_mmf/include/internal/capture_rate.hpp`). The saved request is kept across source changes and restored when the source allows it again. Settings show the delivered rate when it is below the request.
 
 **MJPEG** is unavailable while the HDMI input is 3840×2160, whatever the stream limit: next to a 4K stream the JPEG channel wedges the hardware encoder until reboot, and with the stream limited to 1440p it produces no frames. The MJPEG stream, MCP and screenshots, and selecting MJPEG are refused with a message, and `stream.mjpeg` in the capabilities is unavailable with the reason `mjpeg-4k`. Use H.265, or H.264 with a stream resolution of 1440p or lower.
 
@@ -171,6 +173,19 @@ Direct playback (lowest latency by default, or smooth), JPEG colour sampling, fr
 - **Machine readers.** Screen text (OCR), crash-screen detection and MCP screenshots read the same outputs, so they see the watermark too.
 
 File: `/etc/kvm/watermark.json` (on/off, margin, block places and pictures, the editor's design), replaced whole on every change and part of the settings that backup, restore and reset handle. API: `GET` and `POST /api/vm/video/watermark` (administrators). `POST` takes `enabled`, `margin`, `design` and `blocks`, each `{x, y, image}` with `x` and `y` in thousandths of the free room (0 left or top, 1000 right or bottom) and `image` a base64 PNG; a block without `image` keeps the saved picture of the same index.
+
+## RTSP stream
+
+**Settings → Services → RTSP** (administrators) offers the video to programs that open a stream by its address: OBS (Media Source), VLC, ffmpeg, recorders. It is off by default.
+
+- **Address.** `rtsp://stream:<password>@<device>:8554/stream`. The page shows it with a copy button. The password is generated when the stream is first turned on; **New password** replaces it and disconnects the programs that use the old one. Authentication is RTSP Digest, so the password does not cross the network in clear; the video itself is not encrypted.
+- **Picture.** The H.264 or H.265 stream of the remote console, at its codec, resolution, frame rate and bit rate: the device encodes once for every viewer. A codec change disconnects the RTSP clients; they reconnect at the new codec.
+- **Sound.** With USB audio on, the session has a second track: the computer's sound as Opus (48 kHz stereo, 20 ms packets), from the same capture as the browser's audio. Video and sound carry times of one clock, so players keep them in step. The computer must play to the NanoKVM audio device.
+- **Transport.** RTP over the RTSP TCP connection only, in packets of up to 16 KiB. A program that asks for UDP gets `461 Unsupported Transport` and retries over TCP (ffmpeg and OBS do this at once). The device sends key frames only when asked, so a lost UDP packet would spoil the picture until the next one.
+- **Several programs** watch at once; each starts at a key frame. When all of them fall behind, the bit rate comes down (see the adaptive bit rate above); when the device itself falls behind, they lose whole frames and resume at the next key frame, which it then sends at once. A program that alone cannot keep up does not lower the picture of the others: what it has not taken waits for it, up to 2 MiB, and then it is disconnected.
+- **Failed logins** count like web logins: after `security.loginMaxFailures` failures within `security.loginLockoutDuration`, the address is refused, even with the right password, until the lockout ends.
+
+The server is [live555](http://www.live555.com/liveMedia/), built into NanoKVM-Server and running on a thread of its own. File: `/etc/kvm/rtsp.json` (on/off, port, password, mode 0600), part of the settings that backup, restore and reset handle. API: `GET` and `POST /api/stream/rtsp` (administrators); `POST` takes `enabled`, `port` (1–65535, not 80 or 443) and `newPassword: true`.
 
 ## Video straight from capture
 

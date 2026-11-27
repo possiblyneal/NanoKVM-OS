@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build the pinned OpenSSL source with reviewed NanoKVM patches for NanoKVM's C906/musl runtime."""
 import argparse
+import collections
 import hashlib
 import json
 import os
@@ -12,9 +13,13 @@ import tarfile
 from nanokvm_cpu_profile import flags, record
 
 ROOT = Path(__file__).resolve().parents[1]
+# Not built: the FIPS provider (the runtime package never carried fips.so), kTLS (the kernel has no CONFIG_TLS) and
+# the AF_ALG, CryptoAPI and VIA PadLock engines (the kernel has no AF_ALG; the other two are empty on RISC-V). The
+# ENGINE API, loader_attic and the legacy provider stay: Alpine programs link the API, and the legacy provider has MD4,
+# DES and Blowfish for WPA-Enterprise (wpa_supplicant loads it) and old OpenVPN profiles.
 CONFIG = ['linux64-riscv64', '--prefix=/usr', '--libdir=lib', '--openssldir=/etc/ssl',
-          'enable-fips', 'enable-ktls', 'enable-ec_nistp_64_gcc_128', 'shared', 'no-zlib', 'no-async', 'no-comp',
-          'no-idea', 'no-mdc2', 'no-rc5', 'no-ec2m', 'no-ssl3', 'no-seed',
+          'no-afalgeng', 'no-capieng', 'no-padlockeng', 'enable-ec_nistp_64_gcc_128', 'shared', 'no-zlib',
+          'no-async', 'no-comp', 'no-idea', 'no-mdc2', 'no-rc5', 'no-ec2m', 'no-ssl3', 'no-seed',
           'no-weak-ssl-ciphers']
 
 
@@ -88,10 +93,10 @@ def build(archive, output, cross, jobs):
                     ['make', 'DESTDIR=' + str(output / 'install'), 'install_sw', 'install_ssldirs']):
             subprocess.run(cmd, cwd=source, env=env, stdout=stream,
                            stderr=subprocess.STDOUT, check=True)
-    check_hot_layout(order, source / 'libcrypto.so.3', str(cross) + 'nm')
+    check_hot_layout(order, [source / 'libcrypto.so.3', source / 'libssl.so.3'], str(cross) + 'nm')
     install = output / 'install'
     runtime = output / 'runtime'
-    # Development/static/FIPS artifacts are not part of this runtime package.
+    # Development and static artifacts are not part of this runtime package.
     for rel in ('usr/bin/openssl', 'usr/lib/libcrypto.so.3', 'usr/lib/libssl.so.3',
                 'etc/ssl/openssl.cnf', 'etc/ssl/ct_log_list.cnf'):
         dest = runtime / rel
@@ -99,8 +104,6 @@ def build(archive, output, cross, jobs):
         shutil.copy2(install / rel, dest)
     for directory in ('usr/lib/engines-3', 'usr/lib/ossl-modules'):
         for src in sorted((install / directory).glob('*.so')):
-            if src.name == 'fips.so':
-                continue
             dest = runtime / directory / src.name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)
@@ -108,7 +111,7 @@ def build(archive, output, cross, jobs):
         if path.is_file() and path.read_bytes()[:4] == b'\x7fELF':
             subprocess.run([str(cross) + 'strip', '--strip-unneeded',
                             '--remove-section=.comment', '--remove-section=.note', str(path)], check=True)
-    license_dir = runtime / 'usr/share/licenses/nanokvm-openssl'
+    license_dir = runtime / 'usr/share/licenses/nanokvm-openssl3'
     license_dir.mkdir(parents=True)
     shutil.copy2(source / 'LICENSE.txt', license_dir / 'LICENSE.txt')
     shutil.copy2(ROOT / 'firmware/cpu/go-crypto-c906/LICENSE',
@@ -125,21 +128,29 @@ def build(archive, output, cross, jobs):
     return runtime
 
 
-def check_hot_layout(order, library, nm):
-    """hot-sections.ld names functions; a new OpenSSL may rename or inline
-    them, and the linker ignores a pattern that matches nothing. Most names
-    must still be functions of libcrypto, next to each other."""
-    names = {line.strip()[8:-1] for line in order.read_text().splitlines()
-             if line.strip().startswith('*(.text.')}
-    out = subprocess.run([nm, '-n', str(library)], check=True, capture_output=True, text=True).stdout
-    hot = [int(row[0], 16) for row in (line.split() for line in out.splitlines())
-           if len(row) == 3 and row[1] in 'tT' and row[2] in names]
-    found = len({row[2] for row in (line.split() for line in out.splitlines())
-                 if len(row) == 3 and row[1] in 'tT' and row[2] in names})
-    if found < len(names) * 0.6 or max(hot) - min(hot) > 320 * 1024:
-        raise SystemExit('hot-sections.ld no longer matches libcrypto: %d of %d functions, span %d KiB; '
+def check_hot_layout(order, libraries, nm):
+    """hot-sections.ld names functions of libcrypto and libssl; a new OpenSSL
+    may rename or inline them, and the linker ignores a pattern that matches
+    nothing. Nearly all names must still be functions of one of the two
+    libraries, and those of each library next to each other."""
+    names = {line.split('(.text.', 1)[1].rstrip(')') for line in
+             (line.strip() for line in order.read_text().splitlines()) if '(.text.' in line}
+    found, spans = set(), []
+    for library in libraries:
+        out = subprocess.run([nm, '-n', str(library)], check=True, capture_output=True, text=True).stdout
+        rows = [row for row in (line.split() for line in out.splitlines())
+                if len(row) == 3 and row[1] in 'tT' and row[2] in names]
+        found.update(row[2] for row in rows)
+        # A static name of several files (the NIST curves) is listed for one of them only.
+        count = collections.Counter(row[2] for row in rows)
+        hot = [int(row[0], 16) for row in rows if count[row[2]] == 1]
+        spans.append(max(hot) - min(hot) if hot else 0)
+    if not names:
+        raise SystemExit('%s lists no function; regenerate it (firmware/crypto/openssl-c906/README.md)' % order)
+    if len(found) < len(names) * 0.9 or max(spans) > 320 * 1024:
+        raise SystemExit('hot-sections.ld no longer matches libcrypto and libssl: %d of %d functions, span %d KiB; '
                          'regenerate it (firmware/crypto/openssl-c906/README.md)'
-                         % (found, len(names), (max(hot) - min(hot)) // 1024))
+                         % (len(found), len(names), max(spans) // 1024))
 
 
 def main():

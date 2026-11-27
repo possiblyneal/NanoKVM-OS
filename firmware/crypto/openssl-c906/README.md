@@ -14,11 +14,9 @@ No ENGINE or cryptodev interface is involved.
 
 The GNU ABI assembly is generated from
 `firmware/cpu/go-crypto-c906/gen_chacha_linux.py`, which also supplies Linux's
-ChaCha implementation. Its four vector lanes and fifth scalar block share the
-round construction with the separate Go generator. The GNU version preserves
-the C callee-saved registers, takes a 16-word state and round count, and wipes
-its stack keystream. The Go implementation uses a different ABI and buffer
-wrapper; its timings are not OpenSSL measurements.
+ChaCha implementation: four vector lanes and a fifth scalar block. It
+preserves the C callee-saved registers, takes a 16-word state and round count,
+and wipes its stack keystream.
 
 From `OSSL_CHACHA_C906_MIN_BYTES` (129 bytes, three blocks) the vector code
 runs; a remainder of three or more blocks after the whole groups takes one
@@ -89,12 +87,13 @@ in the GHASH code, with 1.2 and 2.0 million instruction-cache misses (about
 
 `scripts/build-openssl.py` therefore compiles with `-ffunction-sections` and
 links with `--section-ordering-file=hot-sections.ld`. The file lists the
-assembly kernels and about 530 C functions by workload class, so that the
-code one workload touches is contiguous: functions common to several classes,
-ChaCha20-Poly1305 records, AES-GCM records, SHA-256, the other hashes, TLS
-connections. After the build the script checks that most listed names are
-still functions of libcrypto and close together; a new OpenSSL version that
-renames or inlines them fails the build instead of silently losing the order.
+assembly kernels and about 620 C functions of libcrypto and libssl by workload
+class, so that the code one workload touches is contiguous: functions common
+to several classes, ChaCha20-Poly1305 records with the TLS record path,
+AES-GCM records, SHA-256, the other hashes, TLS connections. After the build
+the script checks that nearly all listed names are still functions and close
+together; a new OpenSSL version that renames or inlines them fails the build
+instead of silently losing the order.
 
 With the order, a 1400-byte ChaCha20-Poly1305 record takes 24.6 us instead of
 28.5 us, and a 16-byte SHA-1 digest 1-4 instruction-cache misses instead of
@@ -108,13 +107,47 @@ digest (4300 instructions over about a hundred functions) takes 27-31
 instruction-cache misses instead of 10. After a change of OpenSSL, of the
 patches or of the flags, measure records and small digests again.
 
-To regenerate `hot-sections.ld`: build OpenSSL with `-finstrument-functions`
-and link `hot-sections/callcount.c` into it (it counts calls per function and
-writes "module offset count" lines at exit), run the workloads on a device,
-turn each output into "calls symbol" lines with `nm`, and run
-`hot-sections/mkorder.py OUT` in the directory holding `chacha.txt`,
-`gcm.txt` (records), `hash1.txt`... (`openssl speed` of sha256, sha1, sha512,
-HMAC, md5 at 64 and 1024 bytes) and `tls*.txt` (`openssl s_time`).
+To regenerate `hot-sections.ld`:
+
+1. Build OpenSSL with `-finstrument-functions
+   -finstrument-functions-exclude-file-list=test/,include/openssl/`,
+   `no-tests`, and `hot-sections/hooks.c` compiled into `LDFLAGS`.
+2. On a device, run each workload with `LD_PRELOAD=callcount.so`
+   (`hot-sections/callcount.c`, built with `-pthread`; it counts the calls of
+   all threads and writes "module offset count" lines to `$CYG_OUT.<pid>`):
+   `openssl speed -bytes 1400 -aead` of
+   chacha20-poly1305 and aes-128-gcm, encryption (`chacha.txt`, `gcm.txt`) and
+   `-decrypt` (`chachad.txt`, `gcmd.txt`); `openssl speed -evp` of sha256 and
+   `-hmac sha256` (`hash1.txt`, `hash2.txt`), of sha1, sha512, md5, sha3-256
+   and shake128 (`hash3.txt` to `hash6.txt`, `hash9.txt`); ML-KEM-768
+   (`kem.txt`); an `openssl s_server` with a P-256 certificate taking TLS 1.3
+   handshakes with X25519MLKEM768 and ChaCha20-Poly1305 (`tls1.txt`); and the
+   web server itself, its counts cleared with SIGUSR1 and written with SIGUSR2
+   around 200 new connections (`shs.txt`) and around tens of MB over one
+   connection (`srec.txt`). A signal only queues the request: start the load
+   after `cleared N` in `$CYG_OUT.<pid>.state` has grown, and read the profile
+   after `written M` has grown. A completed empty sample leaves no profile
+   file. If writing fails, the counter stays at its previous value.
+3. Turn each output into "calls symbol" lines with `nm` of the instrumented
+   libraries and run `hot-sections/mkorder.py OUT BUILD READELF PROFILES`,
+   with `BUILD` the tree of a normal build and `PROFILES` the directory
+   holding them. It stops without writing `OUT` when one of the profiles
+   named above is missing or names no function of the build.
+
+The instrumented build counts functions the normal build inlines, so
+`mkorder.py` keeps only names that have a section of their own in `BUILD`
+(the code of libcrypto and libssl and of the providers built into libcrypto).
+After the build, nearly all listed names must still be functions of the two
+libraries.
+
+The list from these profiles, against the one before it (three alternated
+runs each, same patches): AES-128-GCM records +11 %, ChaCha20-Poly1305 records
+the same; 64-byte digests SHA-256 +7 %, HMAC-SHA-256 +6 %, SHA-1 +104 %,
+SHA-512 +56 %, SHA3-256 +36 %, MD5 +27 %; ML-KEM-768 key generation +10 %,
+encapsulation +9 %, decapsulation +4 %; P-256 signatures and X25519 the same.
+The web server's CPU for new TLS connections and for downloads shows no
+measurable change. A quarter of the names of the list before were no longer functions
+(inlined or renamed).
 
 ## NIST curves
 
@@ -230,8 +263,8 @@ rejected tags pass on the device.
 
 ### Vector Poly1305
 
-`0012-poly1305-c906.patch` adds the C906 vector Poly1305 that NanoKVM's Go
-runtime and kernel use: radix 2^26, four blocks in XTheadVector lanes and
+`0012-poly1305-c906.patch` adds the C906 vector Poly1305 that the kernel and
+the RustDesk add-on use too: radix 2^26, four blocks in XTheadVector lanes and
 one in scalar registers per group of five. It is
 `firmware/cpu/go-crypto-c906/gen_poly1305_vector.py --openssl`, and that
 generator executes it against a big-integer Poly1305; see
@@ -253,3 +286,83 @@ generator executes it against a big-integer Poly1305; see
 The vector path produces the same tags as Cryptogams on 6000 cases (lengths
 to 65 KB, offsets 0-15, update splits, all-ones keys and messages) and passes
 the 408-case EVP AEAD check.
+
+## SHA-3 and SHAKE (Keccak)
+
+Upstream OpenSSL 3.5 has no RISC-V Keccak assembly and builds `keccak1600.c`. `0013-keccak-c906.patch` adds
+`crypto/sha/keccak1600-c906.S`, generated by `generate-keccak.py` from CRYPTOGAMS `keccak1600-riscv.pl` (commit
+`4acc4a308eab`, SHA-256 `4b3d783ff0c6...`, the latest; BSD-3-Clause option, the runtime already carries
+`CRYPTOGAMS-BSD-3-Clause.txt`). The C906 has no Zbb, so the generator takes the no-Zbb path (all 25 lanes in
+registers, lane complementing instead of `andn`) and fuses each shift/shift/or rotate of the round into one XTheadBb
+`th.srri`, checking the data flow and liveness of every temporary: 29 per round. The output is preprocessed
+assembly (misaligned-fast input, no Zicfilp). It provides `SHA3_absorb` and the permutation, renamed
+`ossl_keccakf1600_c906` (hidden); OpenSSL's `SHA3_squeeze` takes a `next` argument the CRYPTOGAMS one lacks, so
+`keccak1600_c906.c` is OpenSSL's squeeze on top of that permutation. `build.info` selects both for `riscv64`.
+
+Regenerate or check the file in the patch:
+
+    generate-keccak.py --print-url
+    generate-keccak.py --cryptogams keccak1600-riscv.pl --binutils <riscv64 prefix> --check
+
+On the device (`openssl speed`, 16 KiB): SHA3-256 27.6 to 33.0 MB/s, SHAKE128 34.1 to 41.0 MB/s; one permutation
+takes 4.03 us. ML-KEM-768, which TLS 1.3 uses in its default key share, spends most of its time outside Keccak:
+keygen 850 to 799 us, encapsulation 560 to 547 us, decapsulation 801 to 781 us. Checked on the device: the
+permutation against a plain FIPS 202 reference on 20,000 random, all-zero and all-one states, three chained each
+(and a build with one round constant changed fails it); SHA3-224/256/384/512 and SHAKE128/256 of 306 inputs from 0
+to 65,537 bytes at several output lengths against another OpenSSL (5,508 values); ML-KEM-768 keys of each build
+encapsulated by the other and decapsulated to the same secret.
+
+## ML-KEM
+
+OpenSSL 3.5's ML-KEM (`crypto/ml_kem/ml_kem.c`) computes its number theoretic transforms and base-case products one
+16-bit coefficient at a time; they took about 40 % of a key generation. `0014-ml-kem-c906.patch` replaces
+`scalar_ntt`, `scalar_inverse_ntt`, `scalar_mult` and `scalar_mult_add` on `riscv64` with XTheadVector code in
+`crypto/ml_kem/ml_kem_c906.c` (`ML_KEM_C906`, set by `build.info`). The arithmetic is the scalar code's, so the
+results are the same bits: products of reduced values in 32-bit lanes, the same Barrett step (`x * 5039 >> 24` as
+the high half of a multiply by `5039 << 8`), `reduce_once` as an unsigned minimum with `x - q`. Layers with blocks
+of 8 or more coefficients run along the block; in the last two layers, and in the products, the coefficients are
+loaded as segments, so each block's even and odd halves land in separate registers next to a vector of its roots.
+No branch or address depends on the data.
+
+`ml_kem_c906.c` is RVV intrinsics, which GCC compiles to XTheadVector: the OpenSSL CPU profile includes
+`xtheadvector` for it, while compiler vectorization and vector string operations stay off, so no other compiled C
+function of OpenSSL contains vector instructions (checked on the built libraries).
+
+On the device (`openssl speed`, microseconds for keygen / encapsulation / decapsulation):
+
+| | ML-KEM-512 | ML-KEM-768 | ML-KEM-1024 |
+|---|---|---|---|
+| Keccak only | 539 / 399 / 556 | 801 / 554 / 780 | 1117 / 735 / 1035 |
+| with this patch | 367 / 212 / 262 | 521 / 257 / 339 | 716 / 322 / 434 |
+
+One transform takes 6.4 us instead of 38.8 us, the inverse 6.5 us instead of 35.7 us, a product with sum 2.1 us
+instead of 7.5 us. Checked on the device: the four functions against the scalar ones on 200,000 random polynomials
+and products (with the edge cases 0 and q-1); ML-KEM-512/768/1024 keys of each build encapsulated by the other and
+decapsulated to the same secret; SHA-3/SHAKE digests unchanged. The patch moves unordered code (see Function order):
+16-byte digests changed by -24 % (SHA-1) to +37 % (SHA-256), SHA3-256 by -14 %; ChaCha20-Poly1305 and AES-GCM
+records and digests from 1 KiB on are unchanged.
+
+## Argon2
+
+NanoKVM-Server hashes passwords with OpenSSL's `ARGON2ID` KDF (19 MiB, 2 passes, 1 lane). Its compression function,
+`fill_block` in `providers/implementations/kdfs/argon2.c`, copies and XORs whole 1 KiB blocks four times and runs the
+BlaMka permutations on words addressed through pointers into a block on the stack: on the C906 the loads and stores
+took most of the time, not the arithmetic (16 permutations alone take 4.6 us, the function 8.5-9.5 us).
+`0015-argon2-fill-block.patch` keeps the 16 words of each permutation in registers with constant offsets, reads
+`ref ^ prev` straight from the input blocks in the column permutations, and writes `next` in one sequential pass at
+the end. Writing `next` from the row permutations instead saves another pass in the cache but loses it all again over
+19 MiB: the stride-128 stores miss in a worse order. The results are the same; `ref` and `next` may be the same
+block (`next_addresses`), and every word of `next` is written after the last read of `ref`.
+
+On the device: `fill_block` 8.5 to 6.4 us in the cache; over the server's 19 MiB one pass takes 180 ms instead of
+215 ms, and a whole hash about 500 ms instead of 550 ms. The rest is fixed: the first pass writes 19 MiB of fresh
+memory, about 115 ms more than a later one, mostly page faults (the kernel has no transparent huge pages). Checked
+on the device: Argon2id, Argon2i and Argon2d with 1, 2 and 4 lanes, 1 to 3 passes and 32 KiB to 1 MiB of memory
+(108 sets), and the server's parameters, give the same key as the build without the patch; 20,000 blocks with and
+without XOR and 2,000 with `ref` and `next` the same block equal the reference function.
+
+`0016-argon2-worker-cleanup.patch` is OpenSSL's own fix from its 3.5 branch, after 3.5.9 (commit `5a9068ccd9`):
+after a failure the threaded fill joins only the workers still outstanding, and the memory of the hash is freed.
+The memory of a hash is not mapped with 2 MiB pages: with transparent huge pages a hash took about 110 ms less,
+but the huge-page code in the kernel's fault path makes every anonymous page fault of every process
+slower (20.8 µs instead of 18.8 µs), and without them a mapping of its own saves nothing over OpenSSL's allocation.

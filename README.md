@@ -74,6 +74,7 @@ These are the highest advertised monitor timings on an LT6911UXC or LT6911D rece
 - **Virtual monitor / EDID controls:** choose the resolution, refresh and orientation seen by the managed computer independently from the stream-size limit. Resolution and frame rate have separate controls; the monitor timing follows the stream rate where the receiver can be updated live. On a Cube or Lite with an LT6911C or LT6911UXC, EDID changes require a physical power cycle, and the interface explains when it is needed; PCIe boards with an LT6911UXC or LT6911D, and Cube/Lite boards with an LT6911D, apply them at once. **Same as input** preserves the input dimensions.
 - **Portrait profiles** on an LT6911UXC or LT6911D: 720 × 1280 and 1080 × 1920 with H.264 or H.265, 1440 × 2560 with H.265 (H.264 only with a stream resolution of 1080p or lower), subject to the reported device and browser capabilities.
 - **PNG screenshots and browser-side recording**, plus USB audio playback in the browser through a shared Opus encoder. Direct and WebRTC record the H.264/H.265 stream into MP4 as received, without re-encoding; MJPEG records WebM. Recordings include the USB audio while it plays in the page. Direct/WebRTC preserve the received Opus packets when encoded receiver access is available (the shared device encoder targets 192 kbit/s); the browser encoding fallback also targets 192 kbit/s. A buffer limit or source interruption saves the captured portion with a warning. The single file is committed when recording finishes; a browser crash can still lose an unfinished recording. Recording availability depends on the browser’s recording and encoded-stream APIs.
+- **RTSP stream** for OBS, VLC and recorders: the same H.264/H.265 stream at `rtsp://<device>:8554/stream`, off by default, with a generated password (Settings → Services → RTSP). See [docs/VIDEO.md](docs/VIDEO.md#rtsp-stream).
 - **Playback recovery:** Direct requests fresh keyframes after dropped frames; stalled capture has a bounded recovery path. H.264/H.265 streams carry BT.709 colour information.
 - **HDMI enable/disable and capture idle timeout**, so capture can stop when no viewer is watching. While crash-screen notifications are on, the timeout leaves capture on, idle between the periodic checks of the screen for a crash. Viewers count as watching while a page is visible and keyboard or mouse input came from any page within 5 minutes. An unattended video stream still reserves the memory needed by OCR: high-confidence Windows stop screens are reported with a screenshot and without their text; console panics wait until the video stops.
 
@@ -118,7 +119,7 @@ ATX power/reset controls are available on supported boards. **Wake-on-LAN** incl
 - **Wi-Fi access point**: under **Network → Wi-Fi → Access point**, the device serves a Wi-Fi network of its own instead of joining one, until it is turned off.
 - **Shared STUN/TURN settings** under Network for browser WebRTC video/audio and RustDesk: use the default or custom STUN servers, disable STUN, or configure an authenticated TURN relay.
 - **Bluetooth controller switch** on supported AIC8800 boards, off by default. Enable it under Network; turning it on or off leaves Wi-Fi unaffected. This is a controller switch, not a peripheral-pairing interface.
-- A single **VPN** menu entry for **WireGuard, OpenVPN 2, Tailscale and NetBird**, with installation state, version and connection/profile controls. OpenVPN is installed with the system; Tailscale and NetBird are optional APK installations.
+- A single **VPN** menu entry for **WireGuard, OpenVPN 2, Tailscale, NetBird and ZeroTier**, with installation state, version and connection/profile controls. OpenVPN is installed with the system; Tailscale and NetBird are optional APK installations from Alpine, ZeroTier the optional `nanokvm-zerotier` add-on.
 - **WireGuard `.conf` profiles** with an explicit Route Allowed IPs option; **OpenVPN TUN and TAP `.ovpn` profiles**, including referenced certificate/key files in the same upload.
 - **HTTPS from first boot** with a unique device certificate and HTTP redirect. Newly generated certificates use ECDSA P-256; existing certificates are preserved. A **custom certificate** (your own CA or a public one) can be uploaded in Settings → System → Security and takes effect for new connections without a restart; a custom pair that cannot be loaded never blocks start-up (the generated one stands in). **Let's Encrypt / ZeroSSL / Buypass / Google** certificates through **acme.sh**, installed from its latest release on demand: HTTP-01 on port 80 or DNS-01 with every DNS provider acme.sh ships, renewed from the server and served without a restart. The web server's HTTPS and HTTP ports accept at most 256 connections in total and 64 from one address (one IPv6 /64), closing the rest before any TLS work, and run at most 16 TLS handshakes at a time; local add-ons on the loopback address are not limited. SSH can be enabled from settings; administrators can [import public SSH keys](docs/SSH-KEYS.md) from a file or pasted text.
 
@@ -148,7 +149,7 @@ PicoClaw is downloaded from its upstream release, **not packaged as a NanoKVM AP
 | Area | Controls and information |
 | --- | --- |
 | **Dashboard** | CPU load, RAM, SoC temperature, CPU frequency, storage, network, VPN and time-synchronization status |
-| **Memory** | One reusable 144 MiB video region shared with Linux (every resolution up to 2160p, no reboot); ZRAM (LZ4) with automatic sizing; SD swap; a configurable Go runtime soft memory limit, defaulting to a quarter of the memory Linux keeps under 2160p capture |
+| **Memory** | One reusable 144 MiB video region shared with Linux (every resolution up to 2160p, no reboot); ZRAM (LZ4) with automatic sizing; SD swap |
 | **CPU** | Frequency control, thermal protection and an explicit Apply at startup option; an incomplete overclocked startup triggers a 1000 MHz fallback on the next boot |
 | **Diagnostics** | Service, USB, firewall and package-operation status, plus system logs in the GUI |
 | **Terminal** | Browser shell and serial sessions, with shell command history |
@@ -251,13 +252,13 @@ platform/build.sh -d
 
 `-d` generates **local test signing keys**. Official release builds require the maintainer's ECDSA key; test-signed packages are not official updates. See [build and signing instructions](platform/README.md).
 
-The platform uses **Linux 7.3.5**, **U-Boot 2026.10**, **OpenSBI 1.9** and a **GCC 16.2 / T-Head C906** toolchain built with **Buildroot 2026.08.2**. Kernel/modules use `-O3` without LTO; native userspace uses the reviewed scalar `-O2` profile. The server uses **Go 1.27.4**, and web builds use **Node.js 26 LTS**. Ordinary userspace comes from official Alpine repositories; NanoKVM packages provide **OpenSSL 3.5.9 LTS** with the C906 `-O3` profile, the zlib-compatible zlib-ng library, exfatprogs, i2c-tools, lolcat and BusyBox devmem.
+The platform uses **Linux 7.3.6**, **U-Boot 2026.10**, **OpenSBI 1.9** and a **GCC 16.2 / T-Head C906** toolchain built with **Buildroot 2026.08.2**. Kernel/modules use `-O3` without LTO; native userspace uses the reviewed scalar `-O2` profile. The server is C++ (`server-cpp/`, the same toolchain and profile), and web builds use **Node.js 26 LTS**. Ordinary userspace comes from official Alpine repositories; NanoKVM packages provide **OpenSSL 3.5.9 LTS** with the C906 `-O3` profile, the zlib-compatible zlib-ng library, exfatprogs, lolcat and BusyBox devmem.
 
-Pinned platform inputs, Go modules and the web lockfile fix their respective source versions. Alpine 3.24 repositories continue receiving updates, so later builds can install newer Alpine packages; the build records them in `release/installed-packages.txt`.
+Pinned platform inputs and the web lockfile fix their respective source versions. Alpine 3.24 repositories continue receiving updates, so later builds can install newer Alpine packages; the build records them in `release/installed-packages.txt`.
 
 | Source directory | Contents |
 | --- | --- |
-| `server/`, `web/` | Go application, streaming/API services and React/TypeScript interface |
+| `server-cpp/`, `web/` | The server (streaming, API services; C++) and the React/TypeScript interface |
 | `addons/` | Packages released on their own (RustDesk, computer sensors, OCR and screen models), with their source and packaging |
 | `support/` | Native media/board integration and device tools (`kvm_system`, MMF, `nanokvm_update_edid`) |
 | `tpu/` | TPU runtime integration and the OCR and screen-crash programs |
